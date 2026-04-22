@@ -2,83 +2,102 @@
 #
 # tests/run_multi.sh
 # ------------------
-# N개의 에이전트 프로세스를 병렬로 1회씩 실행시킨다. 각 프로세스는
-# AGENT_HOSTNAME_OVERRIDE 로 서로 다른 hostname ("multi-test-1" ...
-# "multi-test-N") 을 사용하므로, 분석 서버가 서버별로 구분해 저장
-# 가능한지 검증할 수 있다.
+# N개의 에이전트를 병렬로 1회 실행. 각 프로세스는 AGENT_HOSTNAME_OVERRIDE로
+# 서로 다른 hostname을 사용해 서버별 구분이 가능한지 검증한다.
 #
 # 사용:
-#   make
-#   bash scripts/rabbitmq-up.sh
-#   bash tests/run_multi.sh [N]            # 기본 N=10
+#   make && bash scripts/rabbitmq-up.sh
+#   bash tests/run_multi.sh [N]    # 기본 N=10
 #
-# 검증:
-#   - N개가 모두 정상 종료(exit 0)
-#   - 큐에서 소비한 메시지 수 == N
-#   - 메시지의 고유 hostname 수 == N
+# 검증 항목:
+#   1. N개 에이전트 모두 exit 0
+#   2. 큐 메시지 수 == N
+#   3. 고유 hostname 수 == N
+#   4. 각 메시지 페이로드 스키마 정합성
 
 set -eu
 
 cd "$(dirname "$0")/.."
-# shellcheck source=tests/lib.sh
 source tests/lib.sh
 
 N="${1:-10}"
 BIN="./assessment-agent"
+LOGDIR="/tmp/assessment-agent-tests"
+mkdir -p "$LOGDIR"
 
 if [ ! -x "$BIN" ]; then
-    echo "[run_multi] '$BIN' 바이너리가 없습니다. make 먼저 실행하세요." >&2
+    log "[run_multi] '$BIN' 바이너리가 없습니다. make 먼저 실행하세요." >&2
     exit 1
 fi
 
 if ! wait_broker_ready 5; then
-    echo "[run_multi] RabbitMQ management API($RABBITMQ_HOST:$RABBITMQ_MGMT_PORT) 접근 실패." >&2
+    log "[run_multi] RabbitMQ management API 접근 실패 (${RABBITMQ_HOST}:${RABBITMQ_MGMT_PORT})." >&2
     exit 1
 fi
 
-echo "[run_multi] 사전 큐 purge"
+log "[run_multi] 사전 큐 purge"
 purge_queue
 
-mkdir -p /tmp/assessment-agent-tests
-echo "[run_multi] $N 개 에이전트 병렬 실행 (hostname=multi-test-{1..$N})..."
+log "[run_multi] ${N}개 에이전트 병렬 실행..."
 pids=()
 for i in $(seq 1 "$N"); do
-    err="/tmp/assessment-agent-tests/agent-$i.err"
+    err="$LOGDIR/agent-$i.err"
     : > "$err"
-    AGENT_INTERVAL_SEC=0 AGENT_HOSTNAME_OVERRIDE="multi-test-$i" "$BIN" > /dev/null 2> "$err" &
+    AGENT_INTERVAL_SEC=0 AGENT_HOSTNAME_OVERRIDE="multi-test-$i" \
+        "$BIN" > /dev/null 2> "$err" &
     pids+=($!)
 done
 
+# --- [1] 모든 에이전트 종료 대기 ---
 rc=0
-for pid in "${pids[@]}"; do
-    if ! wait "$pid"; then
+for i in "${!pids[@]}"; do
+    if ! wait "${pids[$i]}"; then
+        log "[run_multi] agent-$((i+1)) 실패 (exit non-zero)" >&2
+        cat "$LOGDIR/agent-$((i+1)).err" >&2
         rc=1
     fi
 done
+[ "$rc" -ne 0 ] && exit 1
 
-if [ "$rc" -ne 0 ]; then
-    echo "[run_multi] 일부 에이전트 프로세스가 실패했습니다." >&2
-    echo "[run_multi] stderr 확인: /tmp/assessment-agent-tests/agent-*.err" >&2
-    exit 1
-fi
-
-sleep 1
-count=$(queue_messages)
-echo "[run_multi] 발행 후 큐 메시지 수: $count (기대: $N)"
-
+# --- [2] 큐 메시지 수 검증 ---
+log "[run_multi] 큐 메시지 수 확인 중..."
+count=$(wait_for_queue_count "$N" 15)
+log "[run_multi] 큐 메시지 수: $count / $N"
 if [ "$count" != "$N" ]; then
-    echo "[run_multi] 큐 메시지 수가 기대와 다릅니다." >&2
+    log "[run_multi] FAIL: 메시지 수 불일치 (실제=${count}, 기대=${N})" >&2
     exit 1
 fi
 
+# --- [3] 고유 message_id 검증 (peek, 소비하지 않음) ---
+msg_ids=$(consume_message_ids "$N" | sort -u)
+unique_ids=$(printf '%s\n' "$msg_ids" | grep -c . || true)
+log "[run_multi] 고유 message_id 수: $unique_ids / $N"
+if [ "$unique_ids" -ne "$N" ]; then
+    log "[run_multi] FAIL: message_id 중복 또는 누락" >&2
+    printf '%s\n' "$msg_ids" | sed 's/^/  /' >&2
+    exit 1
+fi
+
+# --- [4] 고유 hostname 검증 (소비) ---
 hostnames=$(consume_hostnames "$N" | sort -u)
 unique=$(printf '%s\n' "$hostnames" | grep -c . || true)
-echo "[run_multi] 고유 hostname 수: $unique"
-echo "$hostnames" | sed 's/^/  /'
-
+log "[run_multi] 고유 hostname 수: $unique / $N"
+printf '%s\n' "$hostnames" | sed 's/^/  /'
 if [ "$unique" -ne "$N" ]; then
-    echo "[run_multi] 고유 hostname 수가 기대(N=$N)와 다릅니다." >&2
+    log "[run_multi] FAIL: 고유 hostname 수 불일치" >&2
     exit 1
 fi
 
-echo "[run_multi] PASS"
+# --- [5] 스키마 검증 ---
+# consume_hostnames가 이미 소비했으므로, 검증용 메시지를 다시 발행
+log "[run_multi] 스키마 검증용 재발행 (1개)..."
+AGENT_INTERVAL_SEC=0 AGENT_HOSTNAME_OVERRIDE="schema-check" \
+    "$BIN" > /dev/null 2>&1
+
+log "[run_multi] 페이로드 스키마 검증:"
+if ! validate_messages 1; then
+    log "[run_multi] FAIL: 스키마 검증 오류" >&2
+    exit 1
+fi
+
+log "[run_multi] PASS"
