@@ -7,14 +7,32 @@ The Agent collects resource metrics from customer servers and transmits the data
 
 ---
 
+## Network Assumption
+
+- **Internal network**. The analysis server (assessment-worker) and the customer servers sit on the **same internal network**. The Agent connects to the RabbitMQ broker through this internal path.
+- **No public internet is assumed.** The Agent must not depend on outbound internet reachability for its core function.
+- `api.ipify.org` style external-IP lookup is **kept for mixed/edge environments**, but must degrade gracefully (empty list) when the host is fully internal — it is never part of the critical path.
+- **Communication endpoint between Agent and Worker is RabbitMQ (AMQP only).** No HTTP REST ingestion endpoint is used on the worker side. Worker acts as a RabbitMQ consumer.
+
+---
+
+## Language Migration
+
+- **Current prototype**: Python 3 (`agent.py` + `consumer.py`) using `pika`.
+- **Deployment target**: **C**, using `rabbitmq-c`(librabbitmq) for AMQP and `cJSON` for JSON serialization.
+- Reasons: single static binary for agent distribution, reduced runtime dependencies on customer hosts, smaller footprint.
+- During migration the message JSON schema, environment variable names, exchange/queue/routing_key values must remain identical, so that the worker-side consumer is unaffected.
+
+---
+
 ## Implementation Scope
 
 | Component | Description |
 |---|---|
-| **Agent** | Server resource collection script (directly implemented) |
-| **RabbitMQ** | Runs standalone on Docker, acts as message broker between Agent and Portal |
+| **Agent** | Server resource collection script (directly implemented; Python prototype → C deployment target) |
+| **RabbitMQ** | Runs standalone on Docker (dev) / internal broker (prod), acts as message broker between Agent and Portal |
 | **Producer** | Agent publishes messages to the RabbitMQ queue after collection |
-| **Consumer** | Portal (analysis server) receives queue messages |
+| **Consumer** | Portal (analysis server / assessment-worker) receives queue messages |
 
 > **No-Execution Principle**: The Agent only performs collection and transmission; it does NOT perform execution/modification operations.
 
@@ -49,7 +67,7 @@ The Agent collects resource metrics from customer servers and transmits the data
 | `free.mem_total_mb` | parse `free -m` | Total memory (MB) |
 | `lsblk_raw` | parse `lsblk --json` | Disk list and sizes |
 | `ip_raw.internal` | parse `ip addr` | Internal IP address list |
-| `ip_raw.external` | external lookup or config | External IP address |
+| `ip_raw.external` | external lookup or config | External IP (empty on fully internal hosts) |
 
 > Future extended collection items: CPU usage (avg/p95/peak), Memory usage, Disk I/O, Network I/O (statistics after 1–2 weeks of collection)
 
@@ -89,12 +107,16 @@ docker run -d \
 ## Communication Flow
 
 ```
+          ┌────────────────── internal network ──────────────────┐
 [Customer Server]                [Broker]                [Analysis Portal]
-  Agent (Producer)  →  RabbitMQ (Docker)  →  Consumer (FastAPI or Script)
-  - Run collection           - Queue: server.metrics     - Receive message
-  - JSON serialization       - Durable queue             - Store in DB (MariaDB)
-  - Publish                                              - Trigger analysis pipeline
+  Agent (Producer)  →  RabbitMQ (AMQP)    →  Consumer (assessment-worker)
+  - Run collection           - Queue: server.metrics       - Receive message
+  - JSON serialization       - Durable queue               - Store in DB
+  - Publish                                                - Trigger analysis
+          └──────────────────────────────────────────────────────┘
 ```
+
+No HTTP REST path exists between Agent and Worker. RabbitMQ is the single communication endpoint.
 
 ---
 
@@ -102,39 +124,34 @@ docker run -d \
 
 ### Language / Dependencies
 
-- Language: **Python 3**
-- Library: `pika` (RabbitMQ AMQP client)
-- Execution: one-shot or cron/scheduler repeated execution (interval TBD)
+- **Current**: Python 3, `pika`. One-shot or cron/scheduler repeated execution (interval TBD).
+- **Deployment target (in progress)**: C, `rabbitmq-c` (AMQP client) + `cJSON` (JSON serialization), built via `Makefile` into a single binary. Same execution pattern (cron / systemd timer).
 
-### Main Function Structure (Pseudocode)
+### Planned C layout
 
-```python
-def collect_inventory() -> dict:
-    # Collect hostname, nproc, free, lsblk, ip
-    ...
-
-def publish_to_rabbitmq(data: dict):
-    # pika connection → channel → queue declaration → basic_publish
-    ...
-
-if __name__ == "__main__":
-    data = collect_inventory()
-    publish_to_rabbitmq(data)
+```
+src/
+  main.c           # env parsing, loop, entry point
+  collect.c / .h   # hostname / nproc / mem / disks / ip collectors
+  publish.c / .h   # rabbitmq-c connection and basic_publish
+  json.c / .h      # cJSON wrappers for payload building
+Makefile
 ```
 
 ### Execution Environment Assumptions
 
 - Customer server: Linux (Ubuntu / CentOS family)
-- Python 3.6+ assumed installed
-- RabbitMQ broker address injected via environment variable or config file
+- Python 3.6+ assumed installed for the prototype; the C binary targets libc + librabbitmq available on the host (or statically linked)
+- RabbitMQ broker address injected via environment variable or config file — must be reachable on the **internal network**
 
 ---
 
 ## Consumer Implementation Specification (Analysis Portal Side)
 
 - Subscribe to RabbitMQ `server.metrics` queue
-- Parse received messages as JSON and store in analysis DB (MariaDB)
+- Parse received messages as JSON and store in analysis DB
 - After storing, trigger the analysis pipeline (asynchronous or separate scheduler)
+- The consumer lives in the **assessment-worker** repository. Any change to the message schema here must be coordinated with that repository.
 
 ---
 
@@ -148,11 +165,11 @@ if __name__ == "__main__":
 
 ## Work Sequence (Current Implementation Goals)
 
-1. Run RabbitMQ on Docker and verify connection
-2. Agent — implement collection function (`collect_inventory`)
-3. Agent — implement RabbitMQ Producer (`publish_to_rabbitmq`)
-4. Consumer — implement queue reception and output verification (pre-portal integration stage)
-5. Integration test: Agent execution → RabbitMQ → Consumer reception verification
+1. Update docs for the internal-network assumption (this task)
+2. Reimplement the agent in C (keep schema / env vars / queue identical)
+3. Build fault / multi-agent test scripts
+4. Add OpenStack-layer collectors
+5. Discuss deployment / observability / security / schema-versioning follow-ups
 
 ---
 
