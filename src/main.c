@@ -1,12 +1,23 @@
 /**
  * @file main.c
- * @brief 에이전트 엔트리포인트. 환경변수 파싱 + 수집·발행 루프.
+ * @brief Agent entry point — orchestrates inventory + metrics + error publish.
  *
- * 실행 모드:
- *   - `AGENT_INTERVAL_SEC <= 0` : 1회 수집·발행 후 종료(cron 용).
- *   - `AGENT_INTERVAL_SEC  > 0` : 루프 모드, interval초마다 재수집.
+ * Lifecycle:
+ *   1. Parse env (.env then shell — shell wins).
+ *   2. Resolve machine_id once (cached for the process).
+ *   3. Publish `inventory` once. Failure here is fatal in one-shot mode but
+ *      not in loop mode (we keep trying with backoff so a slow startup
+ *      doesn't kill the agent).
+ *   4. Loop: publish `metrics` every AGENT_INTERVAL_SEC seconds.
  *
- * 설정은 env만 사용. .env 파일이 있으면 읽되, 쉘 환경이 우선한다.
+ * Error policy (matches docs/payload-schema.md §3):
+ *   - Optional source unavailable → field is null/empty, no error message.
+ *   - Critical collect failure (`collect_*_payload` returned NULL) → emit
+ *     a single `server.error` and continue.
+ *   - Publish failure → exponential backoff retry. Inside the retry loop we
+ *     do NOT publish errors (we'd be publishing into a broken broker). On
+ *     recovery, emit a single `PUBLISH_RECOVERED` summary message including
+ *     `retry_count`, `first_failed_at`, `recovered_at`.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -17,84 +28,229 @@
 
 #include <cjson/cJSON.h>
 
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
+#ifndef AGENT_VERSION
+#define AGENT_VERSION "1.0.0"
+#endif
+
+static volatile sig_atomic_t g_stop = 0;
+static void on_signal(int sig) { (void)sig; g_stop = 1; }
+
 /**
- * @brief 에이전트 1 사이클: 수집 → 직렬화 → 발행.
- *
- * 루프 모드에서 에러를 삼키고 계속 돌 수 있도록 예외를 던지지 않고
- * 반환값으로만 결과를 표현한다.
- *
- * @return 0 성공, -1 실패.
+ * @brief Build a publish_config_t from current environment.
  */
-static int run_once(void)
+static publish_config_t make_publish_config(void)
 {
-	cJSON *inv = collect_inventory();
-	if (!inv) {
-		fprintf(stderr, "[agent] collect failed\n");
-		return -1;
-	}
-
-	char *body = cJSON_PrintUnformatted(inv);
-
-	/* 로깅용 hostname (발행 실패 시에도 어떤 호스트인지 남기기 위함). */
-	const char *hostname = "<unknown>";
-	cJSON *h = cJSON_GetObjectItemCaseSensitive(inv, "hostname");
-	if (cJSON_IsString(h))
-		hostname = h->valuestring;
-
 	publish_config_t cfg = {
 		.host        = getenv_default("RABBITMQ_HOST", "localhost"),
 		.port        = atoi(getenv_default("RABBITMQ_PORT", "5672")),
+		.vhost       = getenv_default("RABBITMQ_VHOST", "/"),
 		.user        = getenv_default("RABBITMQ_USER", "admin"),
 		.password    = getenv_default("RABBITMQ_PASS", "admin"),
 		.exchange    = getenv_default("RABBITMQ_EXCHANGE", "assessment"),
-		.queue       = getenv_default("RABBITMQ_QUEUE", "server.metrics"),
-		.routing_key = getenv_default("RABBITMQ_ROUTING_KEY", "metrics"),
+
+		/* RabbitMQ recommends 60s heartbeat. */
+		.heartbeat_sec = atoi(getenv_default("RABBITMQ_HEARTBEAT_SEC", "60")),
+
+		.tls_enabled = atoi(getenv_default("RABBITMQ_TLS_ENABLED", "0")),
+		.tls_ca_path = getenv_default("RABBITMQ_TLS_CA_PATH", ""),
+		.tls_verify_peer     = atoi(getenv_default("RABBITMQ_TLS_VERIFY_PEER", "1")),
+		.tls_verify_hostname = atoi(getenv_default("RABBITMQ_TLS_VERIFY_HOSTNAME", "1")),
+		.tls_cert_path = getenv_default("RABBITMQ_TLS_CERT_PATH", ""),
+		.tls_key_path  = getenv_default("RABBITMQ_TLS_KEY_PATH", ""),
 	};
-	/* atoi 실패 시 0이 나오므로 AMQP 표준 포트로 재설정. */
 	if (cfg.port <= 0)
-		cfg.port = 5672;
+		cfg.port = cfg.tls_enabled ? 5671 : 5672;
+	return cfg;
+}
 
-	int rc = publish_message(&cfg, body, strlen(body));
-	if (rc == 0)
-		fprintf(stderr, "[agent] published inventory for %s\n", hostname);
-
+/**
+ * @brief Serialize @p msg, publish via @p routing_key, free both.
+ */
+static int serialize_and_publish(const publish_config_t *cfg,
+                                 const char *routing_key,
+                                 cJSON *msg)
+{
+	if (!msg)
+		return -1;
+	char *body = cJSON_PrintUnformatted(msg);
+	int rc = -1;
+	if (body)
+		rc = publish_message(cfg, routing_key, body, strlen(body));
 	free(body);
-	cJSON_Delete(inv);
+	cJSON_Delete(msg);
 	return rc;
 }
 
 /**
- * @brief 프로세스 진입점.
- *
- * @return 0 정상(루프 모드는 반환 없음), 비-0 1회 실행 모드 실패.
+ * @brief Publish a `server.error` message (best-effort, never recurses).
  */
+static void emit_error(const publish_config_t *cfg,
+                       const char *machine_id,
+                       const char *error_code,
+                       const char *error_message,
+                       const char *failed_component,
+                       int retry_count,
+                       const char *first_failed_at,
+                       const char *recovered_at)
+{
+	const char *rk = getenv_default("RABBITMQ_ROUTING_KEY_ERROR", "server.error");
+	cJSON *msg = build_error_payload(machine_id ? machine_id : "",
+	                                 AGENT_VERSION,
+	                                 error_code, error_message,
+	                                 failed_component,
+	                                 retry_count,
+	                                 first_failed_at, recovered_at);
+	int rc = serialize_and_publish(cfg, rk, msg);
+	if (rc != 0) {
+		fprintf(stderr, "[agent] failed to publish error message %s\n",
+		        error_code ? error_code : "?");
+	}
+}
+
+/**
+ * @brief Publish a payload with exponential-backoff retry.
+ *
+ * On retry, the function records `first_failed_at` once and increments
+ * `retry_count`. On final success after >0 retries, emits a
+ * `PUBLISH_RECOVERED` error summary so operators can observe the outage.
+ *
+ * @return 0 on success, -1 if signal-stopped.
+ */
+static int publish_with_retry(const publish_config_t *cfg,
+                              const char *routing_key,
+                              cJSON *msg,
+                              const char *machine_id,
+                              int max_backoff)
+{
+	if (!msg)
+		return -1;
+	char *body = cJSON_PrintUnformatted(msg);
+	cJSON_Delete(msg);
+	if (!body)
+		return -1;
+
+	unsigned int backoff = 1;
+	int retry_count = 0;
+	char first_failed_at[32] = { 0 };
+
+	for (;;) {
+		int rc = publish_message(cfg, routing_key, body, strlen(body));
+		if (rc == 0) {
+			free(body);
+			if (retry_count > 0) {
+				char now_buf[32];
+				struct timespec ts;
+				clock_gettime(CLOCK_REALTIME, &ts);
+				iso8601_utc(ts.tv_sec, now_buf, sizeof now_buf);
+				char detail[160];
+				snprintf(detail, sizeof detail,
+				         "broker reconnected after %d retries", retry_count);
+				emit_error(cfg, machine_id,
+				           "PUBLISH_RECOVERED", detail, "publish",
+				           retry_count, first_failed_at, now_buf);
+			}
+			return 0;
+		}
+
+		if (g_stop) {
+			free(body);
+			return -1;
+		}
+
+		if (retry_count == 0) {
+			struct timespec ts;
+			clock_gettime(CLOCK_REALTIME, &ts);
+			iso8601_utc(ts.tv_sec, first_failed_at, sizeof first_failed_at);
+		}
+		retry_count++;
+
+		if (backoff > (unsigned int)max_backoff)
+			backoff = (unsigned int)max_backoff;
+		fprintf(stderr, "[agent] publish failed, retry %d in %us\n",
+		        retry_count, backoff);
+		sleep(backoff);
+		backoff *= 2;
+	}
+}
+
 int main(void)
 {
-	/* cwd 기준 .env 탐색. 없으면 쉘 환경만 사용. */
+	signal(SIGINT,  on_signal);
+	signal(SIGTERM, on_signal);
+
 	load_env_file(".env");
 
 	int interval = atoi(getenv_default("AGENT_INTERVAL_SEC", "60"));
-	if (interval <= 0)
-		return run_once() == 0 ? 0 : 1;
+	publish_config_t cfg = make_publish_config();
 
-	fprintf(stderr, "[agent] loop mode: interval=%ds (Ctrl+C to exit)\n", interval);
-	for (;;) {
-		/* 1 사이클 실패 시 지수 백오프로 즉시 재시도. 성공하거나
-		 * interval 에 도달할 때까지 반복한다. 단발 브로커 단절을
-		 * 다음 수집 주기까지 기다리지 않고 복구하기 위함. */
-		unsigned int backoff = 1;
-		while (run_once() != 0) {
-			if (backoff > (unsigned int)interval)
-				backoff = (unsigned int)interval;
-			fprintf(stderr, "[agent] iteration failed, retrying in %us\n", backoff);
-			sleep(backoff);
-			backoff *= 2;
+	const char *rk_inv = getenv_default("RABBITMQ_ROUTING_KEY_INVENTORY", "server.inventory");
+	const char *rk_met = getenv_default("RABBITMQ_ROUTING_KEY_METRICS",   "server.metrics");
+
+	char *machine_id = resolve_machine_id();
+	if (!machine_id) {
+		fprintf(stderr, "[agent] machine_id resolution failed (no /etc/machine-id, "
+		                "no dbus-uuidgen, no IMDS). Cannot identify host.\n");
+		emit_error(&cfg, NULL,
+		           "MACHINE_ID_UNRESOLVED",
+		           "no /etc/machine-id, no dbus-uuidgen, no IMDS instance-id",
+		           "collect", -1, NULL, NULL);
+		return 2;
+	}
+	fprintf(stderr, "[agent] machine_id=%s\n", machine_id);
+
+	/* --- Initial inventory --- */
+	cJSON *inv = collect_inventory_payload(machine_id, AGENT_VERSION);
+	if (!inv) {
+		emit_error(&cfg, machine_id,
+		           "COLLECT_INVENTORY_FAILED",
+		           "core inventory source unreadable", "collect",
+		           -1, NULL, NULL);
+		fprintf(stderr, "[agent] inventory collect failed; continuing with metrics only\n");
+	} else {
+		int max_backoff = interval > 0 ? interval : 60;
+		if (publish_with_retry(&cfg, rk_inv, inv, machine_id, max_backoff) == 0)
+			fprintf(stderr, "[agent] published inventory\n");
+	}
+
+	/* --- One-shot mode: collect & publish metrics once and exit --- */
+	if (interval <= 0) {
+		cJSON *m = collect_metrics_payload(machine_id, AGENT_VERSION);
+		if (!m) {
+			emit_error(&cfg, machine_id,
+			           "COLLECT_METRICS_FAILED",
+			           "core metrics source unreadable", "collect",
+			           -1, NULL, NULL);
+			free(machine_id);
+			return 1;
 		}
+		int rc = serialize_and_publish(&cfg, rk_met, m);
+		free(machine_id);
+		return rc == 0 ? 0 : 1;
+	}
+
+	/* --- Loop mode --- */
+	fprintf(stderr, "[agent] loop mode: interval=%ds (Ctrl+C to exit)\n", interval);
+	while (!g_stop) {
+		cJSON *m = collect_metrics_payload(machine_id, AGENT_VERSION);
+		if (!m) {
+			emit_error(&cfg, machine_id,
+			           "COLLECT_METRICS_FAILED",
+			           "core metrics source unreadable", "collect",
+			           -1, NULL, NULL);
+		} else {
+			publish_with_retry(&cfg, rk_met, m, machine_id, interval);
+		}
+		if (g_stop) break;
 		sleep((unsigned int)interval);
 	}
+
+	free(machine_id);
+	return 0;
 }
