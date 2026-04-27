@@ -2,8 +2,8 @@
 
 AI 기반 Assessment 서비스의 **데이터 수집 에이전트**.
 
-고객 서버(상용 클라우드 VM)에서 리소스 메트릭을 자동 수집하여 RabbitMQ를 통해 중앙 분석 서버(assessment-worker)로 전송합니다.
-수집된 데이터는 분석 엔진에서 avg/p95/peak 계산, Over/Under Provisioning 판단, 적정 스펙 추천에 사용됩니다.
+고객 서버(상용 클라우드 VM)에서 정적 인벤토리와 리소스 메트릭을 자동 수집하여 RabbitMQ를 통해 중앙 분석 서버(`assessment-engine`)로 전송합니다.
+수집된 데이터는 분석 엔진에서 avg / p95 / peak 계산, Over/Under Provisioning 판단, 적정 스펙 추천에 사용됩니다.
 
 ---
 
@@ -11,6 +11,8 @@ AI 기반 Assessment 서비스의 **데이터 수집 에이전트**.
 
 - **아키텍처**: x86_64 only
 - **최소 커널**: 3.10 (CentOS 7)
+- **현재 스코프**: Ubuntu LTS (20.04 / 22.04 / 24.04) 우선. 그 외 배포판은 best-effort 처리 (`null` 허용)
+- **배포 단위**: 클라우드 VM (컨테이너 미지원 — 호스트 `/proc` 가시성 전제)
 
 | 클라우드 | 주요 OS |
 |----------|---------|
@@ -23,11 +25,21 @@ AI 기반 Assessment 서비스의 **데이터 수집 에이전트**.
 ## 기술 스택
 
 - **언어**: C
-- **AMQP 클라이언트**: [rabbitmq-c](https://github.com/alanxz/rabbitmq-c) (librabbitmq)
+- **AMQP 클라이언트**: [rabbitmq-c](https://github.com/alanxz/rabbitmq-c) (librabbitmq) + OpenSSL
 - **JSON 직렬화**: [cJSON](https://github.com/DaveGamble/cJSON)
-- **메시지 브로커**: RabbitMQ 3 (Docker 개발용 / 운영 시 내부망 브로커)
-- **데이터 수집**: `/proc`, `/sys`, syscall 기반 (외부 명령어 의존 없음)
-- **네트워크 전제**: **내부망**. Agent → RabbitMQ 브로커 내부망 경로 접근.
+- **메시지 브로커**: RabbitMQ 3 (Docker 개발용 / 운영 시 내부망 브로커, AMQPS 5671)
+- **데이터 수집**: `/proc`, `/sys`, syscall 기반. 외부 명령은 `/proc`만으로 어려운 항목(`lsblk`, `lvs`, `ethtool` 등)에 한해 사용
+- **네트워크 전제**: 내부망. Agent → Broker AMQPS-only
+
+---
+
+## 핵심 설계 원칙
+
+1. **No-Execution.** 에이전트는 수집·전송만 수행하며 대상 서버에 어떠한 변경도 가하지 않습니다.
+2. **Stateless.** 직전 tick / 카운터를 보관하지 않습니다. `/proc` 누적값을 그대로 publish 합니다.
+3. **Raw values only.** `avg`, `pct`, `iops_per_second` 등 2차 가공값은 보내지 않습니다. delta·비율 계산은 분석 엔진 책임입니다.
+4. **Single normalized schema.** OS·버전 차이는 에이전트 내부 collector가 분기 처리하고, 전송 페이로드는 단일 스키마입니다.
+5. **Optional features are not errors.** `ethtool`, `lvs`, `docker`, IMDS 등 선택적 항목 부재는 `null` / 빈 배열로 처리하고 `server.error`를 발행하지 않습니다.
 
 ---
 
@@ -38,18 +50,18 @@ AI 기반 Assessment 서비스의 **데이터 수집 에이전트**.
 ├── src/
 │   ├── main.c          # 엔트리포인트, 환경변수 파싱, 수집·발행 루프
 │   ├── collect.c/.h    # /proc, /sys, syscall 기반 수집기
-│   ├── publish.c/.h    # rabbitmq-c 연결 및 basic_publish
-│   └── util.c/.h       # run_cmd, load_env_file, trim 유틸
+│   ├── publish.c/.h    # rabbitmq-c 연결 (TLS 포함) 및 basic_publish
+│   └── util.c/.h       # 환경변수 로더, 문자열 헬퍼
 ├── include/            # 헤더 파일
 ├── docs/
-│   └── payload-schema.md  # 메시지 스키마 상세 정의
+│   └── payload-schema.md   # 메시지 스키마 (engine과의 contract)
 ├── tests/
-│   ├── lib.sh          # 테스트 공통 헬퍼
-│   ├── test_schema.sh  # 스키마 검증 (smoke test)
-│   ├── run_multi.sh    # N개 에이전트 병렬 발행
-│   ├── fault_agent.sh  # 에이전트 강제 종료 복원력
-│   ├── fault_rabbitmq.sh # 브로커 재시작 복원력
-│   └── run_all.sh      # 전체 테스트 순차 실행
+│   ├── lib.sh
+│   ├── test_schema.sh      # 스키마 검증 (smoke test)
+│   ├── run_multi.sh        # N개 에이전트 병렬 발행
+│   ├── fault_agent.sh      # 에이전트 강제 종료 복원력
+│   ├── fault_rabbitmq.sh   # 브로커 재시작 복원력
+│   └── run_all.sh
 ├── scripts/
 │   ├── rabbitmq-up.sh
 │   └── rabbitmq-down.sh
@@ -58,8 +70,6 @@ AI 기반 Assessment 서비스의 **데이터 수집 에이전트**.
 └── README.md
 ```
 
-> Python 프로토타입(`agent.py`, `consumer.py`, `requirements.txt`)은 초기 동작 검증용이며 추후 제거될 예정입니다.
-
 ---
 
 ## 아키텍처
@@ -67,64 +77,77 @@ AI 기반 Assessment 서비스의 **데이터 수집 에이전트**.
 ```
           ┌──────────────────── 내부망 ────────────────────┐
           │                                                │
-[고객 서버]                    [브로커]                    [분석 Portal]
- Agent (Producer)   →    RabbitMQ (AMQP)     →    Consumer (assessment-worker)
- - /proc 기반 수집           - Exchange: assessment (topic)  - inventory → DB 서버 등록
- - JSON 직렬화               - Queues:                       - metrics → 시계열 저장/분석
- - Publish (durable)         -   server.inventory            - error → 알림 처리
-                             -   server.metrics
-                             -   server.error
+[고객 서버]                    [브로커]                    [분석 Engine]
+ Agent (Producer)   →    RabbitMQ (AMQPS 5671)   →    assessment-engine
+ - /proc / /sys / syscall      - vhost: /assessment            - consumer + web
+ - JSON 직렬화                 - Exchange: assessment (direct) - DB upsert (machine_id)
+ - Publish (durable, persistent) - Queues: server.{inv,met,err}  - 시계열 분석
+                               - DLX: assessment.dlx           - PDF 리포트 생성
           │                                                │
           └────────────────────────────────────────────────┘
 ```
 
-**No-Execution 원칙:** Agent는 수집·전송만 수행하며 대상 서버에 어떤 변경도 가하지 않습니다.
+운영 단계 보안: AMQPS(TLS 1.2+) + `/assessment` vhost + 5종 역할별 user (`agent-publisher` / `worker-consumer` / `dlq-handler` / `topology-admin` / `monitor-readonly`).
 
 ---
 
 ## 메시지 타입
 
+Exchange: `assessment` (direct, durable). Delivery mode: persistent (2).
+
 | 타입 | Routing Key | 발송 시점 | 설명 |
 |------|-------------|-----------|------|
-| `inventory` | `server.inventory` | 에이전트 기동 시 1회 | 서버 정적 정보 (OS, CPU, 메모리, 디스크 구성) |
-| `metrics` | `server.metrics` | 주기적 (1분) | CPU%, 메모리, I/O, 네트워크, 로드평균 |
-| `error` | `server.error` | 수집/발행 실패 시 | 에러 코드, 메시지, 실패 컴포넌트 |
+| `inventory` | `server.inventory` | 기동 시 + 정적 정보 변경 감지 시 | OS, 커널, CPU 모델, 메모리·스왑 총량, 디스크 구성, 마운트, IP |
+| `metrics` | `server.metrics` | 주기적 (기본 60초) | `cpu_stat`(raw tick), `mem_*_kb`, `swap_*_kb`, `load_{1,5,15}m`, `disk_io[]`, `mounts[]`, `net_io[]` (모두 raw) |
+| `error` | `server.error` | 수집/발행 실패 시 (선택적 도구 부재는 발행 안 함) | `error_code`, `error_message`, `failed_component`, 재시도 요약 |
+
+DLX(`assessment.dlx`)는 컨슈머 측 NAK / TTL 만료 / 큐 길이 초과 시 자동 라우팅 (`server.*.dead`).
+
+공통 메타데이터: `message_type`, `machine_id`, `agent_version`, `collected_at`(ISO 8601 UTC), `hostname`, `message_id`(UUID v4). **`machine_id`가 모든 메시지의 서버 식별자**.
 
 상세 스키마 및 JSON 예시: [`docs/payload-schema.md`](docs/payload-schema.md)
 
-### 수집 소스
+### 수집 소스 (요약)
 
 | Source | Purpose |
 |--------|---------|
-| `/proc/stat` | CPU user/system/iowait (delta) |
-| `/proc/meminfo` | Memory total/used/available, swap |
-| `/proc/diskstats` | Disk IOPS/throughput (delta) |
-| `/proc/partitions` + `/sys/block/*/size` | Disk inventory |
-| `/proc/net/dev` | Network rx/tx (delta) |
-| `/proc/cpuinfo` | CPU model |
-| `/proc/loadavg` | Load average |
-| `/etc/os-release` | OS id/version |
-| `/etc/machine-id` | Server unique ID |
-| `statfs(2)` | Disk usage per mount |
-| `getifaddrs(3)` | Internal IPs |
-| `uname(2)` | Kernel version |
-| `sysconf(_SC_NPROCESSORS_ONLN)` | CPU core count |
+| `/proc/stat` | CPU 누적 tick (`cpu_stat`) |
+| `/proc/meminfo` | Memory total / free / available / buffers / cached, swap total / free (kB) |
+| `/proc/diskstats` (앞 14컬럼) | 디바이스별 누적 I/O 카운터 (`disk_io[]`) |
+| `/proc/net/dev` | 인터페이스별 누적 RX/TX (`net_io[]`) |
+| `/proc/loadavg` | 1m / 5m / 15m 로드 평균 |
+| `/proc/cpuinfo` | CPU 모델 |
+| `/proc/uptime` | 부팅 시각 (시계열 단절 감지) |
+| `/etc/os-release` | OS id / version / codename |
+| `/etc/machine-id` | 서버 불변 식별자 (fallback: `dbus-uuidgen` → IMDS instance-id) |
+| `lsblk -dn -b -J` | 디스크 목록 |
+| `statfs(2)` | 마운트별 사용량 (raw bytes) |
+| `getifaddrs(3)` | 내부 IP |
+| Cloud metadata API | 외부 IP (optional) |
+| `uname(2)` | 커널 버전 |
+| `sysconf(_SC_NPROCESSORS_ONLN)` | CPU 코어 수 |
 
 ---
 
-## 설정
-
-`.env` 파일에서 브로커 접속 정보와 수집 주기를 설정합니다.
+## 설정 (.env)
 
 | 변수 | 기본값 | 설명 |
 |---|---|---|
-| `RABBITMQ_HOST` | `localhost` | 브로커 호스트 (내부망 도메인/IP) |
-| `RABBITMQ_PORT` | `5672` | AMQP 포트 |
-| `RABBITMQ_USER` / `RABBITMQ_PASS` | `admin` / `admin` | 자격증명 |
-| `RABBITMQ_EXCHANGE` | `assessment` | Topic Exchange |
-| `AGENT_INTERVAL_SEC` | `60` | 수집 간격(초). `0`이면 1회 실행 후 종료 |
-| `AGENT_EXTERNAL_IP` | — | 설정 시 외부 IP 조회 생략 |
-| `AGENT_HOSTNAME_OVERRIDE` | — | 실제 hostname 대신 이 값 사용 (테스트용) |
+| `RABBITMQ_HOST` | `localhost` | 브로커 호스트 |
+| `RABBITMQ_PORT` | `5671` | 운영기 AMQPS. 로컬 dev는 5672 |
+| `RABBITMQ_VHOST` | `/assessment` | 운영기 전용 vhost |
+| `RABBITMQ_USER` / `RABBITMQ_PASS` | — | 운영기 `agent-publisher` / Vault·KMS 주입 |
+| `RABBITMQ_TLS_ENABLED` | `true` | 로컬 dev에서만 false |
+| `RABBITMQ_TLS_CA_PATH` | `/etc/assessment-agent/ca.pem` | 내부 CA pem |
+| `RABBITMQ_TLS_VERIFY_PEER` / `RABBITMQ_TLS_VERIFY_HOSTNAME` | `true` / `true` | |
+| `RABBITMQ_TLS_CERT_PATH` / `RABBITMQ_TLS_KEY_PATH` | — | mTLS 적용 시 |
+| `RABBITMQ_EXCHANGE` | `assessment` | direct exchange |
+| `RABBITMQ_ROUTING_KEY_INVENTORY` | `server.inventory` | engine과 contract |
+| `RABBITMQ_ROUTING_KEY_METRICS` | `server.metrics` | engine과 contract |
+| `RABBITMQ_ROUTING_KEY_ERROR` | `server.error` | engine과 contract |
+| `AGENT_INTERVAL_SEC` | `60` | `0` = one-shot |
+| `AGENT_EXTERNAL_IP` | — | 설정 시 IMDS 호출 생략 |
+| `AGENT_HOSTNAME_OVERRIDE` | — | 테스트용 |
 
 쉘 환경변수가 `.env`보다 우선합니다.
 
@@ -132,10 +155,10 @@ AI 기반 Assessment 서비스의 **데이터 수집 에이전트**.
 
 ## 빌드
 
-### 의존성 설치 (Ubuntu / Debian 계열)
+### 의존성 설치 (Ubuntu / Debian)
 
 ```bash
-sudo apt-get install -y build-essential pkg-config librabbitmq-dev libcjson-dev
+sudo apt-get install -y build-essential pkg-config librabbitmq-dev libcjson-dev libssl-dev
 ```
 
 ### 빌드
@@ -149,11 +172,16 @@ make
 
 ## 실행
 
-### 개발 환경 RabbitMQ 구동
+### 로컬 개발 RabbitMQ 구동
 
 ```bash
-sudo docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 -e RABBITMQ_DEFAULT_USER=admin -e RABBITMQ_DEFAULT_PASS=admin rabbitmq:3-management
+sudo docker run -d --name rabbitmq \
+  -p 5672:5672 -p 15672:15672 \
+  -e RABBITMQ_DEFAULT_USER=admin -e RABBITMQ_DEFAULT_PASS=admin \
+  rabbitmq:3-management
 ```
+
+> 로컬 dev는 평문 5672 + default vhost. 운영기는 AMQPS 5671 + `/assessment` vhost + 역할별 user를 사용합니다.
 
 ### 에이전트 실행
 
@@ -169,7 +197,7 @@ cp .env.example .env  # 필요 시 편집
 ./assessment-agent
 ```
 
-루프 모드에서 발행 실패 시 지수 백오프로 재시도한 뒤 정상화되면 interval 주기로 복귀합니다.
+루프 모드에서 발행 실패 시 지수 백오프로 재시도합니다. 재시도 루프 내부에서는 `server.error`를 발행하지 않으며, 재시도 종료 또는 복구 시점에 요약 1건만 발행합니다.
 
 ---
 
@@ -182,16 +210,16 @@ cp .env.example .env  # 필요 시 편집
 DOCKER_CMD="sudo docker" bash tests/run_all.sh
 
 # 개별 실행
-bash tests/test_schema.sh      # smoke test (~5s): 스키마 검증
-bash tests/run_multi.sh        # 다중 에이전트 병렬 발행
-bash tests/fault_agent.sh      # 에이전트 강제 종료 복원력
-DOCKER_CMD="sudo docker" bash tests/fault_rabbitmq.sh  # 브로커 재시작 복원력
+bash tests/test_schema.sh                                # 스키마 smoke (~5s)
+bash tests/run_multi.sh                                  # 다중 에이전트 병렬 발행
+bash tests/fault_agent.sh                                # SIGKILL 복원력
+DOCKER_CMD="sudo docker" bash tests/fault_rabbitmq.sh    # 브로커 재시작 복원력
 ```
 
 | 테스트 | 검증 내용 |
 |---|---|
 | `test_schema.sh` | 페이로드 필드 타입·값 정합성 |
-| `run_multi.sh` | N개 동시 발행, 고유 hostname 구분, 스키마 |
+| `run_multi.sh` | N개 동시 발행, 고유 `machine_id` 구분, 스키마 |
 | `fault_agent.sh` | 일부 에이전트 SIGKILL 후 잔여 에이전트 지속 발행 |
 | `fault_rabbitmq.sh` | 브로커 재시작 후 백오프 재시도 및 자력 재연결 |
 
@@ -204,52 +232,8 @@ DOCKER_CMD="sudo docker" bash tests/fault_rabbitmq.sh  # 브로커 재시작 복
 | 1 | C 재구현 (rabbitmq-c + cJSON) | ✅ Done |
 | 2 | 장애/복원력 테스트 | ✅ Done |
 | 3 | 다중 에이전트 + 스키마 검증 | ✅ Done |
-| 4 | /proc 기반 수집 전환 + 3종 메시지 타입 + topic exchange | Pending |
-| 5 | Library vendoring (rabbitmq-c, cJSON) | Pending |
-| 6 | Deployment (cron / systemd timer) | Pending |
-
----
-
-## 학습 레퍼런스
-
-**RabbitMQ / AMQP**
-- RabbitMQ 공식 튜토리얼 — https://www.rabbitmq.com/tutorials
-- RabbitMQ in Depth (Gavin M. Roy, Manning) — 운영 관점 책
-- AMQP 0-9-1 레퍼런스 — https://www.rabbitmq.com/amqp-0-9-1-reference.html
-- Quorum Queues — https://www.rabbitmq.com/quorum-queues.html
-- rabbitmq-c (C 클라이언트) — https://github.com/alanxz/rabbitmq-c
-
-**배포 (cron / systemd)**
-- systemd 공식 매뉴얼 — `man systemd.service`, `man systemd.timer`
-- Arch Wiki systemd — https://wiki.archlinux.org/title/Systemd
-- crontab(5) 매뉴얼 — `man 5 crontab`
-
-**OpenStack 메타데이터**
-- Nova metadata service — https://docs.openstack.org/nova/latest/user/metadata.html
-- openstacksdk 공식 문서 — https://docs.openstack.org/openstacksdk/latest/
-- cloud-init 문서 — https://cloudinit.readthedocs.io
-
-**데이터 저장 (PostgreSQL + Redis)**
-- PostgreSQL 파티셔닝 — https://www.postgresql.org/docs/current/ddl-partitioning.html
-- PostgreSQL BRIN 인덱스 — https://www.postgresql.org/docs/current/brin-intro.html
-- TimescaleDB 튜토리얼 — https://docs.timescale.com/getting-started
-- Redis 데이터 타입 가이드 — https://redis.io/docs/latest/develop/data-types/
-- Use the Index, Luke! — https://use-the-index-luke.com
-
-**관측성**
-- Prometheus 공식 문서 — https://prometheus.io/docs
-- Google SRE Book (무료) — https://sre.google/books/
-
-**보안**
-- RabbitMQ TLS 설정 — https://www.rabbitmq.com/ssl.html
-- RabbitMQ 접근제어 (vhost/user) — https://www.rabbitmq.com/access-control.html
-- HashiCorp Vault 튜토리얼 — https://developer.hashicorp.com/vault/tutorials
-
-**메시지 스키마**
-- JSON Schema 공식 — https://json-schema.org/learn
-- Protocol Buffers — https://protobuf.dev
-- Apache Avro — https://avro.apache.org/docs/current/
-
-**분산 시스템 기본기 (중장기)**
-- Designing Data-Intensive Applications (Martin Kleppmann, O'Reilly)
-- The Twelve-Factor App — https://12factor.net
+| 4 | `/proc` 기반 수집 + 3종 메시지 타입 + direct exchange | In progress |
+| 5 | v2 스키마 적용 (raw values, `machine_id` 공통, `cpu_stat`/`disk_io[]`/`net_io[]`/`mounts[]`) | In progress |
+| 6 | TLS / vhost / 5종 user 권한 모델 | Pending |
+| 7 | Library vendoring (rabbitmq-c, cJSON) | Pending |
+| 8 | 배포 (cron / systemd timer unit) | Pending |
