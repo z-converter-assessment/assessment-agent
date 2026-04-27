@@ -1,19 +1,10 @@
 /**
  * @file collect.h
- * @brief 고객 서버 인벤토리 수집기.
+ * @brief Inventory and metrics collectors. Builds v2 payloads.
  *
- * Python 프로토타입과 동일한 스키마의 payload를 만든다:
- * @code{.json}
- * {
- *   "hostname": "<str>",
- *   "nproc":    "<str>",
- *   "free":     { "mem_total_mb": <int> },
- *   "lsblk_raw": [ { "name": "<str>", "size": "<str>" }, ... ],
- *   "ip_raw":    { "internal": [<str>, ...], "external": [<str>, ...] }
- * }
- * @endcode
- *
- * 본 모듈은 수집만 담당하며, 브로커 전송은 publish 모듈에서 수행한다.
+ * All collectors are stateless. Cumulative counters (`/proc/stat`,
+ * `/proc/diskstats`, `/proc/net/dev`) are emitted raw — the engine computes
+ * deltas, percentages, and rates from two consecutive snapshots.
  */
 
 #ifndef ASSESSMENT_AGENT_COLLECT_H
@@ -22,16 +13,66 @@
 #include <cjson/cJSON.h>
 
 /**
- * @brief 인벤토리 payload를 수집해 cJSON 객체로 반환한다.
+ * @brief Resolve the immutable server identifier.
  *
- * 필수 필드(hostname/nproc/free/lsblk/ip.internal) 중 하나라도
- * 수집에 실패하면 전체 실패로 간주하고 NULL을 돌려준다.
- * ip.external은 네트워크 장애가 흔하므로 내부적으로 빈 배열
- * fallback을 수행한다.
+ * Resolution order:
+ *   1. /etc/machine-id (32-char hex, systemd standard)
+ *   2. `dbus-uuidgen --get` output
+ *   3. Cloud metadata instance-id (AWS IMDSv2 / Azure / GCP)
  *
- * @return 새로 할당된 cJSON 객체. 호출자가 @ref cJSON_Delete 로 해제해야 한다.
- *         실패 시 NULL.
+ * Returns a malloc'd string the caller must free, or NULL if all fallbacks
+ * fail (treated as a fatal collect error by main).
  */
-cJSON *collect_inventory(void);
+char *resolve_machine_id(void);
+
+/**
+ * @brief Produce an `inventory` payload conforming to docs/payload-schema.md §1.
+ *
+ * Common metadata (`message_type`, `machine_id`, `agent_version`,
+ * `collected_at`, `hostname`, `message_id`) is included. `ip_external` may be
+ * `null` if cloud metadata is unreachable.
+ *
+ * @param machine_id    Pre-resolved server id (must not be NULL).
+ * @param agent_version Build-time version string.
+ * @return cJSON object on success (caller deletes), NULL on critical collect failure.
+ */
+cJSON *collect_inventory_payload(const char *machine_id, const char *agent_version);
+
+/**
+ * @brief Produce a `metrics` payload conforming to docs/payload-schema.md §2.
+ *
+ * All `/proc` counters are emitted as raw cumulative values; no in-agent delta
+ * computation. `mem_available_kb` is `null` on kernels lacking `MemAvailable`.
+ *
+ * @param machine_id    Pre-resolved server id.
+ * @param agent_version Build-time version string.
+ * @return cJSON object on success (caller deletes), NULL on critical collect failure.
+ */
+cJSON *collect_metrics_payload(const char *machine_id, const char *agent_version);
+
+/**
+ * @brief Produce an `error` payload conforming to docs/payload-schema.md §3.
+ *
+ * Used for agent-side collect/publish failures only. Consumer-side failures
+ * are handled by the broker DLX, not by this message.
+ *
+ * @param machine_id        Server id (best-effort; pass empty string if unresolved).
+ * @param agent_version     Build-time version string.
+ * @param error_code        Classification code, e.g. `COLLECT_MEMINFO_FAILED`.
+ * @param error_message     Human readable detail.
+ * @param failed_component  `"collect"` or `"publish"`.
+ * @param retry_count       Optional retry summary (>= 0). Pass -1 to omit.
+ * @param first_failed_at   Optional ISO 8601 string. NULL to omit.
+ * @param recovered_at      Optional ISO 8601 string. NULL to omit.
+ * @return cJSON object (caller deletes). Never NULL unless OOM.
+ */
+cJSON *build_error_payload(const char *machine_id,
+                           const char *agent_version,
+                           const char *error_code,
+                           const char *error_message,
+                           const char *failed_component,
+                           int         retry_count,
+                           const char *first_failed_at,
+                           const char *recovered_at);
 
 #endif
