@@ -237,7 +237,7 @@ Shell environment variables override values in `.env`.
 | 4 | Migrate to `/proc`-only collectors + 3 message types + direct exchange | ✅ Done |
 | 5 | Adopt v2 schema (raw values, `machine_id` common, `cpu_stat` / `disk_io[]` / `net_io[]` / `mounts[]`) | ✅ Done (v2.1: kB nullable + lsblk fallback) |
 | 6 | TLS (AMQPS / mTLS) / vhost / agent-publisher credentials env | ✅ Done |
-| 7 | Library vendoring (rabbitmq-c, cJSON) | 🔧 Infra ready — `make vendor-fetch && make vendor-build && make USE_VENDORED=1`. Needs verification on a real production host. |
+| 7 | Library vendoring (rabbitmq-c, cJSON) — `make USE_VENDORED=1` static build | ✅ Done |
 | 8 | Deployment artifacts (cron + systemd timer) | Pending |
 
 ---
