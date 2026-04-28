@@ -9,3 +9,4 @@ __pycache__/
 # C build artifacts
 src/*.o
 /assessment-agent
+/tests/unit/run_unit

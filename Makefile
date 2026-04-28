@@ -23,7 +23,23 @@ $(BIN): $(OBJ)
 src/%.o: src/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-clean:
-	rm -f $(OBJ) $(BIN)
+# ----------------------------------------------------------------------
+# Unit tests (parser/helper level — no broker, no network)
+#   make test-unit
+# ----------------------------------------------------------------------
+TEST_BIN    := tests/unit/run_unit
+TEST_CFLAGS := -Wall -Wextra -Wpedantic -Wno-unused-function -O0 -g -std=c11 \
+               -Iinclude -DAGENT_VERSION=\"test\" \
+               $(shell pkg-config --cflags libcjson)
+TEST_LDLIBS := $(shell pkg-config --libs libcjson)
 
-.PHONY: all clean
+$(TEST_BIN): tests/unit/test_main.c tests/unit/tinytest.h src/util.c src/collect.c
+	$(CC) $(TEST_CFLAGS) -o $@ tests/unit/test_main.c src/util.c $(TEST_LDLIBS)
+
+test-unit: $(TEST_BIN)
+	./$(TEST_BIN)
+
+clean:
+	rm -f $(OBJ) $(BIN) $(TEST_BIN)
+
+.PHONY: all clean test-unit
