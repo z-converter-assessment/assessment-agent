@@ -10,3 +10,6 @@ __pycache__/
 src/*.o
 /assessment-agent
 /tests/unit/run_unit
+
+# Vendored third-party sources (fetched by `make vendor-fetch`)
+/vendor/
