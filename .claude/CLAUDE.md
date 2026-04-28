@@ -236,7 +236,7 @@ Shell environment variables override values in `.env`.
 | 3 | Multi-agent run + schema validation | ✅ Done |
 | 4 | Migrate to `/proc`-only collectors + 3 message types + direct exchange | ✅ Done |
 | 5 | Adopt v2 schema (raw values, `machine_id` common, `cpu_stat` / `disk_io[]` / `net_io[]` / `mounts[]`) | ✅ Done (v2.1: kB nullable + lsblk fallback) |
-| 6 | TLS / vhost / 5-user permission model | Pending |
+| 6 | TLS / vhost / 5-user permission model | ✅ Agent side done (AMQPS, mTLS, vhost, credentials all env-driven). Broker topology/user bootstrap and cert distribution are ops/engine scope. |
 | 7 | Library vendoring (rabbitmq-c, cJSON) | 🔧 Infra ready — `make vendor-fetch && make vendor-build && make USE_VENDORED=1`. Needs verification on a real production host. |
 | 8 | Deployment artifacts (cron + systemd timer) | Pending |
 
