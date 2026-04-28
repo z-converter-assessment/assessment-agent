@@ -7,6 +7,11 @@
 
 ## 변경 이력
 
+- **v2.1 (2026-04-28)**
+  - `metrics`의 raw kB 필드(`mem_free_kb`, `mem_buffers_kb`, `mem_cached_kb`, `swap_total_kb`, `swap_free_kb`)와 `inventory.swap_total_kb`가 소스 read 실패 시 `null`로 발행됨. 0(실제 값) 과 "못 읽음" 의 모호성 제거
+  - `disks[]` 수집이 `lsblk -J` 미설치/미지원(util-linux < 2.27, 예: CentOS 7) 시 `/sys/block` 스캔으로 자동 폴백. 폴백 사용 시 `type`은 항상 `"disk"`
+  - `wait_confirm` ACK 대기가 wall-clock deadline 으로 통일되며 `RABBITMQ_CONFIRM_TIMEOUT_SEC`(기본 5초)로 캡됨
+  - `detect_cloud_vendor`가 더 이상 `sys_vendor=Xen`을 AWS로 매핑하지 않음. 모던 Nitro는 `Amazon EC2` 매칭
 - **v2 (2026-04-24 합의)**
   - `machine_id`를 공통 메타데이터로 승격 (모든 메시지 타입에 포함)
   - 에이전트는 raw 값만 전송. delta·비율·IOPS-per-second 등 2차 가공은 분석 엔진이 담당
@@ -70,8 +75,8 @@ DLX(`assessment.dlx`)는 컨슈머 측 NAK / TTL 만료 / `x-max-length` 초과 
 | `cpu_cores` | int | `sysconf(_SC_NPROCESSORS_ONLN)` | 온라인 CPU 코어 수 |
 | `cpu_model` | string\|null | `/proc/cpuinfo` → `model name` | 트림된 CPU 모델명 |
 | `mem_total_kb` | int | `/proc/meminfo` → `MemTotal` | 전체 물리 메모리 (kB) |
-| `swap_total_kb` | int | `/proc/meminfo` → `SwapTotal` | 전체 스왑 (kB). 0이면 swap 미설정 |
-| `disks` | array | `lsblk -dn -b -o NAME,SIZE,TYPE -J` | 블록 디바이스 목록 |
+| `swap_total_kb` | int\|null | `/proc/meminfo` → `SwapTotal` | 전체 스왑 (kB). 0=swap 미설정, `null`=`/proc/meminfo` read 실패 |
+| `disks` | array | `lsblk -dn -b -o NAME,SIZE,TYPE -J` (1차) → `/sys/block` 스캔 (폴백) | 블록 디바이스 목록. 폴백 시 `type="disk"` 고정 |
 | `mounts` | array | `statfs(2)` per fstab entry | 마운트별 디스크 사용량 (raw bytes) |
 | `ip_internal` | array | `getifaddrs(3)` | 내부 IP 주소 목록 (loopback 제외) |
 | `ip_external` | array\|null | 클라우드 메타데이터 API | 외부 IP. 메타데이터 미접근 시 `null` |
@@ -132,12 +137,12 @@ DLX(`assessment.dlx`)는 컨슈머 측 NAK / TTL 만료 / `x-max-length` 초과 
 |------|------|------|------|
 | `cpu_stat` | object | `/proc/stat` 첫 행 | 누적 tick 8필드. 단위 = jiffies |
 | `mem_total_kb` | int | `/proc/meminfo` → `MemTotal` | (kB) |
-| `mem_free_kb` | int | `/proc/meminfo` → `MemFree` | (kB) |
-| `mem_available_kb` | int\|null | `/proc/meminfo` → `MemAvailable` | (kB). 커널 < 3.14 시 `MemFree+Buffers+Cached`로 fallback |
-| `mem_buffers_kb` | int | `/proc/meminfo` → `Buffers` | (kB) |
-| `mem_cached_kb` | int | `/proc/meminfo` → `Cached` | (kB) |
-| `swap_total_kb` | int | `/proc/meminfo` → `SwapTotal` | (kB) |
-| `swap_free_kb` | int | `/proc/meminfo` → `SwapFree` | (kB) |
+| `mem_free_kb` | int\|null | `/proc/meminfo` → `MemFree` | (kB). `null`=라인 부재/파싱 실패 |
+| `mem_available_kb` | int\|null | `/proc/meminfo` → `MemAvailable` | (kB). 커널 < 3.14 시 `MemFree+Buffers+Cached`로 fallback. fallback도 실패하면 `null` |
+| `mem_buffers_kb` | int\|null | `/proc/meminfo` → `Buffers` | (kB). `null`=라인 부재/파싱 실패 |
+| `mem_cached_kb` | int\|null | `/proc/meminfo` → `Cached` | (kB). `null`=라인 부재/파싱 실패 |
+| `swap_total_kb` | int\|null | `/proc/meminfo` → `SwapTotal` | (kB). 0=swap 미설정, `null`=read 실패 |
+| `swap_free_kb` | int\|null | `/proc/meminfo` → `SwapFree` | (kB). `null`=read 실패 |
 | `load_1m` | float | `/proc/loadavg` | 1분 로드 평균 |
 | `load_5m` | float | `/proc/loadavg` | 5분 로드 평균 |
 | `load_15m` | float | `/proc/loadavg` | 15분 로드 평균 |
@@ -295,11 +300,13 @@ DLX(`assessment.dlx`)는 컨슈머 측 NAK / TTL 만료 / `x-max-length` 초과 
 
 | 이슈 | 영향 범위 | 대응 |
 |------|-----------|------|
-| `MemAvailable` 필드 부재 | CentOS 7.0~7.1 (커널 < 3.14) | `MemFree + Buffers + Cached`로 fallback (값은 `mem_available_kb`에 채움) |
+| `MemAvailable` 필드 부재 | CentOS 7.0~7.1 (커널 < 3.14) | `MemFree + Buffers + Cached`로 fallback (값은 `mem_available_kb`에 채움). fallback 실패 시 `null` |
+| `/proc/meminfo` 라인 부분 부재 / 파싱 실패 | 비정상 환경 | 해당 kB 필드를 `null`로 발행 (0이 아님 — 모호성 방지) |
+| `lsblk` 미설치 / `lsblk -J` 미지원 | CentOS 7 (util-linux 2.23) | `/sys/block` 스캔으로 자동 폴백. `type`은 항상 `"disk"` |
 | `/proc/diskstats` 컬럼 수 가변 | 커널별 14 / 18 / 20 | 앞 14컬럼만 사용 |
 | 재부팅으로 누적 카운터 리셋 | 모든 환경 | 컨슈머에서 `이전값 > 현재값` 시 0 처리 + `boot_time` 변화로 시계열 단절 표시 |
 | 32-bit 카운터 wrap | 장기 uptime | 동일하게 음수 delta는 skip |
-| `/etc/machine-id` 빈 파일 | 컨테이너 빌드된 이미지 | `dbus-uuidgen --get` → IMDS instance-id fallback |
+| `/etc/machine-id` 빈 파일 | 컨테이너 빌드된 이미지 | `/var/lib/dbus/machine-id` → `dbus-uuidgen --get` → IMDS instance-id fallback |
 | `/etc/os-release` 부재 | 구형 CentOS 6 등 (지원 외) | `os_id`, `os_version`, `os_codename`을 모두 `null`로 발행 |
 
 ### 타겟 환경
@@ -330,4 +337,4 @@ DLX(`assessment.dlx`)는 컨슈머 측 NAK / TTL 만료 / `x-max-length` 초과 
 | `getifaddrs(3)` | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `uname(2)` | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `sysconf(_SC_NPROCESSORS_ONLN)` | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `lsblk` (외부 명령) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `lsblk -J` (외부 명령) | ⚠️ util-linux 2.23은 `-J` 미지원, `/sys/block` 폴백 사용 | ✅ | ✅ | ✅ | ✅ |

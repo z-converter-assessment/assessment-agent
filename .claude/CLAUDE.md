@@ -33,10 +33,14 @@ Pipeline: `agent (this repo) → RabbitMQ → assessment-engine (consumer + web)
 - **Language**: C
 - **AMQP client**: `rabbitmq-c` (librabbitmq) with TLS via OpenSSL
 - **JSON serialization**: `cJSON`
-- **Build**: `make` → single `./assessment-agent` binary
+- **Build**: `make` → single `./assessment-agent` binary. `make USE_VENDORED=1` links statically against `vendor/{cJSON,rabbitmq-c}` (after `make vendor-fetch && make vendor-build`).
 - **Execution mode**:
   - one-shot (`AGENT_INTERVAL_SEC=0`) — for cron / systemd timer
   - loop mode (positive interval) — single long-running process with exponential backoff on publish failure
+- **Optional runtime commands** (silent fallback when missing — startup logs availability to stderr):
+  - `lsblk` — disk listing; falls back to `/sys/block` scan
+  - `curl` — IMDS / external IP; missing → `null`
+  - `dbus-uuidgen` — machine_id fallback link in the resolution chain
 
 ### Source Layout
 
@@ -44,12 +48,15 @@ Pipeline: `agent (this repo) → RabbitMQ → assessment-engine (consumer + web)
 src/
   main.c        # env parsing, collection/publish loop, entry point
   collect.c/.h  # /proc, /sys, syscall-based collectors
-  publish.c/.h  # rabbitmq-c connection, TLS, basic_publish
+  publish.c/.h  # rabbitmq-c connection, TLS, basic_publish, deadline-bounded confirm
   util.c/.h     # env file loader, string helpers
 include/        # public headers for the source files above
 docs/
   payload-schema.md   # message schema (canonical contract with the engine)
 tests/
+  unit/
+    tinytest.h        # header-only single-TU test harness
+    test_main.c       # parser/helper unit tests (compile-includes collect.c)
   test_schema.sh      # smoke test — single-publish payload validation
   run_multi.sh        # N agents publishing in parallel
   fault_agent.sh      # SIGKILL resilience
@@ -58,6 +65,9 @@ tests/
 scripts/
   rabbitmq-up.sh      # local dev broker (Docker)
   rabbitmq-down.sh
+vendor/                # gitignored; populated by `make vendor-fetch`
+  cJSON/               # static lib build target
+  rabbitmq-c/          # static lib build target
 ```
 
 ### Core Principles
@@ -108,7 +118,7 @@ Full schema and JSON examples: [`docs/payload-schema.md`](../docs/payload-schema
 | `sysconf(_SC_NPROCESSORS_ONLN)` | `cpu_cores` | All targets ✅ |
 | `/proc/cpuinfo` | `cpu_model` | All targets ✅ (x86_64) |
 | `/proc/meminfo` | `mem_total_kb`, `swap_total_kb` | Raw kB |
-| `lsblk -dn -b -o NAME,SIZE,TYPE -J` | `disks[]` | External command (no `/proc` equivalent for disk listing) |
+| `lsblk -dn -b -o NAME,SIZE,TYPE -J` (1차) → `/sys/block` 스캔 (폴백) | `disks[]` | lsblk preferred for type info; sysfs fallback for hosts without `lsblk -J` (util-linux < 2.27) |
 | `statfs(2)` per fstab entry | `mounts[]` | Raw bytes |
 | `getifaddrs(3)` | `ip_internal[]` | All targets ✅ |
 | Cloud metadata API (AWS IMDSv2 / Azure / GCP) | `ip_external[]` | Optional. 1s timeout, non-blocking |
@@ -129,12 +139,15 @@ Full schema and JSON examples: [`docs/payload-schema.md`](../docs/payload-schema
 
 | Concern | Handling |
 |---|---|
-| `MemAvailable` absent on CentOS 7.0~7.1 (kernel < 3.14) | Fall back to `MemFree + Buffers + Cached`. Document the fallback in the kB field. |
+| `MemAvailable` absent on CentOS 7.0~7.1 (kernel < 3.14) | Fall back to `MemFree + Buffers + Cached`. Fallback failure → `mem_available_kb=null`. |
+| `/proc/meminfo` line missing / parse failure | The corresponding `*_kb` field is emitted as `null` (not 0) so 실제 0과 read 실패가 구분됨. |
+| `lsblk` missing or `-J` unsupported (CentOS 7 util-linux 2.23) | Auto fallback to `/sys/block` directory scan. `type` is always reported as `"disk"` since sysfs does not classify rotational/SSD/LVM. |
 | `/proc/diskstats` column count varies by kernel (14 / 18 / 20) | Use the first 14 columns. Trailing columns are ignored. |
 | Cumulative counters reset on host reboot | Engine compares with previous row; if `current < previous`, treat the interval as 0 and re-sync. `boot_time` change in inventory marks a series cut. |
 | 32-bit counter wrap on long uptime | Same handling: negative delta → skip interval. |
 | LVM not installed | `lvs` / `pvs` / `vgs` absent → empty arrays in inventory. Not an error. |
 | Cloud IMDS unreachable (on-prem image, network policy) | `ip_external` becomes `null`. Not an error. |
+| `sys_vendor` reports legacy "Xen" string | No longer mapped to AWS. Hosts fall through to `/etc/machine-id` and `dbus-uuidgen` for ID resolution; `ip_external` becomes `null`. |
 
 ---
 
@@ -200,6 +213,8 @@ Local dev uses plain AMQP and the default vhost. Production must not.
 | `RABBITMQ_TLS_VERIFY_HOSTNAME` | `true` | |
 | `RABBITMQ_TLS_CERT_PATH` | — | mTLS client cert (optional) |
 | `RABBITMQ_TLS_KEY_PATH` | — | mTLS client key (optional) |
+| `RABBITMQ_HEARTBEAT_SEC` | `60` | AMQP heartbeat interval |
+| `RABBITMQ_CONFIRM_TIMEOUT_SEC` | `5` | wall-clock deadline for the publisher-confirm ACK |
 | `RABBITMQ_EXCHANGE` | `assessment` | direct exchange |
 | `RABBITMQ_ROUTING_KEY_INVENTORY` | `server.inventory` | contract — must match engine |
 | `RABBITMQ_ROUTING_KEY_METRICS` | `server.metrics` | contract — must match engine |
@@ -222,7 +237,7 @@ Shell environment variables override values in `.env`.
 | 4 | Migrate to `/proc`-only collectors + 3 message types + direct exchange | In progress |
 | 5 | Adopt v2 schema (raw values, `machine_id` common, `cpu_stat` / `disk_io[]` / `net_io[]` / `mounts[]`) | In progress |
 | 6 | TLS / vhost / 5-user permission model | Pending |
-| 7 | Library vendoring (rabbitmq-c, cJSON) | Pending |
+| 7 | Library vendoring (rabbitmq-c, cJSON) | 🔧 Infra ready — `make vendor-fetch && make vendor-build && make USE_VENDORED=1`. Needs verification on a real production host. |
 | 8 | Deployment artifacts (cron + systemd timer) | Pending |
 
 ---
