@@ -16,6 +16,7 @@
 #include <cjson/cJSON.h>
 
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <ifaddrs.h>
 #include <limits.h>
@@ -79,6 +80,34 @@ static void add_common_metadata(cJSON *obj,
 }
 
 /* ============================================================
+ * Small helpers
+ * ============================================================ */
+
+/**
+ * @brief Return @p arr if non-NULL, else a freshly created empty array.
+ *
+ * Guards JSON output against array fields becoming missing on
+ * cJSON_CreateArray() failure inside a collector.
+ */
+static cJSON *or_empty_array(cJSON *arr)
+{
+	return arr ? arr : cJSON_CreateArray();
+}
+
+/**
+ * @brief Add @p key as a kB number, or null if @p val is negative.
+ *
+ * Negative inputs come from meminfo_get_kb() when a line is missing or
+ * unparseable. "Couldn't read" is encoded as JSON null rather than 0
+ * so it can be distinguished from a real zero reading downstream.
+ */
+static void add_kb_or_null(cJSON *root, const char *key, long val)
+{
+	if (val < 0) cJSON_AddNullToObject(root, key);
+	else         cJSON_AddNumberToObject(root, key, (double)val);
+}
+
+/* ============================================================
  * machine_id resolution
  * ============================================================ */
 
@@ -135,12 +164,16 @@ static const char *detect_cloud_vendor(void)
 	trim_inplace(vendor);
 
 	const char *result = NULL;
-	if (strstr(vendor, "Amazon") || strstr(vendor, "Xen"))
+	if (strstr(vendor, "Amazon"))
 		result = "aws";
 	else if (strstr(vendor, "Microsoft"))
 		result = "azure";
 	else if (strstr(vendor, "Google"))
 		result = "gcp";
+	/* Legacy AWS Xen instances had sys_vendor="Xen". Modern Nitro is
+	 * "Amazon EC2", and non-AWS Xen IaaS exists, so we no longer treat
+	 * a bare "Xen" vendor as AWS. Hosts that lose vendor detection
+	 * fall back to /etc/machine-id and dbus-uuidgen. */
 
 	free(vendor);
 	return result;
@@ -368,17 +401,18 @@ static int add_mem_total_swap_total(cJSON *root)
 	if (mem_total < 0)
 		return 0;
 	cJSON_AddNumberToObject(root, "mem_total_kb", (double)mem_total);
-	cJSON_AddNumberToObject(root, "swap_total_kb",
-	                        swap_total < 0 ? 0.0 : (double)swap_total);
+	add_kb_or_null(root, "swap_total_kb", swap_total);
 	return 1;
 }
 
 /**
  * @brief Collect disk list via `lsblk -dn -b -o NAME,SIZE,TYPE -J`.
  *
- * Empty array on failure (not treated as fatal — mounts[] still informs).
+ * Returns an empty array if lsblk is missing or its output is unparsable
+ * (older util-linux predates `-J`, e.g. CentOS 7's 2.23 — see collect_disks
+ * for the sysfs fallback path).
  */
-static cJSON *collect_disks(void)
+static cJSON *collect_disks_via_lsblk(void)
 {
 	cJSON *arr = cJSON_CreateArray();
 	if (!arr)
@@ -418,6 +452,73 @@ static cJSON *collect_disks(void)
 	}
 	cJSON_Delete(parsed);
 	return arr;
+}
+
+/**
+ * @brief Fallback disk list from /sys/block (no lsblk required).
+ *
+ * Used on hosts where lsblk is missing or too old for `-J` (e.g. CentOS 7
+ * util-linux 2.23). Skips loop/ram and entries without `/sys/block/<name>/device`
+ * (synthetic devices). `type` is always reported as `"disk"` since sysfs
+ * does not classify rotational vs SSD vs LVM at this layer.
+ */
+static cJSON *collect_disks_via_sysfs(void)
+{
+	cJSON *arr = cJSON_CreateArray();
+	if (!arr)
+		return NULL;
+
+	DIR *d = opendir("/sys/block");
+	if (!d)
+		return arr;
+
+	struct dirent *e;
+	while ((e = readdir(d)) != NULL) {
+		if (e->d_name[0] == '.')
+			continue;
+		if (strncmp(e->d_name, "loop", 4) == 0 ||
+		    strncmp(e->d_name, "ram",  3) == 0)
+			continue;
+
+		char path[512];
+		snprintf(path, sizeof path, "/sys/block/%s/device", e->d_name);
+		if (access(path, F_OK) != 0)
+			continue;
+
+		snprintf(path, sizeof path, "/sys/block/%s/size", e->d_name);
+		char *content = read_file_all(path);
+		if (!content)
+			continue;
+		long sectors = strtol(content, NULL, 10);
+		free(content);
+		if (sectors <= 0)
+			continue;
+
+		cJSON *item = cJSON_CreateObject();
+		cJSON_AddStringToObject(item, "name", e->d_name);
+		cJSON_AddNumberToObject(item, "size_bytes", (double)sectors * 512.0);
+		cJSON_AddStringToObject(item, "type", "disk");
+		cJSON_AddItemToArray(arr, item);
+	}
+	closedir(d);
+	return arr;
+}
+
+/**
+ * @brief Disk list with lsblk-first, /sys/block fallback.
+ *
+ * lsblk knows partition vs disk vs LVM types and reports byte-accurate
+ * sizes, so it is preferred. If lsblk is unavailable (missing binary,
+ * pre-2.27 util-linux without `-J`) or returns no entries, we fall through
+ * to a minimal /sys/block scan that always works on Linux 2.6+.
+ */
+static cJSON *collect_disks(void)
+{
+	cJSON *arr = collect_disks_via_lsblk();
+	if (arr && cJSON_GetArraySize(arr) > 0)
+		return arr;
+	cJSON_Delete(arr);
+	return collect_disks_via_sysfs();
 }
 
 /**
@@ -699,9 +800,10 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 	add_cpu_model(root);
 	if (!add_mem_total_swap_total(root)) ok = 0;
 
-	cJSON_AddItemToObject(root, "disks",       collect_disks());
-	cJSON_AddItemToObject(root, "mounts",      collect_mounts_inventory());
-	cJSON_AddItemToObject(root, "ip_internal", collect_internal_ips());
+	cJSON_AddItemToObject(root, "disks",       or_empty_array(collect_disks()));
+	cJSON_AddItemToObject(root, "mounts",      or_empty_array(collect_mounts_inventory()));
+	cJSON_AddItemToObject(root, "ip_internal", or_empty_array(collect_internal_ips()));
+	/* ip_external may be null literal by design (cloud metadata unreachable). */
 	cJSON_AddItemToObject(root, "ip_external", collect_external_ip());
 
 	if (!add_boot_time(root)) ok = 0;
@@ -757,23 +859,24 @@ static int add_meminfo_full(cJSON *root)
 
 	if (mem_total < 0)
 		return 0;
+
 	cJSON_AddNumberToObject(root, "mem_total_kb", (double)mem_total);
-	cJSON_AddNumberToObject(root, "mem_free_kb",  mem_free  < 0 ? 0.0 : (double)mem_free);
+	add_kb_or_null(root, "mem_free_kb",    mem_free);
+	add_kb_or_null(root, "mem_buffers_kb", mem_buffers);
+	add_kb_or_null(root, "mem_cached_kb",  mem_cached);
+	add_kb_or_null(root, "swap_total_kb",  swap_total);
+	add_kb_or_null(root, "swap_free_kb",   swap_free);
+
 	if (mem_available < 0) {
 		/* CentOS 7.0~7.1 fallback: MemFree + Buffers + Cached. */
-		if (mem_free >= 0 && mem_buffers >= 0 && mem_cached >= 0) {
+		if (mem_free >= 0 && mem_buffers >= 0 && mem_cached >= 0)
 			cJSON_AddNumberToObject(root, "mem_available_kb",
 			                        (double)(mem_free + mem_buffers + mem_cached));
-		} else {
+		else
 			cJSON_AddNullToObject(root, "mem_available_kb");
-		}
 	} else {
 		cJSON_AddNumberToObject(root, "mem_available_kb", (double)mem_available);
 	}
-	cJSON_AddNumberToObject(root, "mem_buffers_kb", mem_buffers < 0 ? 0.0 : (double)mem_buffers);
-	cJSON_AddNumberToObject(root, "mem_cached_kb",  mem_cached  < 0 ? 0.0 : (double)mem_cached);
-	cJSON_AddNumberToObject(root, "swap_total_kb",  swap_total  < 0 ? 0.0 : (double)swap_total);
-	cJSON_AddNumberToObject(root, "swap_free_kb",   swap_free   < 0 ? 0.0 : (double)swap_free);
 	return 1;
 }
 
@@ -876,16 +979,17 @@ static cJSON *collect_net_io(void)
 
 		long rx_bytes = 0, rx_packets = 0, rx_errors = 0;
 		long tx_bytes = 0, tx_packets = 0, tx_errors = 0;
-		/* /proc/net/dev: rx: bytes packets errs drop fifo frame compressed multicast | tx: bytes packets errs drop fifo colls carrier compressed */
-		long unused;
+		/* /proc/net/dev rx: bytes packets errs drop fifo frame compressed multicast
+		 *               tx: bytes packets errs drop fifo colls carrier compressed
+		 * We only keep bytes/packets/errors per direction; the rest are skipped
+		 * with assignment-suppression (%*d) so the matched-count reflects the
+		 * fields we actually need. */
 		int n = sscanf(colon + 1,
-		               "%ld %ld %ld %ld %ld %ld %ld %ld "
-		               "%ld %ld %ld %ld %ld %ld %ld %ld",
-		               &rx_bytes, &rx_packets, &rx_errors, &unused,
-		               &unused, &unused, &unused, &unused,
-		               &tx_bytes, &tx_packets, &tx_errors, &unused,
-		               &unused, &unused, &unused, &unused);
-		if (n < 11)
+		               "%ld %ld %ld %*d %*d %*d %*d %*d "
+		               "%ld %ld %ld",
+		               &rx_bytes, &rx_packets, &rx_errors,
+		               &tx_bytes, &tx_packets, &tx_errors);
+		if (n < 6)
 			continue;
 
 		cJSON *item = cJSON_CreateObject();
@@ -914,9 +1018,9 @@ cJSON *collect_metrics_payload(const char *machine_id, const char *agent_version
 	if (!add_meminfo_full(root)) ok = 0;
 	if (!add_loadavg(root))      ok = 0;
 
-	cJSON_AddItemToObject(root, "disk_io", collect_disk_io());
-	cJSON_AddItemToObject(root, "mounts",  collect_mounts_metrics());
-	cJSON_AddItemToObject(root, "net_io",  collect_net_io());
+	cJSON_AddItemToObject(root, "disk_io", or_empty_array(collect_disk_io()));
+	cJSON_AddItemToObject(root, "mounts",  or_empty_array(collect_mounts_metrics()));
+	cJSON_AddItemToObject(root, "net_io",  or_empty_array(collect_net_io()));
 
 	if (!ok) {
 		cJSON_Delete(root);
