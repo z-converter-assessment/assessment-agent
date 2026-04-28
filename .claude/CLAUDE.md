@@ -234,8 +234,8 @@ Shell environment variables override values in `.env`.
 | 1 | C reimplementation (rabbitmq-c + cJSON) | ✅ Done |
 | 2 | Fault / resilience tests | ✅ Done |
 | 3 | Multi-agent run + schema validation | ✅ Done |
-| 4 | Migrate to `/proc`-only collectors + 3 message types + direct exchange | In progress |
-| 5 | Adopt v2 schema (raw values, `machine_id` common, `cpu_stat` / `disk_io[]` / `net_io[]` / `mounts[]`) | In progress |
+| 4 | Migrate to `/proc`-only collectors + 3 message types + direct exchange | ✅ Done |
+| 5 | Adopt v2 schema (raw values, `machine_id` common, `cpu_stat` / `disk_io[]` / `net_io[]` / `mounts[]`) | ✅ Done (v2.1: kB nullable + lsblk fallback) |
 | 6 | TLS / vhost / 5-user permission model | Pending |
 | 7 | Library vendoring (rabbitmq-c, cJSON) | 🔧 Infra ready — `make vendor-fetch && make vendor-build && make USE_VENDORED=1`. Needs verification on a real production host. |
 | 8 | Deployment artifacts (cron + systemd timer) | Pending |
