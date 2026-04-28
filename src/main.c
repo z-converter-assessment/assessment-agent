@@ -180,12 +180,36 @@ static int publish_with_retry(const publish_config_t *cfg,
 	}
 }
 
+/**
+ * @brief Probe optional shell-out commands and log their availability.
+ *
+ * The agent has silent fallbacks (or `null`) for missing tools, so a
+ * field becoming empty does not necessarily indicate a collect failure.
+ * Logging command presence at startup lets operators distinguish
+ * "no disks found" from "lsblk missing".
+ */
+static void log_optional_cmds(void)
+{
+	const char *cmds[] = { "lsblk", "curl", "dbus-uuidgen", NULL };
+	for (int i = 0; cmds[i]; i++) {
+		char buf[96];
+		snprintf(buf, sizeof buf,
+		         "command -v %s >/dev/null 2>&1", cmds[i]);
+		int rc = system(buf);
+		fprintf(stderr, "[agent] cmd %-13s %s\n",
+		        cmds[i],
+		        (rc == 0) ? "available"
+		                  : "MISSING (silent fallback / null)");
+	}
+}
+
 int main(void)
 {
 	signal(SIGINT,  on_signal);
 	signal(SIGTERM, on_signal);
 
 	load_env_file(".env");
+	log_optional_cmds();
 
 	int interval = atoi(getenv_default("AGENT_INTERVAL_SEC", "60"));
 	publish_config_t cfg = make_publish_config();
