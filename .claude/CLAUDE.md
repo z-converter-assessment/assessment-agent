@@ -1,189 +1,255 @@
-# Agent + RabbitMQ Communication Implementation Context
+# Assessment Agent — Implementation Context
 
 ## Project Position
 
-This task corresponds to **Phase 1 — Data Collection / Inventory Acquisition** of the AI-based Assessment service.
-The Agent collects resource metrics from customer servers and transmits the data to the central Assessment Portal (analysis server) through RabbitMQ, building the data pipeline.
+**Phase 1 — Data Collection / Inventory Acquisition** of the AI-based Assessment service.
+
+The full service collects customer-server resources, runs AI analysis (avg / p95 / peak, over/under-provisioning detection) and produces sizing recommendations as a PDF report. **This agent owns the collection step.**
+
+Pipeline: `agent (this repo) → RabbitMQ → assessment-engine (consumer + web)`
 
 ---
 
-## Implementation Scope
+## Target Environment
 
-| Component | Description |
-|---|---|
-| **Agent** | Server resource collection script (directly implemented) |
-| **RabbitMQ** | Runs standalone on Docker, acts as message broker between Agent and Portal |
-| **Producer** | Agent publishes messages to the RabbitMQ queue after collection |
-| **Consumer** | Portal (analysis server) receives queue messages |
-
-> **No-Execution Principle**: The Agent only performs collection and transmission; it does NOT perform execution/modification operations.
+- **Architecture**: x86_64 only
+- **Minimum kernel**: 3.10 (CentOS 7)
+- **Deployment unit**: Linux VM on a major public cloud (AWS EC2, Azure VM, GCP CE)
+- **Current scope**: Ubuntu LTS (20.04 / 22.04 / 24.04) first. Other distros are best-effort and may emit `null` fields.
+- **Containers**: not supported as a deployment target. The agent assumes it observes the host VM `/proc` namespace.
 
 ---
 
-## Collected Data Specification (Agent Output Format)
+## Network Assumption
 
-```json
-{
-  "hostname": "server01",
-  "nproc": "4",
-  "free": {
-    "mem_total_mb": 16384
-  },
-  "lsblk_raw": [
-    {"name": "vda", "size": "30G"},
-    {"name": "vdb", "size": "150G"}
-  ],
-  "ip_raw": {
-    "internal": ["10.0.0.10"],
-    "external": ["1.2.3.4"]
-  }
-}
+- Internal network only. Agent and broker live on the same private network.
+- Agent → broker is **AMQPS only** (TLS 1.2+, port 5671) in production.
+- External-IP discovery uses the cloud metadata service (link-local 169.254.169.254). It is **optional**: failure becomes `null`, never blocks publishing.
+
+---
+
+## Implementation
+
+- **Language**: C
+- **AMQP client**: `rabbitmq-c` (librabbitmq) with TLS via OpenSSL
+- **JSON serialization**: `cJSON`
+- **Build**: `make` → single `./assessment-agent` binary
+- **Execution mode**:
+  - one-shot (`AGENT_INTERVAL_SEC=0`) — for cron / systemd timer
+  - loop mode (positive interval) — single long-running process with exponential backoff on publish failure
+
+### Source Layout
+
+```
+src/
+  main.c        # env parsing, collection/publish loop, entry point
+  collect.c/.h  # /proc, /sys, syscall-based collectors
+  publish.c/.h  # rabbitmq-c connection, TLS, basic_publish
+  util.c/.h     # env file loader, string helpers
+include/        # public headers for the source files above
+docs/
+  payload-schema.md   # message schema (canonical contract with the engine)
+tests/
+  test_schema.sh      # smoke test — single-publish payload validation
+  run_multi.sh        # N agents publishing in parallel
+  fault_agent.sh      # SIGKILL resilience
+  fault_rabbitmq.sh   # broker restart resilience
+  run_all.sh
+scripts/
+  rabbitmq-up.sh      # local dev broker (Docker)
+  rabbitmq-down.sh
 ```
 
-### Collection Field Mapping
+### Core Principles
 
-| Field | Collection Method | Description |
-|---|---|---|
-| `hostname` | `hostname` command | Server identifier |
-| `nproc` | `nproc` command | Number of CPU cores |
-| `free.mem_total_mb` | parse `free -m` | Total memory (MB) |
-| `lsblk_raw` | parse `lsblk --json` | Disk list and sizes |
-| `ip_raw.internal` | parse `ip addr` | Internal IP address list |
-| `ip_raw.external` | external lookup or config | External IP address |
-
-> Future extended collection items: CPU usage (avg/p95/peak), Memory usage, Disk I/O, Network I/O (statistics after 1–2 weeks of collection)
+1. **No-execution.** The agent only reads. It must never modify anything on the target host (no writes outside its own log file, no package operations, no service control).
+2. **Stateless.** The agent does not retain previous tick / counter values across cycles. It emits raw cumulative counters from `/proc`. All delta, percentage and rate computations happen in the engine.
+3. **Raw values only.** No `avg`, no `pct`, no `iops_per_second`. The 1-minute metric message is a snapshot of `/proc` raw fields.
+4. **Single normalized schema.** OS-specific command differences are absorbed inside the agent (collector branches by `os_id` / kernel). The wire format is **identical** regardless of OS.
+5. **Optional features are not errors.** Missing `ethtool`, `lvs`, `docker`, etc. produce `null` / empty arrays. They do not generate `server.error` messages.
 
 ---
 
-## RabbitMQ Configuration (Docker)
+## Message Types & Routing
 
-### How to Run
+Exchange: `assessment` (**direct**, durable). Delivery mode: persistent (2). Vhost: `/assessment`.
+
+| Type | Routing key | Trigger | Description |
+|------|-------------|---------|-------------|
+| `inventory` | `server.inventory` | startup + on detected static change | OS, kernel, CPU model, total memory, disks, mounts, IPs |
+| `metrics`   | `server.metrics`   | every `AGENT_INTERVAL_SEC` (default 60) | raw `/proc` counters: `cpu_stat`, `mem_*_kb`, `swap_*_kb`, `load_{1,5,15}m`, `disk_io[]`, `net_io[]`, `mounts[]` |
+| `error`     | `server.error`     | collection / publish failure (see policy below) | `error_code`, `error_message`, `failed_component` |
+
+**Error publish policy** (must match the team agreement to keep the queue useful):
+
+- Optional tool / feature absent (`ethtool`, `lvs`, `docker`, IMDS timeout, non-root cron read) → **not an error**. Fill `null` / empty array.
+- Core source unreadable (`/proc/meminfo`, `/etc/os-release` missing, disk full preventing publish buffer) → **emit error**, single message.
+- Inside the publish retry loop → **do not emit**. Emit one summary message after retry exhaustion or on recovery, including `retry_count`, `first_failed_at`, optional `recovered_at`.
+
+`server.error` is for agent-side failures only. Consumer-side failures (parse / DB / TTL) are handled by RabbitMQ DLX → `assessment.dlx` → `server.{type}.dead`. Different alert channels for each.
+
+Common metadata (every message): `message_type`, `machine_id`, `agent_version`, `collected_at` (ISO 8601 UTC), `hostname`, `message_id` (UUID v4).
+
+`machine_id` is the canonical server identifier (read from `/etc/machine-id`). When the file is empty (containers, custom images), the agent falls back to `dbus-uuidgen --get`, then to the cloud IMDS instance-id. `hostname` is captured for human readability but **must not** be used as a primary key by the engine.
+
+Full schema and JSON examples: [`docs/payload-schema.md`](../docs/payload-schema.md).
+
+---
+
+## Data Sources
+
+### Static (`inventory` — phases 1 and 2)
+
+| Source | Field | Note |
+|--------|-------|------|
+| `/etc/machine-id` (+ `dbus-uuidgen` + IMDS fallback) | `machine_id` | Common metadata. Required. |
+| `/etc/os-release` | `os_id`, `os_version`, `os_codename` | All systemd-based targets ✅ |
+| `uname(2)` | `kernel_version` | All targets ✅ |
+| `sysconf(_SC_NPROCESSORS_ONLN)` | `cpu_cores` | All targets ✅ |
+| `/proc/cpuinfo` | `cpu_model` | All targets ✅ (x86_64) |
+| `/proc/meminfo` | `mem_total_kb`, `swap_total_kb` | Raw kB |
+| `lsblk -dn -b -o NAME,SIZE,TYPE -J` | `disks[]` | External command (no `/proc` equivalent for disk listing) |
+| `statfs(2)` per fstab entry | `mounts[]` | Raw bytes |
+| `getifaddrs(3)` | `ip_internal[]` | All targets ✅ |
+| Cloud metadata API (AWS IMDSv2 / Azure / GCP) | `ip_external[]` | Optional. 1s timeout, non-blocking |
+| `/proc/uptime` or `stat /proc/1` | `boot_time` | For timeline reconstruction |
+
+### Dynamic (`metrics` — phase 4)
+
+| Source | Field | Note |
+|--------|-------|------|
+| `/proc/stat` first row | `cpu_stat: { user, nice, system, idle, iowait, irq, softirq, steal }` | Raw cumulative ticks |
+| `/proc/meminfo` | `mem_total_kb`, `mem_free_kb`, `mem_available_kb`, `mem_buffers_kb`, `mem_cached_kb`, `swap_total_kb`, `swap_free_kb` | Raw kB |
+| `/proc/loadavg` | `load_1m`, `load_5m`, `load_15m` | |
+| `/proc/diskstats` (first 14 columns) | `disk_io[].{ device, reads_completed, writes_completed, sectors_read, sectors_written }` | Per device, raw cumulative |
+| `statfs(2)` | `mounts[].{ mount, total_bytes, free_bytes, avail_bytes }` | Raw bytes (no `usage_pct` here — engine computes) |
+| `/proc/net/dev` | `net_io[].{ interface, rx_bytes, tx_bytes, rx_packets, tx_packets, rx_errors, tx_errors }` | Per interface, raw cumulative. `lo` excluded. |
+
+### Compatibility Notes
+
+| Concern | Handling |
+|---|---|
+| `MemAvailable` absent on CentOS 7.0~7.1 (kernel < 3.14) | Fall back to `MemFree + Buffers + Cached`. Document the fallback in the kB field. |
+| `/proc/diskstats` column count varies by kernel (14 / 18 / 20) | Use the first 14 columns. Trailing columns are ignored. |
+| Cumulative counters reset on host reboot | Engine compares with previous row; if `current < previous`, treat the interval as 0 and re-sync. `boot_time` change in inventory marks a series cut. |
+| 32-bit counter wrap on long uptime | Same handling: negative delta → skip interval. |
+| LVM not installed | `lvs` / `pvs` / `vgs` absent → empty arrays in inventory. Not an error. |
+| Cloud IMDS unreachable (on-prem image, network policy) | `ip_external` becomes `null`. Not an error. |
+
+---
+
+## RabbitMQ Topology (Target Production)
+
+```
+Exchange: assessment       (direct, durable)
+  ├── server.inventory  → queue: server.inventory      (durable, DLX-bound)
+  ├── server.metrics    → queue: server.metrics        (durable, DLX-bound, x-message-ttl=72h, x-max-length=1M)
+  └── server.error      → queue: server.error          (durable, DLX-bound)
+
+DLX: assessment.dlx        (direct, durable)
+  ├── server.inventory  → queue: server.inventory.dead
+  ├── server.metrics    → queue: server.metrics.dead
+  └── server.error      → queue: server.error.dead
+```
+
+The agent only publishes. Queue / exchange / DLX declaration is owned by the engine (run once with the `topology-admin` user).
+
+### Permissions Model (least privilege)
+
+| Vhost user | configure | write | read | Used by |
+|---|---|---|---|---|
+| `agent-publisher` | `^$` | `^assessment$` | `^$` | this agent |
+| `worker-consumer` | `^$` | `^$` | `^server\.(inventory\|metrics\|error)$` | engine consumer |
+| `dlq-handler` | `^$` | `^$` | `^server\.(inventory\|metrics\|error)\.dead$` | engine DLQ inspection |
+| `topology-admin` | `^(assessment(\.dlx)?\|server\..*)$` | `^(assessment(\.dlx)?\|server\..*)$` | `^server\..*$` | one-shot bootstrap |
+| `monitor-readonly` | `^$` | `^$` | `^$` | management UI (`monitoring` tag) |
+
+The agent ships with `agent-publisher` credentials only. Compromise scope is bounded to publishing arbitrary payloads — it cannot consume or reconfigure topology.
+
+### TLS
+
+- AMQPS port **5671**. Plain 5672 is disabled at the broker.
+- TLS 1.2+. Hostname verification on. Internal-CA pem distributed to the agent at deploy time (`/etc/assessment-agent/ca.pem`).
+- Optional mTLS (`client.pem` + `client.key` per agent host) — recommended for production.
+
+### Local Development Broker
 
 ```bash
-docker run -d \
-  --name rabbitmq \
-  -p 5672:5672 \
-  -p 15672:15672 \
-  -e RABBITMQ_DEFAULT_USER=admin \
-  -e RABBITMQ_DEFAULT_PASS=admin \
+sudo docker run -d --name rabbitmq \
+  -p 5672:5672 -p 15672:15672 \
+  -e RABBITMQ_DEFAULT_USER=admin -e RABBITMQ_DEFAULT_PASS=admin \
   rabbitmq:3-management
 ```
 
-| Port | Purpose |
-|---|---|
-| `5672` | AMQP protocol (Agent / Consumer connection) |
-| `15672` | RabbitMQ Management UI |
-
-### Queue Design
-
-| Item | Value |
-|---|---|
-| Exchange | `assessment` (direct) |
-| Queue | `server.metrics` |
-| Routing Key | `metrics` |
-| Message Format | JSON (Agent Output format) |
-| Durability | durable=True (prevent message loss) |
+Local dev uses plain AMQP and the default vhost. Production must not.
 
 ---
 
-## Communication Flow
+## Configuration (.env)
 
-```
-[Customer Server]                [Broker]                [Analysis Portal]
-  Agent (Producer)  →  RabbitMQ (Docker)  →  Consumer (FastAPI or Script)
-  - Run collection           - Queue: server.metrics     - Receive message
-  - JSON serialization       - Durable queue             - Store in DB (MariaDB)
-  - Publish                                              - Trigger analysis pipeline
-```
-
----
-
-## Agent Implementation Specification
-
-### Language / Dependencies
-
-- Language: **Python 3**
-- Library: `pika` (RabbitMQ AMQP client)
-- Execution: one-shot or cron/scheduler repeated execution (interval TBD)
-
-### Main Function Structure (Pseudocode)
-
-```python
-def collect_inventory() -> dict:
-    # Collect hostname, nproc, free, lsblk, ip
-    ...
-
-def publish_to_rabbitmq(data: dict):
-    # pika connection → channel → queue declaration → basic_publish
-    ...
-
-if __name__ == "__main__":
-    data = collect_inventory()
-    publish_to_rabbitmq(data)
-```
-
-### Execution Environment Assumptions
-
-- Customer server: Linux (Ubuntu / CentOS family)
-- Python 3.6+ assumed installed
-- RabbitMQ broker address injected via environment variable or config file
-
----
-
-## Consumer Implementation Specification (Analysis Portal Side)
-
-- Subscribe to RabbitMQ `server.metrics` queue
-- Parse received messages as JSON and store in analysis DB (MariaDB)
-- After storing, trigger the analysis pipeline (asynchronous or separate scheduler)
-
----
-
-## Future Integration Points
-
-- **Analysis Engine**: Calculate avg/p95/peak based on stored metrics, determine over/under-provisioning
-- **AI Recommendation**: LLM-based optimal vCPU / Memory / Disk recommendations
-- **Automated Report Generation**: Jinja2 / HTML / Markdown-based customer PDF reports
-
----
-
-## Work Sequence (Current Implementation Goals)
-
-1. Run RabbitMQ on Docker and verify connection
-2. Agent — implement collection function (`collect_inventory`)
-3. Agent — implement RabbitMQ Producer (`publish_to_rabbitmq`)
-4. Consumer — implement queue reception and output verification (pre-portal integration stage)
-5. Integration test: Agent execution → RabbitMQ → Consumer reception verification
-
----
-
-## 브랜치 전략
-
-```
-main          # 배포용. 직접 push 금지
-develop       # 개발 통합. PR로만 머지
-feature/xxx   # 기능 개발
-fix/xxx       # 버그 수정
-chore/xxx     # 설정 변경
-```
-
-**작업 흐름**
-
-```
-develop에서 브랜치 생성
-→ 작업 완료 후 develop으로 PR
-→ 1명 이상 리뷰 승인 후 머지
-```
-
----
-
-## 커밋 컨벤션
-
-| 타입 | 설명 | 예시 |
+| Var | Default | Description |
 |---|---|---|
-| `feat` | 새로운 기능 추가 | `feat: 메트릭 수집 엔드포인트 추가` |
-| `fix` | 버그 수정 | `fix: Redis 연결 타임아웃 오류 수정` |
-| `chore` | 설정, 패키지 변경 | `chore: requirements.txt 업데이트` |
-| `docs` | 문서 수정 | `docs: README 로컬 실행 방법 추가` |
-| `refactor` | 리팩토링 | `refactor: 메트릭 파싱 로직 함수 분리` |
-| `test` | 테스트 코드 | `test: 수집 API 유닛 테스트 추가` |
-| `style` | 포맷 등 스타일 변경 | `style: 들여쓰기 정리` |
+| `RABBITMQ_HOST` | `localhost` | broker hostname |
+| `RABBITMQ_PORT` | `5671` | AMQPS in production |
+| `RABBITMQ_VHOST` | `/assessment` | dedicated vhost (production) |
+| `RABBITMQ_USER` | — | `agent-publisher` in production |
+| `RABBITMQ_PASS` | — | injected from secret store |
+| `RABBITMQ_TLS_ENABLED` | `true` | disable only for local dev |
+| `RABBITMQ_TLS_CA_PATH` | `/etc/assessment-agent/ca.pem` | CA pem |
+| `RABBITMQ_TLS_VERIFY_PEER` | `true` | |
+| `RABBITMQ_TLS_VERIFY_HOSTNAME` | `true` | |
+| `RABBITMQ_TLS_CERT_PATH` | — | mTLS client cert (optional) |
+| `RABBITMQ_TLS_KEY_PATH` | — | mTLS client key (optional) |
+| `RABBITMQ_EXCHANGE` | `assessment` | direct exchange |
+| `RABBITMQ_ROUTING_KEY_INVENTORY` | `server.inventory` | contract — must match engine |
+| `RABBITMQ_ROUTING_KEY_METRICS` | `server.metrics` | contract — must match engine |
+| `RABBITMQ_ROUTING_KEY_ERROR` | `server.error` | contract — must match engine |
+| `AGENT_INTERVAL_SEC` | `60` | `0` means one-shot |
+| `AGENT_HOSTNAME_OVERRIDE` | — | testing aid |
+| `AGENT_EXTERNAL_IP` | — | skip IMDS lookup if set |
+
+Shell environment variables override values in `.env`.
+
+---
+
+## Work Sequence
+
+| # | Task | Status |
+|---|---|---|
+| 1 | C reimplementation (rabbitmq-c + cJSON) | ✅ Done |
+| 2 | Fault / resilience tests | ✅ Done |
+| 3 | Multi-agent run + schema validation | ✅ Done |
+| 4 | Migrate to `/proc`-only collectors + 3 message types + direct exchange | In progress |
+| 5 | Adopt v2 schema (raw values, `machine_id` common, `cpu_stat` / `disk_io[]` / `net_io[]` / `mounts[]`) | In progress |
+| 6 | TLS / vhost / 5-user permission model | Pending |
+| 7 | Library vendoring (rabbitmq-c, cJSON) | Pending |
+| 8 | Deployment artifacts (cron + systemd timer) | Pending |
+
+---
+
+## Branch Strategy
+
+```
+main         # production-ready; no direct push
+develop      # integration; merge via PR only
+feature/xxx  # feature work
+fix/xxx      # bug fixes
+chore/xxx    # config / tooling
+docs/xxx     # documentation only
+```
+
+Workflow: branch from `develop` → PR back to `develop` → 1 approval required.
+
+---
+
+## Commit Convention (description in Korean)
+
+| Type | When |
+|---|---|
+| `feat` | new feature |
+| `fix` | bug fix |
+| `chore` | config, dependency, tooling |
+| `docs` | documentation only |
+| `refactor` | code restructure, no behavior change |
+| `test` | add or update tests |
+| `style` | formatting only |
