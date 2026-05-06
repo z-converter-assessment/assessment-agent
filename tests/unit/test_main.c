@@ -604,6 +604,56 @@ static void test_dedup_mounts_empty(void)
 }
 
 /* ============================================================
+ * v3 — collect.c — parse_tcp_v4_hex_addr
+ * ============================================================ */
+
+static void test_parse_tcp_v4_hex_addr_localhost(void)
+{
+	/* 127.0.0.1 in network order = 0x7F000001 → printed in host order
+	 * on x86_64 little-endian as "0100007F". */
+	char buf[INET_ADDRSTRLEN] = { 0 };
+	parse_tcp_v4_hex_addr("0100007F", buf, sizeof buf);
+	ASSERT_STR_EQ(buf, "127.0.0.1");
+}
+
+static void test_parse_tcp_v4_hex_addr_any(void)
+{
+	char buf[INET_ADDRSTRLEN] = { 0 };
+	parse_tcp_v4_hex_addr("00000000", buf, sizeof buf);
+	ASSERT_STR_EQ(buf, "0.0.0.0");
+}
+
+/* RFC 1918 "192.168.1.10" → network 0xC0A8010A → host LE "0A01A8C0". */
+static void test_parse_tcp_v4_hex_addr_rfc1918(void)
+{
+	char buf[INET_ADDRSTRLEN] = { 0 };
+	parse_tcp_v4_hex_addr("0A01A8C0", buf, sizeof buf);
+	ASSERT_STR_EQ(buf, "192.168.1.10");
+}
+
+/* ============================================================
+ * v3 — collect.c — parse_tcp_v6_hex_addr
+ * ============================================================ */
+
+static void test_parse_tcp_v6_hex_addr_unspecified(void)
+{
+	char buf[INET6_ADDRSTRLEN] = { 0 };
+	parse_tcp_v6_hex_addr(
+		"00000000000000000000000000000000", buf, sizeof buf);
+	ASSERT_STR_EQ(buf, "::");
+}
+
+static void test_parse_tcp_v6_hex_addr_loopback(void)
+{
+	/* ::1 in network bytes = 00..00 01. Stored as 4 LE u32:
+	 * dwords = 0, 0, 0, 0x01000000 → hex chars: 8x'0' 8x'0' 8x'0' "01000000". */
+	char buf[INET6_ADDRSTRLEN] = { 0 };
+	parse_tcp_v6_hex_addr(
+		"00000000000000000000000001000000", buf, sizeof buf);
+	ASSERT_STR_EQ(buf, "::1");
+}
+
+/* ============================================================
  * runner
  * ============================================================ */
 
@@ -689,6 +739,15 @@ int main(void)
 	RUN_TEST(test_dedup_mounts_keeps_first);
 	RUN_TEST(test_dedup_mounts_no_dups_passthrough);
 	RUN_TEST(test_dedup_mounts_empty);
+
+	/* v3 — collect.c — parse_tcp_v4_hex_addr */
+	RUN_TEST(test_parse_tcp_v4_hex_addr_localhost);
+	RUN_TEST(test_parse_tcp_v4_hex_addr_any);
+	RUN_TEST(test_parse_tcp_v4_hex_addr_rfc1918);
+
+	/* v3 — collect.c — parse_tcp_v6_hex_addr */
+	RUN_TEST(test_parse_tcp_v6_hex_addr_unspecified);
+	RUN_TEST(test_parse_tcp_v6_hex_addr_loopback);
 
 	return tt_summary();
 }

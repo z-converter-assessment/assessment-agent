@@ -23,6 +23,7 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1013,6 +1014,246 @@ static cJSON *collect_services(void)
 	return arr;
 }
 
+/* ============================================================
+ * listen_ports[] — TCP listen sockets + owning process
+ * ============================================================ */
+
+/**
+ * @brief Map entry: socket inode → owning pid + comm.
+ *
+ * Built once per inventory tick by walking /proc/<pid>/fd. comm is a fixed
+ * 64-byte buffer (Linux TASK_COMM_LEN is 16; 64 is comfortable headroom for
+ * any future widening).
+ */
+struct sock_inode_owner {
+	long inode;
+	int  pid;
+	char comm[64];
+};
+
+static int read_pid_comm(int pid, char *out, size_t out_len)
+{
+	if (!out || out_len == 0) return 0;
+	out[0] = '\0';
+	char path[64];
+	snprintf(path, sizeof path, "/proc/%d/comm", pid);
+	char *content = read_file_all(path);
+	if (!content) return 0;
+	trim_inplace(content);
+	strncpy(out, content, out_len - 1);
+	out[out_len - 1] = '\0';
+	free(content);
+	return 1;
+}
+
+/**
+ * @brief Walk /proc/PID/fd/N to build a socket-inode → (pid, comm) map.
+ *
+ * Unprivileged agent: many `/proc/<pid>/fd` directories are unreadable
+ * (EACCES — owned by a different uid). Those are silently skipped, leaving
+ * those sockets with `pid`/`comm` = null in the final output. uid is still
+ * recoverable from /proc/net/tcp regardless.
+ *
+ * @return malloc'd array (caller frees) or NULL on opendir failure / OOM.
+ *         *@p out_count receives the entry count.
+ */
+static struct sock_inode_owner *build_socket_owner_map(size_t *out_count)
+{
+	*out_count = 0;
+	DIR *proc = opendir("/proc");
+	if (!proc) return NULL;
+
+	size_t cap = 256, count = 0;
+	struct sock_inode_owner *map = malloc(sizeof *map * cap);
+	if (!map) { closedir(proc); return NULL; }
+
+	struct dirent *e;
+	while ((e = readdir(proc)) != NULL) {
+		char *end = NULL;
+		long pid = strtol(e->d_name, &end, 10);
+		if (!end || *end != '\0' || pid <= 0) continue;
+
+		char fd_dir[64];
+		snprintf(fd_dir, sizeof fd_dir, "/proc/%ld/fd", pid);
+		DIR *fdd = opendir(fd_dir);
+		if (!fdd) continue;
+
+		char comm[64] = { 0 };
+		read_pid_comm((int)pid, comm, sizeof comm);
+
+		struct dirent *fe;
+		while ((fe = readdir(fdd)) != NULL) {
+			if (fe->d_name[0] == '.') continue;
+			char fd_path[160], target[256];
+			snprintf(fd_path, sizeof fd_path, "%s/%s", fd_dir, fe->d_name);
+			ssize_t n = readlink(fd_path, target, sizeof target - 1);
+			if (n <= 0) continue;
+			target[n] = '\0';
+			if (strncmp(target, "socket:[", 8) != 0) continue;
+			long inode = strtol(target + 8, NULL, 10);
+			if (inode <= 0) continue;
+
+			if (count + 1 > cap) {
+				cap *= 2;
+				struct sock_inode_owner *nr = realloc(map, sizeof *map * cap);
+				if (!nr) { closedir(fdd); goto done; }
+				map = nr;
+			}
+			map[count].inode = inode;
+			map[count].pid = (int)pid;
+			strncpy(map[count].comm, comm, sizeof map[count].comm - 1);
+			map[count].comm[sizeof map[count].comm - 1] = '\0';
+			count++;
+		}
+		closedir(fdd);
+	}
+done:
+	closedir(proc);
+	*out_count = count;
+	return map;
+}
+
+/**
+ * @brief Decode `/proc/net/tcp` IPv4 hex address (8 hex chars, host order).
+ *
+ * The kernel writes the 32-bit IP via `%08X` from a host-order int, so on
+ * x86_64 (little-endian) `127.0.0.1` (network byte order 0x7F000001) is
+ * stored as int 0x0100007F and printed `"0100007F"`. Extracting bytes
+ * LSB-first reconstructs the dotted quad.
+ *
+ * x86_64 only — matches the agent's target architecture (CLAUDE.md).
+ */
+static void parse_tcp_v4_hex_addr(const char *hex8, char *out, size_t out_len)
+{
+	unsigned int a = (unsigned int)strtoul(hex8, NULL, 16);
+	snprintf(out, out_len, "%u.%u.%u.%u",
+	         a & 0xff, (a >> 8) & 0xff,
+	         (a >> 16) & 0xff, (a >> 24) & 0xff);
+}
+
+/**
+ * @brief Decode `/proc/net/tcp6` IPv6 hex address (32 hex chars).
+ *
+ * Stored as 4 little-endian uint32. Each is byte-swapped into network order
+ * to populate `struct in6_addr`, then formatted via inet_ntop.
+ */
+static void parse_tcp_v6_hex_addr(const char *hex32, char *out, size_t out_len)
+{
+	struct in6_addr addr;
+	memset(&addr, 0, sizeof addr);
+	for (int i = 0; i < 4; i++) {
+		char buf[9];
+		memcpy(buf, hex32 + i * 8, 8);
+		buf[8] = '\0';
+		unsigned int dw = (unsigned int)strtoul(buf, NULL, 16);
+		addr.s6_addr[i * 4 + 0] = (uint8_t)( dw        & 0xff);
+		addr.s6_addr[i * 4 + 1] = (uint8_t)((dw >> 8)  & 0xff);
+		addr.s6_addr[i * 4 + 2] = (uint8_t)((dw >> 16) & 0xff);
+		addr.s6_addr[i * 4 + 3] = (uint8_t)((dw >> 24) & 0xff);
+	}
+	inet_ntop(AF_INET6, &addr, out, (socklen_t)out_len);
+}
+
+/* TCP_LISTEN per linux/include/net/tcp_states.h is 0x0A. */
+#define TCP_STATE_LISTEN_HEX "0A"
+
+/**
+ * @brief Parse `/proc/net/tcp{,6}` and append LISTEN sockets to @p arr.
+ *
+ * Format columns (post-`sl:`): local rem state tx_q:rx_q tr:tm retr uid
+ *                              timeout inode [...].
+ * Only state == "0A" (LISTEN) is emitted.
+ */
+static void scan_tcp_listen(const char *path, const char *proto, int is_v6,
+                            cJSON *arr,
+                            const struct sock_inode_owner *map, size_t map_n)
+{
+	char *content = read_file_all(path);
+	if (!content) return;
+
+	int line_no = 0;
+	char *save = NULL;
+	for (char *line = strtok_r(content, "\n", &save); line;
+	     line = strtok_r(NULL, "\n", &save)) {
+		if (line_no++ == 0) continue; /* header row */
+
+		while (*line == ' ' || *line == '\t') line++;
+		char *colon = strchr(line, ':');
+		if (!colon) continue;
+		char *rest = colon + 1;
+		while (*rest == ' ' || *rest == '\t') rest++;
+
+		char local[80], remote[80], state[8];
+		char txrxq[40], trtm[40], retr[16];
+		long uid = 0, timeout = 0, inode = 0;
+		int n = sscanf(rest,
+		               "%79s %79s %7s %39s %39s %15s %ld %ld %ld",
+		               local, remote, state, txrxq, trtm, retr,
+		               &uid, &timeout, &inode);
+		if (n < 9) continue;
+		if (strcmp(state, TCP_STATE_LISTEN_HEX) != 0) continue;
+
+		char *port_sep = strrchr(local, ':');
+		if (!port_sep) continue;
+		*port_sep = '\0';
+		unsigned int port = (unsigned int)strtoul(port_sep + 1, NULL, 16);
+		if (port == 0) continue;
+
+		char addr_buf[INET6_ADDRSTRLEN] = { 0 };
+		if (is_v6) {
+			if (strlen(local) != 32) continue;
+			parse_tcp_v6_hex_addr(local, addr_buf, sizeof addr_buf);
+		} else {
+			if (strlen(local) != 8) continue;
+			parse_tcp_v4_hex_addr(local, addr_buf, sizeof addr_buf);
+		}
+
+		int pid = -1;
+		const char *comm = NULL;
+		for (size_t i = 0; i < map_n; i++) {
+			if (map[i].inode == inode) {
+				pid = map[i].pid;
+				comm = map[i].comm;
+				break;
+			}
+		}
+
+		cJSON *item = cJSON_CreateObject();
+		cJSON_AddStringToObject(item, "proto", proto);
+		cJSON_AddStringToObject(item, "addr", addr_buf);
+		cJSON_AddNumberToObject(item, "port", (double)port);
+		cJSON_AddNumberToObject(item, "uid",  (double)uid);
+		if (pid > 0) cJSON_AddNumberToObject(item, "pid", (double)pid);
+		else         cJSON_AddNullToObject(item, "pid");
+		if (comm && *comm) cJSON_AddStringToObject(item, "comm", comm);
+		else               cJSON_AddNullToObject(item, "comm");
+		cJSON_AddItemToArray(arr, item);
+	}
+	free(content);
+}
+
+/**
+ * @brief Build inventory `listen_ports[]` from /proc/net/tcp{,6}.
+ *
+ * Combines IPv4 + IPv6 listen sockets. Per-socket `pid`/`comm` may be
+ * `null` when the socket is owned by a process the unprivileged agent
+ * cannot inspect; `uid` is always populated.
+ */
+static cJSON *collect_listen_ports(void)
+{
+	cJSON *arr = cJSON_CreateArray();
+	if (!arr) return NULL;
+
+	size_t map_n = 0;
+	struct sock_inode_owner *map = build_socket_owner_map(&map_n);
+
+	scan_tcp_listen("/proc/net/tcp",  "tcp",  0, arr, map, map_n);
+	scan_tcp_listen("/proc/net/tcp6", "tcp6", 1, arr, map, map_n);
+
+	free(map);
+	return arr;
+}
+
 static int add_boot_time(cJSON *root)
 {
 	char *content = read_file_all("/proc/uptime");
@@ -1049,8 +1290,9 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 	cJSON_AddItemToObject(root, "disks",       or_empty_array(collect_disks()));
 	cJSON_AddItemToObject(root, "mounts",      or_empty_array(collect_mounts_inventory()));
 	/* services may be null literal by design (non-systemd host). */
-	cJSON_AddItemToObject(root, "services",    collect_services());
-	cJSON_AddItemToObject(root, "ip_internal", or_empty_array(collect_internal_ips()));
+	cJSON_AddItemToObject(root, "services",     collect_services());
+	cJSON_AddItemToObject(root, "listen_ports", or_empty_array(collect_listen_ports()));
+	cJSON_AddItemToObject(root, "ip_internal",  or_empty_array(collect_internal_ips()));
 	/* ip_external may be null literal by design (cloud metadata unreachable). */
 	cJSON_AddItemToObject(root, "ip_external", collect_external_ip());
 
