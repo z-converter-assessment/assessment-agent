@@ -964,6 +964,55 @@ static cJSON *collect_external_ip(void)
 	return arr;
 }
 
+/**
+ * @brief Collect active systemd service units.
+ *
+ * Source: `systemctl list-units --type=service --state=running --no-pager
+ *         --plain --no-legend`
+ * Output line layout: `UNIT  LOAD  ACTIVE  SUB  DESCRIPTION...`
+ *
+ * On non-systemd hosts (Amazon Linux 1, custom containers) systemctl is
+ * absent — `run_cmd` returns NULL and we emit a JSON null literal so the
+ * engine can distinguish "no systemd" from "systemd present, no running
+ * services" (the latter yields an empty array).
+ *
+ * Per v3 contract: agent emits raw unit names; categorisation
+ * (`web`/`db`/...) and OS-name normalisation (`httpd`↔`apache2`) is the
+ * engine's responsibility — keeps the per-OS mapping table out of the
+ * binary so adding an OS does not require an agent re-deploy.
+ */
+static cJSON *collect_services(void)
+{
+	char *out = run_cmd(
+		"systemctl list-units --type=service --state=running "
+		"--no-pager --plain --no-legend 2>/dev/null");
+	if (!out)
+		return cJSON_CreateNull();
+
+	cJSON *arr = cJSON_CreateArray();
+	if (!arr) { free(out); return NULL; }
+
+	char *save = NULL;
+	for (char *line = strtok_r(out, "\n", &save); line;
+	     line = strtok_r(NULL, "\n", &save)) {
+		char *tok_save = NULL;
+		char *unit   = strtok_r(line, " \t", &tok_save);
+		if (!unit || !*unit) continue;
+		char *load   = strtok_r(NULL, " \t", &tok_save);
+		char *active = strtok_r(NULL, " \t", &tok_save);
+		char *sub    = strtok_r(NULL, " \t", &tok_save);
+		(void)load; (void)active;
+		if (!sub) continue;
+
+		cJSON *item = cJSON_CreateObject();
+		cJSON_AddStringToObject(item, "unit", unit);
+		cJSON_AddStringToObject(item, "sub",  sub);
+		cJSON_AddItemToArray(arr, item);
+	}
+	free(out);
+	return arr;
+}
+
 static int add_boot_time(cJSON *root)
 {
 	char *content = read_file_all("/proc/uptime");
@@ -999,6 +1048,8 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 
 	cJSON_AddItemToObject(root, "disks",       or_empty_array(collect_disks()));
 	cJSON_AddItemToObject(root, "mounts",      or_empty_array(collect_mounts_inventory()));
+	/* services may be null literal by design (non-systemd host). */
+	cJSON_AddItemToObject(root, "services",    collect_services());
 	cJSON_AddItemToObject(root, "ip_internal", or_empty_array(collect_internal_ips()));
 	/* ip_external may be null literal by design (cloud metadata unreachable). */
 	cJSON_AddItemToObject(root, "ip_external", collect_external_ip());
