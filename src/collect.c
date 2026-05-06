@@ -604,76 +604,209 @@ static cJSON *collect_disks(void)
 }
 
 /**
- * @brief List mountpoints from /proc/mounts, skip pseudo filesystems.
+ * @brief Pseudo / virtual filesystems excluded from mounts[].
  *
- * @return malloc'd array of malloc'd `mount<TAB>fstype` strings, NULL-terminated.
- *         Caller frees each entry then the array.
+ * These exist for kernel/snap/k8s interfaces, not user data storage.
+ * Centralised so inventory.mounts[] and metrics.mounts[] always agree.
+ *
+ *   nsfs     — k8s / container namespaces
+ *   squashfs — snap (Ubuntu) and other read-only image mounts
+ *   overlay  — container layered fs (docker/podman/k8s)
+ *   tmpfs/devtmpfs/proc/sysfs/cgroup* etc — kernel pseudo-fs
  */
-static char **list_real_mounts(void)
+static int is_excluded_fstype(const char *fstype)
 {
-	char *content = read_file_all("/proc/mounts");
-	if (!content)
-		return NULL;
-
-	size_t cap = 16, count = 0;
-	char **arr = malloc(sizeof *arr * cap);
-	if (!arr) {
-		free(content);
-		return NULL;
-	}
-
-	const char *skip_fs[] = {
+	static const char *skip_fs[] = {
 		"proc", "sysfs", "cgroup", "cgroup2", "devpts", "tmpfs",
 		"devtmpfs", "mqueue", "hugetlbfs", "fusectl", "debugfs",
 		"tracefs", "securityfs", "pstore", "autofs", "rpc_pipefs",
 		"binfmt_misc", "configfs", "bpf", "ramfs", "overlay", "squashfs",
+		"nsfs",
+		/* container / VM virtual fs */
+		"9p", "virtiofs", "fuse.lxcfs", "fuse.gvfsd-fuse",
 		NULL,
 	};
+	if (!fstype) return 1;
+	for (int i = 0; skip_fs[i]; i++)
+		if (strcmp(fstype, skip_fs[i]) == 0)
+			return 1;
+	return 0;
+}
+
+/**
+ * @brief Single mount entry produced by list_real_mounts().
+ *
+ * `mount` and `fstype` are owned malloc'd strings. (major,minor) is the
+ * device id parsed from /proc/self/mountinfo field 3. Used as the dedup
+ * key so bind mounts (same device, multiple mountpoints) only count once.
+ */
+struct mount_entry {
+	int   major;
+	int   minor;
+	char *mount;
+	char *fstype;
+};
+
+static void free_mount_entries(struct mount_entry *arr, size_t n)
+{
+	if (!arr) return;
+	for (size_t i = 0; i < n; i++) {
+		free(arr[i].mount);
+		free(arr[i].fstype);
+	}
+	free(arr);
+}
+
+/**
+ * @brief Parse a single /proc/self/mountinfo line.
+ *
+ * Format (man 5 proc):
+ *   ID PARENT MAJOR:MINOR ROOT MOUNTPOINT MOUNT_OPTS [optional...] - FSTYPE SOURCE SUPER_OPTS
+ *
+ * Single-pass token scan — only positions 3 (maj:min), 5 (mount), and
+ * the field after "-" (fstype) are captured. Avoids any fixed-size
+ * fields[] cap so hosts with many optional fields (mount propagation
+ * tags: shared:N master:M propagate_from:K unbindable, …) parse safely.
+ *
+ * Mountpoints with whitespace appear as `\040`-escaped — left as-is
+ * (rare in our target environments; engine can decode if it matters).
+ *
+ * @return 1 on full success and writes @p major, @p minor, @p mount_out
+ *         (malloc'd), @p fstype_out (malloc'd). 0 on parse failure
+ *         (out-pointers untouched).
+ */
+static int parse_mountinfo_line(const char *line,
+                                int *major, int *minor,
+                                char **mount_out, char **fstype_out)
+{
+	char *copy = strdup(line);
+	if (!copy) return 0;
+
+	int mj = -1, mn = -1;
+	char *mnt = NULL, *fst = NULL;
+	int seen_dash = 0;
+	int idx = 0;
+
+	char *save = NULL;
+	for (char *tok = strtok_r(copy, " ", &save); tok;
+	     tok = strtok_r(NULL, " ", &save)) {
+		idx++;
+		if (idx == 3) {
+			if (!parse_major_minor(tok, &mj, &mn)) goto fail;
+		} else if (idx == 5) {
+			mnt = strdup(tok);
+			if (!mnt) goto fail;
+		} else if (!seen_dash && idx >= 7
+		           && tok[0] == '-' && tok[1] == '\0') {
+			seen_dash = 1;
+		} else if (seen_dash && !fst) {
+			fst = strdup(tok);
+			if (!fst) goto fail;
+			break; /* fstype is the only post-dash field we need */
+		}
+	}
+	free(copy);
+
+	if (mj < 0 || !mnt || !fst) {
+		free(mnt); free(fst);
+		return 0;
+	}
+
+	*major = mj;
+	*minor = mn;
+	*mount_out = mnt;
+	*fstype_out = fst;
+	return 1;
+
+fail:
+	free(copy);
+	free(mnt);
+	free(fst);
+	return 0;
+}
+
+/**
+ * @brief Dedup by (major, minor). Keeps the first occurrence (typically the
+ *        canonical mountpoint; bind mounts are skipped).
+ *
+ * In-place: rewrites @p arr and updates @p count. Frees freed-out entries'
+ * strings. Stable order — first-seen wins.
+ */
+static void dedup_mounts(struct mount_entry *arr, size_t *count)
+{
+	size_t out = 0;
+	for (size_t i = 0; i < *count; i++) {
+		int seen = 0;
+		for (size_t j = 0; j < out; j++) {
+			if (arr[j].major == arr[i].major &&
+			    arr[j].minor == arr[i].minor) {
+				seen = 1;
+				break;
+			}
+		}
+		if (seen) {
+			free(arr[i].mount);
+			free(arr[i].fstype);
+			continue;
+		}
+		if (out != i) arr[out] = arr[i];
+		out++;
+	}
+	*count = out;
+}
+
+/**
+ * @brief Build the canonical mount list from /proc/self/mountinfo.
+ *
+ * Excludes pseudo filesystems (`is_excluded_fstype`) and dedups by
+ * (major,minor) so bind mounts of the same device only appear once.
+ *
+ * @param out_count  receives entry count.
+ * @return malloc'd array (caller frees via free_mount_entries) or NULL on
+ *         OOM / mountinfo unreadable. *out_count is 0 in that case.
+ */
+static struct mount_entry *list_real_mounts(size_t *out_count)
+{
+	*out_count = 0;
+	char *content = read_file_all("/proc/self/mountinfo");
+	if (!content) return NULL;
+
+	size_t cap = 16, count = 0;
+	struct mount_entry *arr = malloc(sizeof *arr * cap);
+	if (!arr) { free(content); return NULL; }
 
 	char *save = NULL;
 	for (char *line = strtok_r(content, "\n", &save); line;
 	     line = strtok_r(NULL, "\n", &save)) {
-		char *tok_save = NULL;
-		char *src   = strtok_r(line, " ", &tok_save);
-		char *mnt   = strtok_r(NULL, " ", &tok_save);
-		char *fstype = strtok_r(NULL, " ", &tok_save);
-		if (!src || !mnt || !fstype)
+		int mj = -1, mn = -1;
+		char *mnt = NULL, *fst = NULL;
+		if (!parse_mountinfo_line(line, &mj, &mn, &mnt, &fst))
 			continue;
-
-		int skip = 0;
-		for (int i = 0; skip_fs[i]; i++) {
-			if (strcmp(fstype, skip_fs[i]) == 0) {
-				skip = 1;
-				break;
-			}
+		if (is_excluded_fstype(fst)) {
+			free(mnt); free(fst);
+			continue;
 		}
-		if (skip)
-			continue;
-
-		size_t need = strlen(mnt) + 1 + strlen(fstype) + 1;
-		char *entry = malloc(need);
-		if (!entry)
-			continue;
-		snprintf(entry, need, "%s\t%s", mnt, fstype);
-
-		if (count + 2 > cap) {
+		if (count + 1 > cap) {
 			cap *= 2;
-			char **nr = realloc(arr, sizeof *arr * cap);
-			if (!nr) {
-				free(entry);
-				break;
-			}
+			struct mount_entry *nr = realloc(arr, sizeof *arr * cap);
+			if (!nr) { free(mnt); free(fst); break; }
 			arr = nr;
 		}
-		arr[count++] = entry;
+		arr[count].major = mj;
+		arr[count].minor = mn;
+		arr[count].mount = mnt;
+		arr[count].fstype = fst;
+		count++;
 	}
-	arr[count] = NULL;
 	free(content);
+
+	dedup_mounts(arr, &count);
+	*out_count = count;
 	return arr;
 }
 
 /**
- * @brief Build inventory `mounts[]` (raw bytes + fstype).
+ * @brief Build inventory `mounts[]` (raw bytes + fstype + major/minor).
  */
 static cJSON *collect_mounts_inventory(void)
 {
@@ -681,44 +814,34 @@ static cJSON *collect_mounts_inventory(void)
 	if (!arr)
 		return NULL;
 
-	char **mounts = list_real_mounts();
-	if (!mounts)
-		return arr;
-
-	for (size_t i = 0; mounts[i]; i++) {
-		char *tab = strchr(mounts[i], '\t');
-		if (!tab) {
-			free(mounts[i]);
-			continue;
-		}
-		*tab = '\0';
-		const char *mnt = mounts[i];
-		const char *fstype = tab + 1;
-
+	size_t n = 0;
+	struct mount_entry *mounts = list_real_mounts(&n);
+	for (size_t i = 0; i < n; i++) {
 		struct statvfs st;
-		if (statvfs(mnt, &st) != 0) {
-			free(mounts[i]);
+		if (statvfs(mounts[i].mount, &st) != 0)
 			continue;
-		}
 		double total = (double)st.f_blocks * (double)st.f_frsize;
 		double freeb = (double)st.f_bfree  * (double)st.f_frsize;
 		double avail = (double)st.f_bavail * (double)st.f_frsize;
 
 		cJSON *item = cJSON_CreateObject();
-		cJSON_AddStringToObject(item, "mount", mnt);
+		cJSON_AddStringToObject(item, "mount", mounts[i].mount);
+		add_major_minor(item, mounts[i].major, mounts[i].minor);
 		cJSON_AddNumberToObject(item, "total_bytes", total);
 		cJSON_AddNumberToObject(item, "free_bytes", freeb);
 		cJSON_AddNumberToObject(item, "avail_bytes", avail);
-		cJSON_AddStringToObject(item, "fstype", fstype);
+		cJSON_AddStringToObject(item, "fstype", mounts[i].fstype);
 		cJSON_AddItemToArray(arr, item);
-		free(mounts[i]);
 	}
-	free(mounts);
+	free_mount_entries(mounts, n);
 	return arr;
 }
 
 /**
- * @brief Build metrics `mounts[]` (raw bytes only — no fstype, no usage_pct).
+ * @brief Build metrics `mounts[]` (raw bytes + major/minor; no fstype).
+ *
+ * fstype lives in inventory only — it doesn't change per metric tick and
+ * keeping it out of the 60-second message reduces wire traffic.
  */
 static cJSON *collect_mounts_metrics(void)
 {
@@ -726,33 +849,25 @@ static cJSON *collect_mounts_metrics(void)
 	if (!arr)
 		return NULL;
 
-	char **mounts = list_real_mounts();
-	if (!mounts)
-		return arr;
-
-	for (size_t i = 0; mounts[i]; i++) {
-		char *tab = strchr(mounts[i], '\t');
-		if (tab) *tab = '\0';
-		const char *mnt = mounts[i];
-
+	size_t n = 0;
+	struct mount_entry *mounts = list_real_mounts(&n);
+	for (size_t i = 0; i < n; i++) {
 		struct statvfs st;
-		if (statvfs(mnt, &st) != 0) {
-			free(mounts[i]);
+		if (statvfs(mounts[i].mount, &st) != 0)
 			continue;
-		}
 		double total = (double)st.f_blocks * (double)st.f_frsize;
 		double freeb = (double)st.f_bfree  * (double)st.f_frsize;
 		double avail = (double)st.f_bavail * (double)st.f_frsize;
 
 		cJSON *item = cJSON_CreateObject();
-		cJSON_AddStringToObject(item, "mount", mnt);
+		cJSON_AddStringToObject(item, "mount", mounts[i].mount);
+		add_major_minor(item, mounts[i].major, mounts[i].minor);
 		cJSON_AddNumberToObject(item, "total_bytes", total);
 		cJSON_AddNumberToObject(item, "free_bytes", freeb);
 		cJSON_AddNumberToObject(item, "avail_bytes", avail);
 		cJSON_AddItemToArray(arr, item);
-		free(mounts[i]);
 	}
-	free(mounts);
+	free_mount_entries(mounts, n);
 	return arr;
 }
 

@@ -449,6 +449,161 @@ static void test_parse_major_minor_invalid(void)
 }
 
 /* ============================================================
+ * v3 — collect.c — is_excluded_fstype
+ * ============================================================ */
+
+static void test_is_excluded_fstype_pseudo(void)
+{
+	ASSERT_EQ(is_excluded_fstype("proc"),     1);
+	ASSERT_EQ(is_excluded_fstype("sysfs"),    1);
+	ASSERT_EQ(is_excluded_fstype("cgroup2"),  1);
+	ASSERT_EQ(is_excluded_fstype("tmpfs"),    1);
+	ASSERT_EQ(is_excluded_fstype("squashfs"), 1);
+	ASSERT_EQ(is_excluded_fstype("overlay"),  1);
+	ASSERT_EQ(is_excluded_fstype("nsfs"),     1);
+}
+
+static void test_is_excluded_fstype_real(void)
+{
+	ASSERT_EQ(is_excluded_fstype("ext4"), 0);
+	ASSERT_EQ(is_excluded_fstype("xfs"),  0);
+	ASSERT_EQ(is_excluded_fstype("btrfs"), 0);
+	ASSERT_EQ(is_excluded_fstype("zfs"),  0);
+}
+
+static void test_is_excluded_fstype_null(void)
+{
+	ASSERT_EQ(is_excluded_fstype(NULL), 1);
+}
+
+/* ============================================================
+ * v3 — collect.c — parse_mountinfo_line
+ * ============================================================ */
+
+static void test_parse_mountinfo_line_basic(void)
+{
+	const char *line =
+		"36 35 252:1 / /mnt/data rw,relatime - ext4 /dev/vda1 rw,errors=remount-ro";
+	int mj = -1, mn = -1;
+	char *mnt = NULL, *fst = NULL;
+	ASSERT_EQ(parse_mountinfo_line(line, &mj, &mn, &mnt, &fst), 1);
+	ASSERT_EQ(mj, 252);
+	ASSERT_EQ(mn, 1);
+	ASSERT_STR_EQ(mnt, "/mnt/data");
+	ASSERT_STR_EQ(fst, "ext4");
+	free(mnt); free(fst);
+}
+
+/* mountinfo with one optional field (`shared:1`). The parser must skip
+ * variable-length optional region until the literal `-` separator. */
+static void test_parse_mountinfo_line_one_optional(void)
+{
+	const char *line =
+		"22 28 0:21 / /sys rw,nosuid shared:7 - sysfs sysfs rw";
+	int mj = -1, mn = -1;
+	char *mnt = NULL, *fst = NULL;
+	ASSERT_EQ(parse_mountinfo_line(line, &mj, &mn, &mnt, &fst), 1);
+	ASSERT_EQ(mj, 0);
+	ASSERT_EQ(mn, 21);
+	ASSERT_STR_EQ(mnt, "/sys");
+	ASSERT_STR_EQ(fst, "sysfs");
+	free(mnt); free(fst);
+}
+
+/* Multiple optional fields. Real-world mountinfo can have 3-4+ tags such
+ * as `shared:N master:M propagate_from:K unbindable`. The parser must
+ * still correctly locate the `-` separator. */
+static void test_parse_mountinfo_line_many_optionals(void)
+{
+	const char *line =
+		"99 1 8:1 /sub /mnt/x rw,relatime "
+		"shared:1 master:2 propagate_from:3 unbindable "
+		"- xfs /dev/sda1 rw,attr2,inode64";
+	int mj = -1, mn = -1;
+	char *mnt = NULL, *fst = NULL;
+	ASSERT_EQ(parse_mountinfo_line(line, &mj, &mn, &mnt, &fst), 1);
+	ASSERT_EQ(mj, 8);
+	ASSERT_EQ(mn, 1);
+	ASSERT_STR_EQ(mnt, "/mnt/x");
+	ASSERT_STR_EQ(fst, "xfs");
+	free(mnt); free(fst);
+}
+
+static void test_parse_mountinfo_line_missing_dash(void)
+{
+	/* No `-` separator → must reject. */
+	const char *line = "1 2 3:4 / /mnt rw shared:1 only_optionals_no_dash";
+	int mj = 99, mn = 99;
+	char *mnt = NULL, *fst = NULL;
+	ASSERT_EQ(parse_mountinfo_line(line, &mj, &mn, &mnt, &fst), 0);
+	ASSERT_NULL(mnt);
+	ASSERT_NULL(fst);
+}
+
+static void test_parse_mountinfo_line_too_few_fields(void)
+{
+	const char *line = "1 2 3:4";
+	int mj = 99, mn = 99;
+	char *mnt = NULL, *fst = NULL;
+	ASSERT_EQ(parse_mountinfo_line(line, &mj, &mn, &mnt, &fst), 0);
+	ASSERT_NULL(mnt);
+	ASSERT_NULL(fst);
+}
+
+static void test_parse_mountinfo_line_bad_majmin(void)
+{
+	const char *line = "1 2 BAD / /mnt rw - ext4 /dev/sda rw";
+	int mj = 99, mn = 99;
+	char *mnt = NULL, *fst = NULL;
+	ASSERT_EQ(parse_mountinfo_line(line, &mj, &mn, &mnt, &fst), 0);
+	ASSERT_NULL(mnt);
+	ASSERT_NULL(fst);
+}
+
+/* ============================================================
+ * v3 — collect.c — dedup_mounts
+ * ============================================================ */
+
+static void test_dedup_mounts_keeps_first(void)
+{
+	struct mount_entry arr[3] = {
+		{ 252, 1, strdup("/"),     strdup("ext4") },
+		{ 252, 1, strdup("/bind"), strdup("ext4") }, /* dup */
+		{ 8,   1, strdup("/data"), strdup("xfs")  },
+	};
+	size_t n = 3;
+	dedup_mounts(arr, &n);
+	ASSERT_EQ((long)n, 2L);
+	ASSERT_STR_EQ(arr[0].mount, "/");
+	ASSERT_EQ(arr[0].major, 252);
+	ASSERT_STR_EQ(arr[1].mount, "/data");
+	ASSERT_EQ(arr[1].major, 8);
+	free(arr[0].mount); free(arr[0].fstype);
+	free(arr[1].mount); free(arr[1].fstype);
+}
+
+static void test_dedup_mounts_no_dups_passthrough(void)
+{
+	struct mount_entry arr[2] = {
+		{ 252, 1, strdup("/"),     strdup("ext4") },
+		{ 8,   1, strdup("/data"), strdup("xfs")  },
+	};
+	size_t n = 2;
+	dedup_mounts(arr, &n);
+	ASSERT_EQ((long)n, 2L);
+	free(arr[0].mount); free(arr[0].fstype);
+	free(arr[1].mount); free(arr[1].fstype);
+}
+
+static void test_dedup_mounts_empty(void)
+{
+	struct mount_entry *arr = NULL;
+	size_t n = 0;
+	dedup_mounts(arr, &n);
+	ASSERT_EQ((long)n, 0L);
+}
+
+/* ============================================================
  * runner
  * ============================================================ */
 
@@ -516,6 +671,24 @@ int main(void)
 	RUN_TEST(test_parse_major_minor_basic);
 	RUN_TEST(test_parse_major_minor_two_digit);
 	RUN_TEST(test_parse_major_minor_invalid);
+
+	/* v3 — collect.c — is_excluded_fstype */
+	RUN_TEST(test_is_excluded_fstype_pseudo);
+	RUN_TEST(test_is_excluded_fstype_real);
+	RUN_TEST(test_is_excluded_fstype_null);
+
+	/* v3 — collect.c — parse_mountinfo_line */
+	RUN_TEST(test_parse_mountinfo_line_basic);
+	RUN_TEST(test_parse_mountinfo_line_one_optional);
+	RUN_TEST(test_parse_mountinfo_line_many_optionals);
+	RUN_TEST(test_parse_mountinfo_line_missing_dash);
+	RUN_TEST(test_parse_mountinfo_line_too_few_fields);
+	RUN_TEST(test_parse_mountinfo_line_bad_majmin);
+
+	/* v3 — collect.c — dedup_mounts */
+	RUN_TEST(test_dedup_mounts_keeps_first);
+	RUN_TEST(test_dedup_mounts_no_dups_passthrough);
+	RUN_TEST(test_dedup_mounts_empty);
 
 	return tt_summary();
 }
