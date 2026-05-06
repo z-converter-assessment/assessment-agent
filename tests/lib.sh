@@ -122,33 +122,102 @@ for m in msgs:
 '
 }
 
-# 큐에서 count건 소비하고 각 페이로드의 스키마를 검증.
-# 결과를 stdout에 출력. 실패 건이 있으면 exit 1.
+# 큐에서 count건 소비하고 각 페이로드의 스키마를 검증 (v3).
+# 사용:  validate_messages <count> [<queue>]
+#   queue 미지정 시 RABBITMQ_QUEUE 사용 (기본 server.metrics).
+# 메시지의 message_type 필드로 inventory/metrics/error 스키마를 자동 적용.
 validate_messages() {
     local count="${1:-1}"
+    local queue="${2:-$RABBITMQ_QUEUE}"
     curl -sS -u "$RABBITMQ_USER:$RABBITMQ_PASS" -X POST \
         -H 'Content-Type: application/json' \
         --data "$(printf '{"count":%s,"ackmode":"ack_requeue_false","encoding":"auto"}' "$count")" \
-        "$(_mgmt_url "/queues/$(vhost_encoded)/$RABBITMQ_QUEUE/get")" \
+        "$(_mgmt_url "/queues/$(vhost_encoded)/$queue/get")" \
         | python3 -c '
 import sys, json
 
-# (field_path, validator) — 모든 항목이 통과해야 OK
-SCHEMA = [
-    ("hostname",          lambda v: isinstance(v, str) and len(v) > 0),
-    ("nproc",             lambda v: isinstance(v, str) and v.strip().isdigit()),
-    ("free.mem_total_mb", lambda v: isinstance(v, (int, float)) and v > 0),
-    ("lsblk_raw",         lambda v: isinstance(v, list)),
-    ("ip_raw.internal",   lambda v: isinstance(v, list)),
-    ("ip_raw.external",   lambda v: isinstance(v, list)),
+def is_str(v):    return isinstance(v, str) and len(v) > 0
+def is_int(v):    return isinstance(v, int) and not isinstance(v, bool)
+def is_intlike(v):return isinstance(v, (int, float)) and not isinstance(v, bool)
+def is_list(v):   return isinstance(v, list)
+def is_obj(v):    return isinstance(v, dict)
+def is_kbnull(v): return v is None or (is_intlike(v) and v >= 0)
+
+# 공통 메타데이터 (모든 메시지)
+COMMON = [
+    ("message_type",  is_str),
+    ("machine_id",    is_str),
+    ("agent_version", is_str),
+    ("collected_at",  is_str),
+    ("hostname",      is_str),
+    ("message_id",    is_str),
 ]
 
-def get_nested(d, dotpath):
-    for key in dotpath.split("."):
-        if not isinstance(d, dict):
-            return None
-        d = d.get(key)
-    return d
+INVENTORY = COMMON + [
+    ("kernel_version", is_str),
+    ("cpu_cores",      lambda v: is_int(v) and v > 0),
+    ("mem_total_kb",   lambda v: is_int(v) and v > 0),
+    ("swap_total_kb",  is_kbnull),
+    ("disks",          is_list),
+    ("mounts",         is_list),
+    ("services",       lambda v: v is None or is_list(v)),  # v3: array|null
+    ("listen_ports",   is_list),                              # v3
+    ("ip_internal",    is_list),
+    ("boot_time",      is_str),
+]
+
+METRICS = COMMON + [
+    ("cpu_stat",         is_obj),
+    ("mem_total_kb",     lambda v: is_int(v) and v > 0),
+    ("mem_free_kb",      is_kbnull),
+    ("mem_available_kb", is_kbnull),
+    ("load_1m",          is_intlike),
+    ("load_5m",          is_intlike),
+    ("load_15m",         is_intlike),
+    ("disk_io",          is_list),
+    ("mounts",           is_list),
+    ("net_io",           is_list),
+]
+
+ERROR = COMMON + [
+    ("error_code",       is_str),
+    ("error_message",    lambda v: isinstance(v, str)),
+    ("failed_component", is_str),
+]
+
+# v3 추가 검증: 항목별 필드
+def validate_v3_arrays(p, errors):
+    # disks[]: name, major, minor (옵셔널), size_bytes, type
+    for i, d in enumerate(p.get("disks", [])):
+        loc = "disks[%d]" % i
+        if not is_str(d.get("name")):           errors.append(loc + ".name")
+        if not is_intlike(d.get("size_bytes")): errors.append(loc + ".size_bytes")
+        if not is_str(d.get("type")):           errors.append(loc + ".type")
+    # mounts[]: mount, major, minor, total/free/avail bytes (+ inventory: fstype)
+    for i, m in enumerate(p.get("mounts", [])):
+        loc = "mounts[%d]" % i
+        if not is_str(m.get("mount")):           errors.append(loc + ".mount")
+        if not is_intlike(m.get("total_bytes")): errors.append(loc + ".total_bytes")
+        if not is_intlike(m.get("free_bytes")):  errors.append(loc + ".free_bytes")
+        if not is_intlike(m.get("avail_bytes")): errors.append(loc + ".avail_bytes")
+    # listen_ports[]: proto, addr, port, uid, pid|null, comm|null (v3)
+    for i, lp in enumerate(p.get("listen_ports") or []):
+        loc = "listen_ports[%d]" % i
+        if lp.get("proto") not in ("tcp", "tcp6", "udp", "udp6"):
+            errors.append(loc + ".proto")
+        if not is_str(lp.get("addr")):              errors.append(loc + ".addr")
+        if not (is_int(lp.get("port")) and 0 < lp.get("port") < 65536):
+            errors.append(loc + ".port")
+        if not is_int(lp.get("uid")):               errors.append(loc + ".uid")
+    # services[]: unit, sub  (or null)
+    services = p.get("services")
+    if isinstance(services, list):
+        for i, s in enumerate(services):
+            loc = "services[%d]" % i
+            if not is_str(s.get("unit")): errors.append(loc + ".unit")
+            if not is_str(s.get("sub")):  errors.append(loc + ".sub")
+
+SCHEMAS = {"inventory": INVENTORY, "metrics": METRICS, "error": ERROR}
 
 try:
     msgs = json.load(sys.stdin)
@@ -170,15 +239,20 @@ for i, m in enumerate(msgs):
         fail += 1
         continue
     host = payload.get("hostname", "<unknown>")
-    errors = [p for p, check in SCHEMA if not check(get_nested(payload, p))]
-    mid = m.get("properties", {}).get("message_id", "")
-    if not mid:
-        errors.append("properties.message_id missing")
+    mt = payload.get("message_type", "?")
+    schema = SCHEMAS.get(mt)
+    if schema is None:
+        print("  " + idx + " FAIL  알 수 없는 message_type=" + str(mt))
+        fail += 1
+        continue
+    errors = [p for p, check in schema if not check(payload.get(p))]
+    if mt in ("inventory", "metrics"):
+        validate_v3_arrays(payload, errors)
     if errors:
-        print("  " + idx + " FAIL  " + host + ": " + ", ".join(errors))
+        print("  " + idx + " FAIL  " + mt + " " + host + ": " + ", ".join(errors))
         fail += 1
     else:
-        print("  " + idx + " OK    " + host + "  (id=" + mid + ")")
+        print("  " + idx + " OK    " + mt + " " + host)
 
 sys.exit(1 if fail else 0)
 '
