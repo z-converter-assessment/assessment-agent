@@ -107,6 +107,58 @@ static void add_kb_or_null(cJSON *root, const char *key, long val)
 	else         cJSON_AddNumberToObject(root, key, (double)val);
 }
 
+/**
+ * @brief Block device names the agent always excludes from disks[] / disk_io[].
+ *
+ * Universal noise across all target OSes:
+ *   - loop  : snap (Ubuntu), flatpak, losetup-mounted images
+ *   - ram   : ramdisk (always present, never analytical interest)
+ *   - sr    : optical drives / virtual CDROMs (cloud-init seed iso)
+ *   - fd    : floppy (legacy, but still enumerated by some kernels)
+ * Centralized here so lsblk / sysfs / diskstats apply identical policy.
+ */
+static int is_excluded_block_dev(const char *name)
+{
+	if (!name || !*name) return 1;
+	return strncmp(name, "loop", 4) == 0
+	    || strncmp(name, "ram",  3) == 0
+	    || strncmp(name, "sr",   2) == 0
+	    || strncmp(name, "fd",   2) == 0;
+}
+
+/**
+ * @brief Parse "MAJOR:MINOR" into two ints.
+ *
+ * Used by both lsblk JSON (`MAJ:MIN` column) and `/sys/block/<dev>/dev`
+ * sysfs file. Returns 1 on success and writes both ints; on failure both
+ * stay -1 so the caller can choose to omit the JSON fields.
+ */
+static int parse_major_minor(const char *s, int *major, int *minor)
+{
+	*major = -1;
+	*minor = -1;
+	if (!s) return 0;
+	const char *colon = strchr(s, ':');
+	if (!colon || colon == s) return 0;       /* require non-empty major */
+	char *end = NULL;
+	long mj = strtol(s, &end, 10);
+	if (end != colon) return 0;
+	long mn = strtol(colon + 1, &end, 10);
+	if (end == colon + 1) return 0;            /* require non-empty minor */
+	*major = (int)mj;
+	*minor = (int)mn;
+	return 1;
+}
+
+/**
+ * @brief Add `major`/`minor` int fields to @p obj, or skip when negative.
+ */
+static void add_major_minor(cJSON *obj, int major, int minor)
+{
+	if (major >= 0) cJSON_AddNumberToObject(obj, "major", (double)major);
+	if (minor >= 0) cJSON_AddNumberToObject(obj, "minor", (double)minor);
+}
+
 /* ============================================================
  * machine_id resolution
  * ============================================================ */
@@ -406,11 +458,18 @@ static int add_mem_total_swap_total(cJSON *root)
 }
 
 /**
- * @brief Collect disk list via `lsblk -dn -b -o NAME,SIZE,TYPE -J`.
+ * @brief Collect disk list via lsblk JSON output.
  *
- * Returns an empty array if lsblk is missing or its output is unparsable
- * (older util-linux predates `-J`, e.g. CentOS 7's 2.23 — see collect_disks
- * for the sysfs fallback path).
+ * Command: `lsblk -dn -b -e 7,11 -o NAME,MAJ:MIN,SIZE,TYPE -J`
+ *   -e 7,11 excludes loop (major 7) and sr/cdrom (major 11) at source.
+ *   MAJ:MIN is added so disks[] can be joined with mounts[] / disk_io[].
+ *
+ * Defense-in-depth: even with `-e`, the name prefix filter
+ * (`is_excluded_block_dev`) drops anything that slipped through.
+ *
+ * Returns an empty array if lsblk is missing or output is unparsable
+ * (older util-linux predates `-J`, e.g. CentOS 7's 2.23 — see
+ * collect_disks for the sysfs fallback path).
  */
 static cJSON *collect_disks_via_lsblk(void)
 {
@@ -418,7 +477,7 @@ static cJSON *collect_disks_via_lsblk(void)
 	if (!arr)
 		return NULL;
 
-	char *out = run_cmd("lsblk -dn -b -o NAME,SIZE,TYPE -J 2>/dev/null");
+	char *out = run_cmd("lsblk -dn -b -e 7,11 -o NAME,MAJ:MIN,SIZE,TYPE -J 2>/dev/null");
 	if (!out)
 		return arr;
 
@@ -431,13 +490,25 @@ static cJSON *collect_disks_via_lsblk(void)
 	cJSON *dev = NULL;
 	cJSON_ArrayForEach(dev, devices) {
 		cJSON *name = cJSON_GetObjectItemCaseSensitive(dev, "name");
+		/* util-linux pre-2.33 emits the JSON key as "MAJ:MIN" (uppercase);
+		 * 2.33+ emits "maj:min". Try lowercase first, then uppercase. */
+		cJSON *majmin = cJSON_GetObjectItemCaseSensitive(dev, "maj:min");
+		if (!majmin)
+			majmin = cJSON_GetObjectItemCaseSensitive(dev, "MAJ:MIN");
 		cJSON *size = cJSON_GetObjectItemCaseSensitive(dev, "size");
 		cJSON *type = cJSON_GetObjectItemCaseSensitive(dev, "type");
 		if (!cJSON_IsString(name))
 			continue;
+		if (is_excluded_block_dev(name->valuestring))
+			continue;
+
+		int major = -1, minor = -1;
+		if (cJSON_IsString(majmin))
+			parse_major_minor(majmin->valuestring, &major, &minor);
 
 		cJSON *item = cJSON_CreateObject();
 		cJSON_AddStringToObject(item, "name", name->valuestring);
+		add_major_minor(item, major, minor);
 
 		double size_bytes = 0;
 		if (cJSON_IsNumber(size))
@@ -458,9 +529,11 @@ static cJSON *collect_disks_via_lsblk(void)
  * @brief Fallback disk list from /sys/block (no lsblk required).
  *
  * Used on hosts where lsblk is missing or too old for `-J` (e.g. CentOS 7
- * util-linux 2.23). Skips loop/ram and entries without `/sys/block/<name>/device`
- * (synthetic devices). `type` is always reported as `"disk"` since sysfs
- * does not classify rotational vs SSD vs LVM at this layer.
+ * util-linux 2.23). Applies the same exclusion policy as the lsblk path
+ * via `is_excluded_block_dev`. Skips entries without `/sys/block/<name>/device`
+ * (synthetic devices). `major`/`minor` come from `/sys/block/<name>/dev`.
+ * `type` is always `"disk"` since sysfs does not classify rotational vs SSD
+ * vs LVM at this layer.
  */
 static cJSON *collect_disks_via_sysfs(void)
 {
@@ -476,8 +549,7 @@ static cJSON *collect_disks_via_sysfs(void)
 	while ((e = readdir(d)) != NULL) {
 		if (e->d_name[0] == '.')
 			continue;
-		if (strncmp(e->d_name, "loop", 4) == 0 ||
-		    strncmp(e->d_name, "ram",  3) == 0)
+		if (is_excluded_block_dev(e->d_name))
 			continue;
 
 		char path[512];
@@ -494,8 +566,18 @@ static cJSON *collect_disks_via_sysfs(void)
 		if (sectors <= 0)
 			continue;
 
+		int major = -1, minor = -1;
+		snprintf(path, sizeof path, "/sys/block/%s/dev", e->d_name);
+		char *dev_str = read_file_all(path);
+		if (dev_str) {
+			trim_inplace(dev_str);
+			parse_major_minor(dev_str, &major, &minor);
+			free(dev_str);
+		}
+
 		cJSON *item = cJSON_CreateObject();
 		cJSON_AddStringToObject(item, "name", e->d_name);
+		add_major_minor(item, major, minor);
 		cJSON_AddNumberToObject(item, "size_bytes", (double)sectors * 512.0);
 		cJSON_AddStringToObject(item, "type", "disk");
 		cJSON_AddItemToArray(arr, item);
@@ -899,8 +981,13 @@ static int add_loadavg(cJSON *root)
 /**
  * @brief Parse /proc/diskstats first 14 columns per device.
  *
- * Skips loop / ram devices and partitions of common parents (heuristic:
- * keep entries that match a real /sys/block/<name>).
+ * Filtering policy (matches inventory.disks[]):
+ *   - Excludes loop / ram / sr / fd via is_excluded_block_dev.
+ *   - Keeps only top-level block devices: /sys/block/<dev> must exist
+ *     (drops partitions like vda1 by leaving them out of the parent's row).
+ *
+ * Emits major/minor so the engine can join with inventory.disks[] /
+ * mounts[] without doing string-level device-name matching.
  */
 static cJSON *collect_disk_io(void)
 {
@@ -929,7 +1016,7 @@ static cJSON *collect_disk_io(void)
 		               &ios_in_progress, &time_io, &weighted_time);
 		if (n < 7)
 			continue;
-		if (strncmp(dev, "loop", 4) == 0 || strncmp(dev, "ram", 3) == 0)
+		if (is_excluded_block_dev(dev))
 			continue;
 
 		/* Only keep top-level block devices: /sys/block/<dev> exists. */
@@ -940,6 +1027,7 @@ static cJSON *collect_disk_io(void)
 
 		cJSON *item = cJSON_CreateObject();
 		cJSON_AddStringToObject(item, "device", dev);
+		add_major_minor(item, (int)major, (int)minor);
 		cJSON_AddNumberToObject(item, "reads_completed",  (double)reads_completed);
 		cJSON_AddNumberToObject(item, "writes_completed", (double)writes_completed);
 		cJSON_AddNumberToObject(item, "sectors_read",     (double)sectors_read);

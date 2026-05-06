@@ -373,6 +373,82 @@ static void test_add_kb_or_null_negative(void)
 }
 
 /* ============================================================
+ * v3 — collect.c — is_excluded_block_dev
+ * ============================================================ */
+
+static void test_is_excluded_block_dev_loop(void)
+{
+	ASSERT_EQ(is_excluded_block_dev("loop0"),  1);
+	ASSERT_EQ(is_excluded_block_dev("loop42"), 1);
+}
+
+static void test_is_excluded_block_dev_ram_sr_fd(void)
+{
+	ASSERT_EQ(is_excluded_block_dev("ram0"), 1);
+	ASSERT_EQ(is_excluded_block_dev("sr0"),  1);
+	ASSERT_EQ(is_excluded_block_dev("sr15"), 1);
+	ASSERT_EQ(is_excluded_block_dev("fd0"),  1);
+}
+
+static void test_is_excluded_block_dev_real_disks_kept(void)
+{
+	ASSERT_EQ(is_excluded_block_dev("sda"),   0);
+	ASSERT_EQ(is_excluded_block_dev("vda"),   0);
+	ASSERT_EQ(is_excluded_block_dev("nvme0n1"), 0);
+	ASSERT_EQ(is_excluded_block_dev("xvda"),  0);
+	ASSERT_EQ(is_excluded_block_dev("dm-0"),  0);
+}
+
+static void test_is_excluded_block_dev_null_empty(void)
+{
+	ASSERT_EQ(is_excluded_block_dev(NULL), 1);
+	ASSERT_EQ(is_excluded_block_dev(""),   1);
+}
+
+/* "ramen" is not a real device but proves the prefix policy fires on
+ * 3 chars; documents that the helper is intentionally a prefix match,
+ * not a wholename match. */
+static void test_is_excluded_block_dev_prefix_policy(void)
+{
+	ASSERT_EQ(is_excluded_block_dev("ramen"), 1);
+	ASSERT_EQ(is_excluded_block_dev("loopxx"), 1);
+}
+
+/* ============================================================
+ * v3 — collect.c — parse_major_minor
+ * ============================================================ */
+
+static void test_parse_major_minor_basic(void)
+{
+	int mj = -1, mn = -1;
+	ASSERT_EQ(parse_major_minor("252:0", &mj, &mn), 1);
+	ASSERT_EQ(mj, 252);
+	ASSERT_EQ(mn, 0);
+}
+
+static void test_parse_major_minor_two_digit(void)
+{
+	int mj = -1, mn = -1;
+	ASSERT_EQ(parse_major_minor("8:16", &mj, &mn), 1);
+	ASSERT_EQ(mj, 8);
+	ASSERT_EQ(mn, 16);
+}
+
+static void test_parse_major_minor_invalid(void)
+{
+	int mj = 99, mn = 99;
+	ASSERT_EQ(parse_major_minor("bad", &mj, &mn), 0);
+	ASSERT_EQ(mj, -1);
+	ASSERT_EQ(mn, -1);
+	mj = mn = 99;
+	ASSERT_EQ(parse_major_minor(":5", &mj, &mn), 0);
+	mj = mn = 99;
+	ASSERT_EQ(parse_major_minor("5:", &mj, &mn), 0);
+	mj = mn = 99;
+	ASSERT_EQ(parse_major_minor(NULL, &mj, &mn), 0);
+}
+
+/* ============================================================
  * runner
  * ============================================================ */
 
@@ -428,6 +504,18 @@ int main(void)
 	RUN_TEST(test_add_kb_or_null_positive);
 	RUN_TEST(test_add_kb_or_null_zero);
 	RUN_TEST(test_add_kb_or_null_negative);
+
+	/* v3 — collect.c — is_excluded_block_dev */
+	RUN_TEST(test_is_excluded_block_dev_loop);
+	RUN_TEST(test_is_excluded_block_dev_ram_sr_fd);
+	RUN_TEST(test_is_excluded_block_dev_real_disks_kept);
+	RUN_TEST(test_is_excluded_block_dev_null_empty);
+	RUN_TEST(test_is_excluded_block_dev_prefix_policy);
+
+	/* v3 — collect.c — parse_major_minor */
+	RUN_TEST(test_parse_major_minor_basic);
+	RUN_TEST(test_parse_major_minor_two_digit);
+	RUN_TEST(test_parse_major_minor_invalid);
 
 	return tt_summary();
 }
