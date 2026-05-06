@@ -16,12 +16,14 @@
 #include <cjson/cJSON.h>
 
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <ifaddrs.h>
 #include <limits.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -76,6 +78,86 @@ static void add_common_metadata(cJSON *obj,
 	char uuid_buf[64];
 	uuid_v4(uuid_buf, sizeof uuid_buf);
 	cJSON_AddStringToObject(obj, "message_id", uuid_buf);
+}
+
+/* ============================================================
+ * Small helpers
+ * ============================================================ */
+
+/**
+ * @brief Return @p arr if non-NULL, else a freshly created empty array.
+ *
+ * Guards JSON output against array fields becoming missing on
+ * cJSON_CreateArray() failure inside a collector.
+ */
+static cJSON *or_empty_array(cJSON *arr)
+{
+	return arr ? arr : cJSON_CreateArray();
+}
+
+/**
+ * @brief Add @p key as a kB number, or null if @p val is negative.
+ *
+ * Negative inputs come from meminfo_get_kb() when a line is missing or
+ * unparseable. "Couldn't read" is encoded as JSON null rather than 0
+ * so it can be distinguished from a real zero reading downstream.
+ */
+static void add_kb_or_null(cJSON *root, const char *key, long val)
+{
+	if (val < 0) cJSON_AddNullToObject(root, key);
+	else         cJSON_AddNumberToObject(root, key, (double)val);
+}
+
+/**
+ * @brief Block device names the agent always excludes from disks[] / disk_io[].
+ *
+ * Universal noise across all target OSes:
+ *   - loop  : snap (Ubuntu), flatpak, losetup-mounted images
+ *   - ram   : ramdisk (always present, never analytical interest)
+ *   - sr    : optical drives / virtual CDROMs (cloud-init seed iso)
+ *   - fd    : floppy (legacy, but still enumerated by some kernels)
+ * Centralized here so lsblk / sysfs / diskstats apply identical policy.
+ */
+static int is_excluded_block_dev(const char *name)
+{
+	if (!name || !*name) return 1;
+	return strncmp(name, "loop", 4) == 0
+	    || strncmp(name, "ram",  3) == 0
+	    || strncmp(name, "sr",   2) == 0
+	    || strncmp(name, "fd",   2) == 0;
+}
+
+/**
+ * @brief Parse "MAJOR:MINOR" into two ints.
+ *
+ * Used by both lsblk JSON (`MAJ:MIN` column) and `/sys/block/<dev>/dev`
+ * sysfs file. Returns 1 on success and writes both ints; on failure both
+ * stay -1 so the caller can choose to omit the JSON fields.
+ */
+static int parse_major_minor(const char *s, int *major, int *minor)
+{
+	*major = -1;
+	*minor = -1;
+	if (!s) return 0;
+	const char *colon = strchr(s, ':');
+	if (!colon || colon == s) return 0;       /* require non-empty major */
+	char *end = NULL;
+	long mj = strtol(s, &end, 10);
+	if (end != colon) return 0;
+	long mn = strtol(colon + 1, &end, 10);
+	if (end == colon + 1) return 0;            /* require non-empty minor */
+	*major = (int)mj;
+	*minor = (int)mn;
+	return 1;
+}
+
+/**
+ * @brief Add `major`/`minor` int fields to @p obj, or skip when negative.
+ */
+static void add_major_minor(cJSON *obj, int major, int minor)
+{
+	if (major >= 0) cJSON_AddNumberToObject(obj, "major", (double)major);
+	if (minor >= 0) cJSON_AddNumberToObject(obj, "minor", (double)minor);
 }
 
 /* ============================================================
@@ -135,12 +217,16 @@ static const char *detect_cloud_vendor(void)
 	trim_inplace(vendor);
 
 	const char *result = NULL;
-	if (strstr(vendor, "Amazon") || strstr(vendor, "Xen"))
+	if (strstr(vendor, "Amazon"))
 		result = "aws";
 	else if (strstr(vendor, "Microsoft"))
 		result = "azure";
 	else if (strstr(vendor, "Google"))
 		result = "gcp";
+	/* Legacy AWS Xen instances had sys_vendor="Xen". Modern Nitro is
+	 * "Amazon EC2", and non-AWS Xen IaaS exists, so we no longer treat
+	 * a bare "Xen" vendor as AWS. Hosts that lose vendor detection
+	 * fall back to /etc/machine-id and dbus-uuidgen. */
 
 	free(vendor);
 	return result;
@@ -368,23 +454,31 @@ static int add_mem_total_swap_total(cJSON *root)
 	if (mem_total < 0)
 		return 0;
 	cJSON_AddNumberToObject(root, "mem_total_kb", (double)mem_total);
-	cJSON_AddNumberToObject(root, "swap_total_kb",
-	                        swap_total < 0 ? 0.0 : (double)swap_total);
+	add_kb_or_null(root, "swap_total_kb", swap_total);
 	return 1;
 }
 
 /**
- * @brief Collect disk list via `lsblk -dn -b -o NAME,SIZE,TYPE -J`.
+ * @brief Collect disk list via lsblk JSON output.
  *
- * Empty array on failure (not treated as fatal — mounts[] still informs).
+ * Command: `lsblk -dn -b -e 7,11 -o NAME,MAJ:MIN,SIZE,TYPE -J`
+ *   -e 7,11 excludes loop (major 7) and sr/cdrom (major 11) at source.
+ *   MAJ:MIN is added so disks[] can be joined with mounts[] / disk_io[].
+ *
+ * Defense-in-depth: even with `-e`, the name prefix filter
+ * (`is_excluded_block_dev`) drops anything that slipped through.
+ *
+ * Returns an empty array if lsblk is missing or output is unparsable
+ * (older util-linux predates `-J`, e.g. CentOS 7's 2.23 — see
+ * collect_disks for the sysfs fallback path).
  */
-static cJSON *collect_disks(void)
+static cJSON *collect_disks_via_lsblk(void)
 {
 	cJSON *arr = cJSON_CreateArray();
 	if (!arr)
 		return NULL;
 
-	char *out = run_cmd("lsblk -dn -b -o NAME,SIZE,TYPE -J 2>/dev/null");
+	char *out = run_cmd("lsblk -dn -b -e 7,11 -o NAME,MAJ:MIN,SIZE,TYPE -J 2>/dev/null");
 	if (!out)
 		return arr;
 
@@ -397,13 +491,25 @@ static cJSON *collect_disks(void)
 	cJSON *dev = NULL;
 	cJSON_ArrayForEach(dev, devices) {
 		cJSON *name = cJSON_GetObjectItemCaseSensitive(dev, "name");
+		/* util-linux pre-2.33 emits the JSON key as "MAJ:MIN" (uppercase);
+		 * 2.33+ emits "maj:min". Try lowercase first, then uppercase. */
+		cJSON *majmin = cJSON_GetObjectItemCaseSensitive(dev, "maj:min");
+		if (!majmin)
+			majmin = cJSON_GetObjectItemCaseSensitive(dev, "MAJ:MIN");
 		cJSON *size = cJSON_GetObjectItemCaseSensitive(dev, "size");
 		cJSON *type = cJSON_GetObjectItemCaseSensitive(dev, "type");
 		if (!cJSON_IsString(name))
 			continue;
+		if (is_excluded_block_dev(name->valuestring))
+			continue;
+
+		int major = -1, minor = -1;
+		if (cJSON_IsString(majmin))
+			parse_major_minor(majmin->valuestring, &major, &minor);
 
 		cJSON *item = cJSON_CreateObject();
 		cJSON_AddStringToObject(item, "name", name->valuestring);
+		add_major_minor(item, major, minor);
 
 		double size_bytes = 0;
 		if (cJSON_IsNumber(size))
@@ -421,76 +527,287 @@ static cJSON *collect_disks(void)
 }
 
 /**
- * @brief List mountpoints from /proc/mounts, skip pseudo filesystems.
+ * @brief Fallback disk list from /sys/block (no lsblk required).
  *
- * @return malloc'd array of malloc'd `mount<TAB>fstype` strings, NULL-terminated.
- *         Caller frees each entry then the array.
+ * Used on hosts where lsblk is missing or too old for `-J` (e.g. CentOS 7
+ * util-linux 2.23). Applies the same exclusion policy as the lsblk path
+ * via `is_excluded_block_dev`. Skips entries without `/sys/block/<name>/device`
+ * (synthetic devices). `major`/`minor` come from `/sys/block/<name>/dev`.
+ * `type` is always `"disk"` since sysfs does not classify rotational vs SSD
+ * vs LVM at this layer.
  */
-static char **list_real_mounts(void)
+static cJSON *collect_disks_via_sysfs(void)
 {
-	char *content = read_file_all("/proc/mounts");
-	if (!content)
+	cJSON *arr = cJSON_CreateArray();
+	if (!arr)
 		return NULL;
 
-	size_t cap = 16, count = 0;
-	char **arr = malloc(sizeof *arr * cap);
-	if (!arr) {
+	DIR *d = opendir("/sys/block");
+	if (!d)
+		return arr;
+
+	struct dirent *e;
+	while ((e = readdir(d)) != NULL) {
+		if (e->d_name[0] == '.')
+			continue;
+		if (is_excluded_block_dev(e->d_name))
+			continue;
+
+		char path[512];
+		snprintf(path, sizeof path, "/sys/block/%s/device", e->d_name);
+		if (access(path, F_OK) != 0)
+			continue;
+
+		snprintf(path, sizeof path, "/sys/block/%s/size", e->d_name);
+		char *content = read_file_all(path);
+		if (!content)
+			continue;
+		long sectors = strtol(content, NULL, 10);
 		free(content);
-		return NULL;
-	}
-
-	const char *skip_fs[] = {
-		"proc", "sysfs", "cgroup", "cgroup2", "devpts", "tmpfs",
-		"devtmpfs", "mqueue", "hugetlbfs", "fusectl", "debugfs",
-		"tracefs", "securityfs", "pstore", "autofs", "rpc_pipefs",
-		"binfmt_misc", "configfs", "bpf", "ramfs", "overlay", "squashfs",
-		NULL,
-	};
-
-	char *save = NULL;
-	for (char *line = strtok_r(content, "\n", &save); line;
-	     line = strtok_r(NULL, "\n", &save)) {
-		char *tok_save = NULL;
-		char *src   = strtok_r(line, " ", &tok_save);
-		char *mnt   = strtok_r(NULL, " ", &tok_save);
-		char *fstype = strtok_r(NULL, " ", &tok_save);
-		if (!src || !mnt || !fstype)
+		if (sectors <= 0)
 			continue;
 
-		int skip = 0;
-		for (int i = 0; skip_fs[i]; i++) {
-			if (strcmp(fstype, skip_fs[i]) == 0) {
-				skip = 1;
-				break;
-			}
+		int major = -1, minor = -1;
+		snprintf(path, sizeof path, "/sys/block/%s/dev", e->d_name);
+		char *dev_str = read_file_all(path);
+		if (dev_str) {
+			trim_inplace(dev_str);
+			parse_major_minor(dev_str, &major, &minor);
+			free(dev_str);
 		}
-		if (skip)
-			continue;
 
-		size_t need = strlen(mnt) + 1 + strlen(fstype) + 1;
-		char *entry = malloc(need);
-		if (!entry)
-			continue;
-		snprintf(entry, need, "%s\t%s", mnt, fstype);
-
-		if (count + 2 > cap) {
-			cap *= 2;
-			char **nr = realloc(arr, sizeof *arr * cap);
-			if (!nr) {
-				free(entry);
-				break;
-			}
-			arr = nr;
-		}
-		arr[count++] = entry;
+		cJSON *item = cJSON_CreateObject();
+		cJSON_AddStringToObject(item, "name", e->d_name);
+		add_major_minor(item, major, minor);
+		cJSON_AddNumberToObject(item, "size_bytes", (double)sectors * 512.0);
+		cJSON_AddStringToObject(item, "type", "disk");
+		cJSON_AddItemToArray(arr, item);
 	}
-	arr[count] = NULL;
-	free(content);
+	closedir(d);
 	return arr;
 }
 
 /**
- * @brief Build inventory `mounts[]` (raw bytes + fstype).
+ * @brief Disk list with lsblk-first, /sys/block fallback.
+ *
+ * lsblk knows partition vs disk vs LVM types and reports byte-accurate
+ * sizes, so it is preferred. If lsblk is unavailable (missing binary,
+ * pre-2.27 util-linux without `-J`) or returns no entries, we fall through
+ * to a minimal /sys/block scan that always works on Linux 2.6+.
+ */
+static cJSON *collect_disks(void)
+{
+	cJSON *arr = collect_disks_via_lsblk();
+	if (arr && cJSON_GetArraySize(arr) > 0)
+		return arr;
+	cJSON_Delete(arr);
+	return collect_disks_via_sysfs();
+}
+
+/**
+ * @brief Pseudo / virtual filesystems excluded from mounts[].
+ *
+ * These exist for kernel/snap/k8s interfaces, not user data storage.
+ * Centralised so inventory.mounts[] and metrics.mounts[] always agree.
+ *
+ *   nsfs     — k8s / container namespaces
+ *   squashfs — snap (Ubuntu) and other read-only image mounts
+ *   overlay  — container layered fs (docker/podman/k8s)
+ *   tmpfs/devtmpfs/proc/sysfs/cgroup* etc — kernel pseudo-fs
+ */
+static int is_excluded_fstype(const char *fstype)
+{
+	static const char *skip_fs[] = {
+		"proc", "sysfs", "cgroup", "cgroup2", "devpts", "tmpfs",
+		"devtmpfs", "mqueue", "hugetlbfs", "fusectl", "debugfs",
+		"tracefs", "securityfs", "pstore", "autofs", "rpc_pipefs",
+		"binfmt_misc", "configfs", "bpf", "ramfs", "overlay", "squashfs",
+		"nsfs",
+		/* container / VM virtual fs */
+		"9p", "virtiofs", "fuse.lxcfs", "fuse.gvfsd-fuse",
+		NULL,
+	};
+	if (!fstype) return 1;
+	for (int i = 0; skip_fs[i]; i++)
+		if (strcmp(fstype, skip_fs[i]) == 0)
+			return 1;
+	return 0;
+}
+
+/**
+ * @brief Single mount entry produced by list_real_mounts().
+ *
+ * `mount` and `fstype` are owned malloc'd strings. (major,minor) is the
+ * device id parsed from /proc/self/mountinfo field 3. Used as the dedup
+ * key so bind mounts (same device, multiple mountpoints) only count once.
+ */
+struct mount_entry {
+	int   major;
+	int   minor;
+	char *mount;
+	char *fstype;
+};
+
+static void free_mount_entries(struct mount_entry *arr, size_t n)
+{
+	if (!arr) return;
+	for (size_t i = 0; i < n; i++) {
+		free(arr[i].mount);
+		free(arr[i].fstype);
+	}
+	free(arr);
+}
+
+/**
+ * @brief Parse a single /proc/self/mountinfo line.
+ *
+ * Format (man 5 proc):
+ *   ID PARENT MAJOR:MINOR ROOT MOUNTPOINT MOUNT_OPTS [optional...] - FSTYPE SOURCE SUPER_OPTS
+ *
+ * Single-pass token scan — only positions 3 (maj:min), 5 (mount), and
+ * the field after "-" (fstype) are captured. Avoids any fixed-size
+ * fields[] cap so hosts with many optional fields (mount propagation
+ * tags: shared:N master:M propagate_from:K unbindable, …) parse safely.
+ *
+ * Mountpoints with whitespace appear as `\040`-escaped — left as-is
+ * (rare in our target environments; engine can decode if it matters).
+ *
+ * @return 1 on full success and writes @p major, @p minor, @p mount_out
+ *         (malloc'd), @p fstype_out (malloc'd). 0 on parse failure
+ *         (out-pointers untouched).
+ */
+static int parse_mountinfo_line(const char *line,
+                                int *major, int *minor,
+                                char **mount_out, char **fstype_out)
+{
+	char *copy = strdup(line);
+	if (!copy) return 0;
+
+	int mj = -1, mn = -1;
+	char *mnt = NULL, *fst = NULL;
+	int seen_dash = 0;
+	int idx = 0;
+
+	char *save = NULL;
+	for (char *tok = strtok_r(copy, " ", &save); tok;
+	     tok = strtok_r(NULL, " ", &save)) {
+		idx++;
+		if (idx == 3) {
+			if (!parse_major_minor(tok, &mj, &mn)) goto fail;
+		} else if (idx == 5) {
+			mnt = strdup(tok);
+			if (!mnt) goto fail;
+		} else if (!seen_dash && idx >= 7
+		           && tok[0] == '-' && tok[1] == '\0') {
+			seen_dash = 1;
+		} else if (seen_dash && !fst) {
+			fst = strdup(tok);
+			if (!fst) goto fail;
+			break; /* fstype is the only post-dash field we need */
+		}
+	}
+	free(copy);
+
+	if (mj < 0 || !mnt || !fst) {
+		free(mnt); free(fst);
+		return 0;
+	}
+
+	*major = mj;
+	*minor = mn;
+	*mount_out = mnt;
+	*fstype_out = fst;
+	return 1;
+
+fail:
+	free(copy);
+	free(mnt);
+	free(fst);
+	return 0;
+}
+
+/**
+ * @brief Dedup by (major, minor). Keeps the first occurrence (typically the
+ *        canonical mountpoint; bind mounts are skipped).
+ *
+ * In-place: rewrites @p arr and updates @p count. Frees freed-out entries'
+ * strings. Stable order — first-seen wins.
+ */
+static void dedup_mounts(struct mount_entry *arr, size_t *count)
+{
+	size_t out = 0;
+	for (size_t i = 0; i < *count; i++) {
+		int seen = 0;
+		for (size_t j = 0; j < out; j++) {
+			if (arr[j].major == arr[i].major &&
+			    arr[j].minor == arr[i].minor) {
+				seen = 1;
+				break;
+			}
+		}
+		if (seen) {
+			free(arr[i].mount);
+			free(arr[i].fstype);
+			continue;
+		}
+		if (out != i) arr[out] = arr[i];
+		out++;
+	}
+	*count = out;
+}
+
+/**
+ * @brief Build the canonical mount list from /proc/self/mountinfo.
+ *
+ * Excludes pseudo filesystems (`is_excluded_fstype`) and dedups by
+ * (major,minor) so bind mounts of the same device only appear once.
+ *
+ * @param out_count  receives entry count.
+ * @return malloc'd array (caller frees via free_mount_entries) or NULL on
+ *         OOM / mountinfo unreadable. *out_count is 0 in that case.
+ */
+static struct mount_entry *list_real_mounts(size_t *out_count)
+{
+	*out_count = 0;
+	char *content = read_file_all("/proc/self/mountinfo");
+	if (!content) return NULL;
+
+	size_t cap = 16, count = 0;
+	struct mount_entry *arr = malloc(sizeof *arr * cap);
+	if (!arr) { free(content); return NULL; }
+
+	char *save = NULL;
+	for (char *line = strtok_r(content, "\n", &save); line;
+	     line = strtok_r(NULL, "\n", &save)) {
+		int mj = -1, mn = -1;
+		char *mnt = NULL, *fst = NULL;
+		if (!parse_mountinfo_line(line, &mj, &mn, &mnt, &fst))
+			continue;
+		if (is_excluded_fstype(fst)) {
+			free(mnt); free(fst);
+			continue;
+		}
+		if (count + 1 > cap) {
+			cap *= 2;
+			struct mount_entry *nr = realloc(arr, sizeof *arr * cap);
+			if (!nr) { free(mnt); free(fst); break; }
+			arr = nr;
+		}
+		arr[count].major = mj;
+		arr[count].minor = mn;
+		arr[count].mount = mnt;
+		arr[count].fstype = fst;
+		count++;
+	}
+	free(content);
+
+	dedup_mounts(arr, &count);
+	*out_count = count;
+	return arr;
+}
+
+/**
+ * @brief Build inventory `mounts[]` (raw bytes + fstype + major/minor).
  */
 static cJSON *collect_mounts_inventory(void)
 {
@@ -498,44 +815,34 @@ static cJSON *collect_mounts_inventory(void)
 	if (!arr)
 		return NULL;
 
-	char **mounts = list_real_mounts();
-	if (!mounts)
-		return arr;
-
-	for (size_t i = 0; mounts[i]; i++) {
-		char *tab = strchr(mounts[i], '\t');
-		if (!tab) {
-			free(mounts[i]);
-			continue;
-		}
-		*tab = '\0';
-		const char *mnt = mounts[i];
-		const char *fstype = tab + 1;
-
+	size_t n = 0;
+	struct mount_entry *mounts = list_real_mounts(&n);
+	for (size_t i = 0; i < n; i++) {
 		struct statvfs st;
-		if (statvfs(mnt, &st) != 0) {
-			free(mounts[i]);
+		if (statvfs(mounts[i].mount, &st) != 0)
 			continue;
-		}
 		double total = (double)st.f_blocks * (double)st.f_frsize;
 		double freeb = (double)st.f_bfree  * (double)st.f_frsize;
 		double avail = (double)st.f_bavail * (double)st.f_frsize;
 
 		cJSON *item = cJSON_CreateObject();
-		cJSON_AddStringToObject(item, "mount", mnt);
+		cJSON_AddStringToObject(item, "mount", mounts[i].mount);
+		add_major_minor(item, mounts[i].major, mounts[i].minor);
 		cJSON_AddNumberToObject(item, "total_bytes", total);
 		cJSON_AddNumberToObject(item, "free_bytes", freeb);
 		cJSON_AddNumberToObject(item, "avail_bytes", avail);
-		cJSON_AddStringToObject(item, "fstype", fstype);
+		cJSON_AddStringToObject(item, "fstype", mounts[i].fstype);
 		cJSON_AddItemToArray(arr, item);
-		free(mounts[i]);
 	}
-	free(mounts);
+	free_mount_entries(mounts, n);
 	return arr;
 }
 
 /**
- * @brief Build metrics `mounts[]` (raw bytes only — no fstype, no usage_pct).
+ * @brief Build metrics `mounts[]` (raw bytes + major/minor; no fstype).
+ *
+ * fstype lives in inventory only — it doesn't change per metric tick and
+ * keeping it out of the 60-second message reduces wire traffic.
  */
 static cJSON *collect_mounts_metrics(void)
 {
@@ -543,33 +850,25 @@ static cJSON *collect_mounts_metrics(void)
 	if (!arr)
 		return NULL;
 
-	char **mounts = list_real_mounts();
-	if (!mounts)
-		return arr;
-
-	for (size_t i = 0; mounts[i]; i++) {
-		char *tab = strchr(mounts[i], '\t');
-		if (tab) *tab = '\0';
-		const char *mnt = mounts[i];
-
+	size_t n = 0;
+	struct mount_entry *mounts = list_real_mounts(&n);
+	for (size_t i = 0; i < n; i++) {
 		struct statvfs st;
-		if (statvfs(mnt, &st) != 0) {
-			free(mounts[i]);
+		if (statvfs(mounts[i].mount, &st) != 0)
 			continue;
-		}
 		double total = (double)st.f_blocks * (double)st.f_frsize;
 		double freeb = (double)st.f_bfree  * (double)st.f_frsize;
 		double avail = (double)st.f_bavail * (double)st.f_frsize;
 
 		cJSON *item = cJSON_CreateObject();
-		cJSON_AddStringToObject(item, "mount", mnt);
+		cJSON_AddStringToObject(item, "mount", mounts[i].mount);
+		add_major_minor(item, mounts[i].major, mounts[i].minor);
 		cJSON_AddNumberToObject(item, "total_bytes", total);
 		cJSON_AddNumberToObject(item, "free_bytes", freeb);
 		cJSON_AddNumberToObject(item, "avail_bytes", avail);
 		cJSON_AddItemToArray(arr, item);
-		free(mounts[i]);
 	}
-	free(mounts);
+	free_mount_entries(mounts, n);
 	return arr;
 }
 
@@ -666,6 +965,329 @@ static cJSON *collect_external_ip(void)
 	return arr;
 }
 
+/**
+ * @brief Collect active systemd service units.
+ *
+ * Source: `systemctl list-units --type=service --state=running --no-pager
+ *         --plain --no-legend`
+ * Output line layout: `UNIT  LOAD  ACTIVE  SUB  DESCRIPTION...`
+ *
+ * On non-systemd hosts (Amazon Linux 1, custom containers) systemctl is
+ * absent — `run_cmd` returns NULL and we emit a JSON null literal so the
+ * engine can distinguish "no systemd" from "systemd present, no running
+ * services" (the latter yields an empty array).
+ *
+ * Per v3 contract: agent emits raw unit names; categorisation
+ * (`web`/`db`/...) and OS-name normalisation (`httpd`↔`apache2`) is the
+ * engine's responsibility — keeps the per-OS mapping table out of the
+ * binary so adding an OS does not require an agent re-deploy.
+ */
+static cJSON *collect_services(void)
+{
+	char *out = run_cmd(
+		"systemctl list-units --type=service --state=running "
+		"--no-pager --plain --no-legend 2>/dev/null");
+	if (!out)
+		return cJSON_CreateNull();
+
+	cJSON *arr = cJSON_CreateArray();
+	if (!arr) { free(out); return NULL; }
+
+	char *save = NULL;
+	for (char *line = strtok_r(out, "\n", &save); line;
+	     line = strtok_r(NULL, "\n", &save)) {
+		char *tok_save = NULL;
+		char *unit   = strtok_r(line, " \t", &tok_save);
+		if (!unit || !*unit) continue;
+		char *load   = strtok_r(NULL, " \t", &tok_save);
+		char *active = strtok_r(NULL, " \t", &tok_save);
+		char *sub    = strtok_r(NULL, " \t", &tok_save);
+		(void)load; (void)active;
+		if (!sub) continue;
+
+		cJSON *item = cJSON_CreateObject();
+		cJSON_AddStringToObject(item, "unit", unit);
+		cJSON_AddStringToObject(item, "sub",  sub);
+		cJSON_AddItemToArray(arr, item);
+	}
+	free(out);
+	return arr;
+}
+
+/* ============================================================
+ * listen_ports[] — TCP listen sockets + owning process
+ * ============================================================ */
+
+/**
+ * @brief Map entry: socket inode → owning pid + comm.
+ *
+ * Built once per inventory tick by walking /proc/<pid>/fd. comm is a fixed
+ * 64-byte buffer (Linux TASK_COMM_LEN is 16; 64 is comfortable headroom for
+ * any future widening).
+ */
+struct sock_inode_owner {
+	long inode;
+	int  pid;
+	char comm[64];
+};
+
+static int read_pid_comm(int pid, char *out, size_t out_len)
+{
+	if (!out || out_len == 0) return 0;
+	out[0] = '\0';
+	char path[64];
+	snprintf(path, sizeof path, "/proc/%d/comm", pid);
+	char *content = read_file_all(path);
+	if (!content) return 0;
+	trim_inplace(content);
+	strncpy(out, content, out_len - 1);
+	out[out_len - 1] = '\0';
+	free(content);
+	return 1;
+}
+
+/**
+ * @brief Walk /proc/PID/fd/N to build a socket-inode → (pid, comm) map.
+ *
+ * Unprivileged agent: many `/proc/<pid>/fd` directories are unreadable
+ * (EACCES — owned by a different uid). Those are silently skipped, leaving
+ * those sockets with `pid`/`comm` = null in the final output. uid is still
+ * recoverable from /proc/net/tcp regardless.
+ *
+ * @return malloc'd array (caller frees) or NULL on opendir failure / OOM.
+ *         *@p out_count receives the entry count.
+ */
+static struct sock_inode_owner *build_socket_owner_map(size_t *out_count)
+{
+	*out_count = 0;
+	DIR *proc = opendir("/proc");
+	if (!proc) return NULL;
+
+	size_t cap = 256, count = 0;
+	struct sock_inode_owner *map = malloc(sizeof *map * cap);
+	if (!map) { closedir(proc); return NULL; }
+
+	struct dirent *e;
+	while ((e = readdir(proc)) != NULL) {
+		char *end = NULL;
+		long pid = strtol(e->d_name, &end, 10);
+		if (!end || *end != '\0' || pid <= 0) continue;
+
+		char fd_dir[64];
+		snprintf(fd_dir, sizeof fd_dir, "/proc/%ld/fd", pid);
+		DIR *fdd = opendir(fd_dir);
+		if (!fdd) continue;
+
+		char comm[64] = { 0 };
+		read_pid_comm((int)pid, comm, sizeof comm);
+
+		struct dirent *fe;
+		while ((fe = readdir(fdd)) != NULL) {
+			if (fe->d_name[0] == '.') continue;
+			char fd_path[160], target[256];
+			snprintf(fd_path, sizeof fd_path, "%s/%s", fd_dir, fe->d_name);
+			ssize_t n = readlink(fd_path, target, sizeof target - 1);
+			if (n <= 0) continue;
+			target[n] = '\0';
+			if (strncmp(target, "socket:[", 8) != 0) continue;
+			long inode = strtol(target + 8, NULL, 10);
+			if (inode <= 0) continue;
+
+			if (count + 1 > cap) {
+				cap *= 2;
+				struct sock_inode_owner *nr = realloc(map, sizeof *map * cap);
+				if (!nr) { closedir(fdd); goto done; }
+				map = nr;
+			}
+			map[count].inode = inode;
+			map[count].pid = (int)pid;
+			strncpy(map[count].comm, comm, sizeof map[count].comm - 1);
+			map[count].comm[sizeof map[count].comm - 1] = '\0';
+			count++;
+		}
+		closedir(fdd);
+	}
+done:
+	closedir(proc);
+	*out_count = count;
+	return map;
+}
+
+/**
+ * @brief Decode `/proc/net/tcp` IPv4 hex address (8 hex chars, host order).
+ *
+ * The kernel writes the 32-bit IP via `%08X` from a host-order int, so on
+ * x86_64 (little-endian) `127.0.0.1` (network byte order 0x7F000001) is
+ * stored as int 0x0100007F and printed `"0100007F"`. Extracting bytes
+ * LSB-first reconstructs the dotted quad.
+ *
+ * x86_64 only — matches the agent's target architecture (CLAUDE.md).
+ */
+static void parse_tcp_v4_hex_addr(const char *hex8, char *out, size_t out_len)
+{
+	unsigned int a = (unsigned int)strtoul(hex8, NULL, 16);
+	snprintf(out, out_len, "%u.%u.%u.%u",
+	         a & 0xff, (a >> 8) & 0xff,
+	         (a >> 16) & 0xff, (a >> 24) & 0xff);
+}
+
+/**
+ * @brief Decode `/proc/net/tcp6` IPv6 hex address (32 hex chars).
+ *
+ * Stored as 4 little-endian uint32. Each is byte-swapped into network order
+ * to populate `struct in6_addr`, then formatted via inet_ntop.
+ */
+static void parse_tcp_v6_hex_addr(const char *hex32, char *out, size_t out_len)
+{
+	struct in6_addr addr;
+	memset(&addr, 0, sizeof addr);
+	for (int i = 0; i < 4; i++) {
+		char buf[9];
+		memcpy(buf, hex32 + i * 8, 8);
+		buf[8] = '\0';
+		unsigned int dw = (unsigned int)strtoul(buf, NULL, 16);
+		addr.s6_addr[i * 4 + 0] = (uint8_t)( dw        & 0xff);
+		addr.s6_addr[i * 4 + 1] = (uint8_t)((dw >> 8)  & 0xff);
+		addr.s6_addr[i * 4 + 2] = (uint8_t)((dw >> 16) & 0xff);
+		addr.s6_addr[i * 4 + 3] = (uint8_t)((dw >> 24) & 0xff);
+	}
+	inet_ntop(AF_INET6, &addr, out, (socklen_t)out_len);
+}
+
+/* TCP_LISTEN per linux/include/net/tcp_states.h is 0x0A. */
+#define TCP_STATE_LISTEN_HEX "0A"
+
+/**
+ * @brief Returns 1 if @p remote is an all-zero address:port string.
+ *
+ * /proc/net/{tcp,udp}{,6} prints the remote endpoint as "addr:port"
+ * (hex). UDP sockets without a `connect()`ed peer have all-zero remote
+ * — used as the "server-like / no peer" filter for UDP since UDP has no
+ * LISTEN state.
+ */
+static int is_remote_unconnected(const char *remote)
+{
+	if (!remote || !*remote) return 0;
+	for (const char *p = remote; *p; p++) {
+		if (*p == ':') continue;
+		if (*p != '0') return 0;
+	}
+	return 1;
+}
+
+/**
+ * @brief Parse `/proc/net/{tcp,udp}{,6}` and append server-like sockets to @p arr.
+ *
+ * Format columns (post-`sl:`): local rem state tx_q:rx_q tr:tm retr uid
+ *                              timeout inode [...].
+ *
+ * @param is_udp  0 = TCP (filter state == "0A" LISTEN)
+ *                1 = UDP (filter remote == 0:0, i.e. no connect()ed peer —
+ *                         covers bound server sockets and unconnected
+ *                         clients alike; engine can post-filter ephemeral
+ *                         high ports if needed)
+ */
+static void scan_proto_sockets(const char *path, const char *proto,
+                               int is_v6, int is_udp,
+                               cJSON *arr,
+                               const struct sock_inode_owner *map, size_t map_n)
+{
+	char *content = read_file_all(path);
+	if (!content) return;
+
+	int line_no = 0;
+	char *save = NULL;
+	for (char *line = strtok_r(content, "\n", &save); line;
+	     line = strtok_r(NULL, "\n", &save)) {
+		if (line_no++ == 0) continue; /* header row */
+
+		while (*line == ' ' || *line == '\t') line++;
+		char *colon = strchr(line, ':');
+		if (!colon) continue;
+		char *rest = colon + 1;
+		while (*rest == ' ' || *rest == '\t') rest++;
+
+		char local[80], remote[80], state[8];
+		char txrxq[40], trtm[40], retr[16];
+		long uid = 0, timeout = 0, inode = 0;
+		int n = sscanf(rest,
+		               "%79s %79s %7s %39s %39s %15s %ld %ld %ld",
+		               local, remote, state, txrxq, trtm, retr,
+		               &uid, &timeout, &inode);
+		if (n < 9) continue;
+
+		if (is_udp) {
+			if (!is_remote_unconnected(remote)) continue;
+		} else {
+			if (strcmp(state, TCP_STATE_LISTEN_HEX) != 0) continue;
+		}
+
+		char *port_sep = strrchr(local, ':');
+		if (!port_sep) continue;
+		*port_sep = '\0';
+		unsigned int port = (unsigned int)strtoul(port_sep + 1, NULL, 16);
+		if (port == 0) continue;
+
+		char addr_buf[INET6_ADDRSTRLEN] = { 0 };
+		if (is_v6) {
+			if (strlen(local) != 32) continue;
+			parse_tcp_v6_hex_addr(local, addr_buf, sizeof addr_buf);
+		} else {
+			if (strlen(local) != 8) continue;
+			parse_tcp_v4_hex_addr(local, addr_buf, sizeof addr_buf);
+		}
+
+		int pid = -1;
+		const char *comm = NULL;
+		for (size_t i = 0; i < map_n; i++) {
+			if (map[i].inode == inode) {
+				pid = map[i].pid;
+				comm = map[i].comm;
+				break;
+			}
+		}
+
+		cJSON *item = cJSON_CreateObject();
+		cJSON_AddStringToObject(item, "proto", proto);
+		cJSON_AddStringToObject(item, "addr", addr_buf);
+		cJSON_AddNumberToObject(item, "port", (double)port);
+		cJSON_AddNumberToObject(item, "uid",  (double)uid);
+		if (pid > 0) cJSON_AddNumberToObject(item, "pid", (double)pid);
+		else         cJSON_AddNullToObject(item, "pid");
+		if (comm && *comm) cJSON_AddStringToObject(item, "comm", comm);
+		else               cJSON_AddNullToObject(item, "comm");
+		cJSON_AddItemToArray(arr, item);
+	}
+	free(content);
+}
+
+/**
+ * @brief Build inventory `listen_ports[]` from /proc/net/{tcp,udp}{,6}.
+ *
+ * Combines:
+ *   - TCP LISTEN sockets (state == 0A)
+ *   - UDP unconnected sockets (no `connect()`ed peer — typical server pattern)
+ *
+ * Per-socket `pid`/`comm` may be `null` when the socket is owned by a
+ * process the unprivileged agent cannot inspect; `uid` is always populated.
+ */
+static cJSON *collect_listen_ports(void)
+{
+	cJSON *arr = cJSON_CreateArray();
+	if (!arr) return NULL;
+
+	size_t map_n = 0;
+	struct sock_inode_owner *map = build_socket_owner_map(&map_n);
+
+	scan_proto_sockets("/proc/net/tcp",  "tcp",  0, 0, arr, map, map_n);
+	scan_proto_sockets("/proc/net/tcp6", "tcp6", 1, 0, arr, map, map_n);
+	scan_proto_sockets("/proc/net/udp",  "udp",  0, 1, arr, map, map_n);
+	scan_proto_sockets("/proc/net/udp6", "udp6", 1, 1, arr, map, map_n);
+
+	free(map);
+	return arr;
+}
+
 static int add_boot_time(cJSON *root)
 {
 	char *content = read_file_all("/proc/uptime");
@@ -699,9 +1321,13 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 	add_cpu_model(root);
 	if (!add_mem_total_swap_total(root)) ok = 0;
 
-	cJSON_AddItemToObject(root, "disks",       collect_disks());
-	cJSON_AddItemToObject(root, "mounts",      collect_mounts_inventory());
-	cJSON_AddItemToObject(root, "ip_internal", collect_internal_ips());
+	cJSON_AddItemToObject(root, "disks",       or_empty_array(collect_disks()));
+	cJSON_AddItemToObject(root, "mounts",      or_empty_array(collect_mounts_inventory()));
+	/* services may be null literal by design (non-systemd host). */
+	cJSON_AddItemToObject(root, "services",     collect_services());
+	cJSON_AddItemToObject(root, "listen_ports", or_empty_array(collect_listen_ports()));
+	cJSON_AddItemToObject(root, "ip_internal",  or_empty_array(collect_internal_ips()));
+	/* ip_external may be null literal by design (cloud metadata unreachable). */
 	cJSON_AddItemToObject(root, "ip_external", collect_external_ip());
 
 	if (!add_boot_time(root)) ok = 0;
@@ -757,23 +1383,24 @@ static int add_meminfo_full(cJSON *root)
 
 	if (mem_total < 0)
 		return 0;
+
 	cJSON_AddNumberToObject(root, "mem_total_kb", (double)mem_total);
-	cJSON_AddNumberToObject(root, "mem_free_kb",  mem_free  < 0 ? 0.0 : (double)mem_free);
+	add_kb_or_null(root, "mem_free_kb",    mem_free);
+	add_kb_or_null(root, "mem_buffers_kb", mem_buffers);
+	add_kb_or_null(root, "mem_cached_kb",  mem_cached);
+	add_kb_or_null(root, "swap_total_kb",  swap_total);
+	add_kb_or_null(root, "swap_free_kb",   swap_free);
+
 	if (mem_available < 0) {
 		/* CentOS 7.0~7.1 fallback: MemFree + Buffers + Cached. */
-		if (mem_free >= 0 && mem_buffers >= 0 && mem_cached >= 0) {
+		if (mem_free >= 0 && mem_buffers >= 0 && mem_cached >= 0)
 			cJSON_AddNumberToObject(root, "mem_available_kb",
 			                        (double)(mem_free + mem_buffers + mem_cached));
-		} else {
+		else
 			cJSON_AddNullToObject(root, "mem_available_kb");
-		}
 	} else {
 		cJSON_AddNumberToObject(root, "mem_available_kb", (double)mem_available);
 	}
-	cJSON_AddNumberToObject(root, "mem_buffers_kb", mem_buffers < 0 ? 0.0 : (double)mem_buffers);
-	cJSON_AddNumberToObject(root, "mem_cached_kb",  mem_cached  < 0 ? 0.0 : (double)mem_cached);
-	cJSON_AddNumberToObject(root, "swap_total_kb",  swap_total  < 0 ? 0.0 : (double)swap_total);
-	cJSON_AddNumberToObject(root, "swap_free_kb",   swap_free   < 0 ? 0.0 : (double)swap_free);
 	return 1;
 }
 
@@ -796,8 +1423,13 @@ static int add_loadavg(cJSON *root)
 /**
  * @brief Parse /proc/diskstats first 14 columns per device.
  *
- * Skips loop / ram devices and partitions of common parents (heuristic:
- * keep entries that match a real /sys/block/<name>).
+ * Filtering policy (matches inventory.disks[]):
+ *   - Excludes loop / ram / sr / fd via is_excluded_block_dev.
+ *   - Keeps only top-level block devices: /sys/block/<dev> must exist
+ *     (drops partitions like vda1 by leaving them out of the parent's row).
+ *
+ * Emits major/minor so the engine can join with inventory.disks[] /
+ * mounts[] without doing string-level device-name matching.
  */
 static cJSON *collect_disk_io(void)
 {
@@ -826,7 +1458,7 @@ static cJSON *collect_disk_io(void)
 		               &ios_in_progress, &time_io, &weighted_time);
 		if (n < 7)
 			continue;
-		if (strncmp(dev, "loop", 4) == 0 || strncmp(dev, "ram", 3) == 0)
+		if (is_excluded_block_dev(dev))
 			continue;
 
 		/* Only keep top-level block devices: /sys/block/<dev> exists. */
@@ -837,6 +1469,7 @@ static cJSON *collect_disk_io(void)
 
 		cJSON *item = cJSON_CreateObject();
 		cJSON_AddStringToObject(item, "device", dev);
+		add_major_minor(item, (int)major, (int)minor);
 		cJSON_AddNumberToObject(item, "reads_completed",  (double)reads_completed);
 		cJSON_AddNumberToObject(item, "writes_completed", (double)writes_completed);
 		cJSON_AddNumberToObject(item, "sectors_read",     (double)sectors_read);
@@ -876,16 +1509,17 @@ static cJSON *collect_net_io(void)
 
 		long rx_bytes = 0, rx_packets = 0, rx_errors = 0;
 		long tx_bytes = 0, tx_packets = 0, tx_errors = 0;
-		/* /proc/net/dev: rx: bytes packets errs drop fifo frame compressed multicast | tx: bytes packets errs drop fifo colls carrier compressed */
-		long unused;
+		/* /proc/net/dev rx: bytes packets errs drop fifo frame compressed multicast
+		 *               tx: bytes packets errs drop fifo colls carrier compressed
+		 * We only keep bytes/packets/errors per direction; the rest are skipped
+		 * with assignment-suppression (%*d) so the matched-count reflects the
+		 * fields we actually need. */
 		int n = sscanf(colon + 1,
-		               "%ld %ld %ld %ld %ld %ld %ld %ld "
-		               "%ld %ld %ld %ld %ld %ld %ld %ld",
-		               &rx_bytes, &rx_packets, &rx_errors, &unused,
-		               &unused, &unused, &unused, &unused,
-		               &tx_bytes, &tx_packets, &tx_errors, &unused,
-		               &unused, &unused, &unused, &unused);
-		if (n < 11)
+		               "%ld %ld %ld %*d %*d %*d %*d %*d "
+		               "%ld %ld %ld",
+		               &rx_bytes, &rx_packets, &rx_errors,
+		               &tx_bytes, &tx_packets, &tx_errors);
+		if (n < 6)
 			continue;
 
 		cJSON *item = cJSON_CreateObject();
@@ -914,9 +1548,9 @@ cJSON *collect_metrics_payload(const char *machine_id, const char *agent_version
 	if (!add_meminfo_full(root)) ok = 0;
 	if (!add_loadavg(root))      ok = 0;
 
-	cJSON_AddItemToObject(root, "disk_io", collect_disk_io());
-	cJSON_AddItemToObject(root, "mounts",  collect_mounts_metrics());
-	cJSON_AddItemToObject(root, "net_io",  collect_net_io());
+	cJSON_AddItemToObject(root, "disk_io", or_empty_array(collect_disk_io()));
+	cJSON_AddItemToObject(root, "mounts",  or_empty_array(collect_mounts_metrics()));
+	cJSON_AddItemToObject(root, "net_io",  or_empty_array(collect_net_io()));
 
 	if (!ok) {
 		cJSON_Delete(root);

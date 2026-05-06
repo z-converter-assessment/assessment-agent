@@ -29,11 +29,11 @@
 #include <amqp_ssl_socket.h>
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
-
-#define CONFIRM_TIMEOUT_SEC 5
 
 static int check_rpc(amqp_rpc_reply_t r, const char *ctx)
 {
@@ -55,17 +55,43 @@ static int check_rpc(amqp_rpc_reply_t r, const char *ctx)
 	return -1;
 }
 
+/**
+ * @brief Wait for broker ACK/NACK with a wall-clock deadline.
+ *
+ * The per-call @c tv passed to amqp_simple_wait_frame_noblock is a select(2)
+ * timeout, not a deadline. If the broker delivers an unrelated frame on
+ * channel 1 before the ACK, the loop's `continue` would otherwise restart
+ * a fresh timeout each iteration. Tracking the deadline ourselves caps
+ * total wait at @c RABBITMQ_CONFIRM_TIMEOUT_SEC.
+ */
 static int wait_confirm(amqp_connection_state_t conn)
 {
-	struct timeval tv = { .tv_sec = CONFIRM_TIMEOUT_SEC, .tv_usec = 0 };
+	int t = atoi(getenv_default("RABBITMQ_CONFIRM_TIMEOUT_SEC", "5"));
+	long limit_ms = (long)(t > 0 ? t : 5) * 1000;
+
+	struct timespec start;
+	clock_gettime(CLOCK_MONOTONIC, &start);
+
 	amqp_frame_t frame;
 	for (;;) {
-		amqp_maybe_release_buffers(conn);
-		int status = amqp_simple_wait_frame_noblock(conn, &frame, &tv);
-		if (status == AMQP_STATUS_TIMEOUT) {
+		struct timespec now;
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000
+		                + (now.tv_nsec - start.tv_nsec) / 1000000;
+		long remain_ms = limit_ms - elapsed_ms;
+		if (remain_ms <= 0) {
 			fprintf(stderr, "[publish] confirm: timed out waiting for broker ACK\n");
 			return -1;
 		}
+		struct timeval tv = {
+			.tv_sec  = remain_ms / 1000,
+			.tv_usec = (remain_ms % 1000) * 1000,
+		};
+
+		amqp_maybe_release_buffers(conn);
+		int status = amqp_simple_wait_frame_noblock(conn, &frame, &tv);
+		if (status == AMQP_STATUS_TIMEOUT)
+			continue; /* loop will detect deadline expiry */
 		if (status != AMQP_STATUS_OK) {
 			fprintf(stderr, "[publish] confirm: frame error: %s\n",
 			        amqp_error_string2(status));
