@@ -654,6 +654,39 @@ static void test_parse_tcp_v6_hex_addr_loopback(void)
 }
 
 /* ============================================================
+ * v3 — collect.c — is_remote_unconnected (UDP listen filter)
+ * ============================================================ */
+
+static void test_is_remote_unconnected_v4_zero(void)
+{
+	ASSERT_EQ(is_remote_unconnected("00000000:0000"), 1);
+}
+
+static void test_is_remote_unconnected_v6_zero(void)
+{
+	ASSERT_EQ(is_remote_unconnected(
+		"00000000000000000000000000000000:0000"), 1);
+}
+
+static void test_is_remote_unconnected_with_peer_v4(void)
+{
+	/* 8.8.8.8:53 → "08080808:0035" — connect()'d, must be rejected. */
+	ASSERT_EQ(is_remote_unconnected("08080808:0035"), 0);
+}
+
+static void test_is_remote_unconnected_only_port_set(void)
+{
+	/* Address all-zero but port non-zero: still considered "connected". */
+	ASSERT_EQ(is_remote_unconnected("00000000:0035"), 0);
+}
+
+static void test_is_remote_unconnected_null_empty(void)
+{
+	ASSERT_EQ(is_remote_unconnected(NULL), 0);
+	ASSERT_EQ(is_remote_unconnected(""),   0);
+}
+
+/* ============================================================
  * runner
  * ============================================================ */
 
@@ -748,6 +781,13 @@ int main(void)
 	/* v3 — collect.c — parse_tcp_v6_hex_addr */
 	RUN_TEST(test_parse_tcp_v6_hex_addr_unspecified);
 	RUN_TEST(test_parse_tcp_v6_hex_addr_loopback);
+
+	/* v3 — collect.c — is_remote_unconnected (UDP listen filter) */
+	RUN_TEST(test_is_remote_unconnected_v4_zero);
+	RUN_TEST(test_is_remote_unconnected_v6_zero);
+	RUN_TEST(test_is_remote_unconnected_with_peer_v4);
+	RUN_TEST(test_is_remote_unconnected_only_port_set);
+	RUN_TEST(test_is_remote_unconnected_null_empty);
 
 	return tt_summary();
 }

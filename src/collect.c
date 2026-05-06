@@ -1158,15 +1158,39 @@ static void parse_tcp_v6_hex_addr(const char *hex32, char *out, size_t out_len)
 #define TCP_STATE_LISTEN_HEX "0A"
 
 /**
- * @brief Parse `/proc/net/tcp{,6}` and append LISTEN sockets to @p arr.
+ * @brief Returns 1 if @p remote is an all-zero address:port string.
+ *
+ * /proc/net/{tcp,udp}{,6} prints the remote endpoint as "addr:port"
+ * (hex). UDP sockets without a `connect()`ed peer have all-zero remote
+ * — used as the "server-like / no peer" filter for UDP since UDP has no
+ * LISTEN state.
+ */
+static int is_remote_unconnected(const char *remote)
+{
+	if (!remote || !*remote) return 0;
+	for (const char *p = remote; *p; p++) {
+		if (*p == ':') continue;
+		if (*p != '0') return 0;
+	}
+	return 1;
+}
+
+/**
+ * @brief Parse `/proc/net/{tcp,udp}{,6}` and append server-like sockets to @p arr.
  *
  * Format columns (post-`sl:`): local rem state tx_q:rx_q tr:tm retr uid
  *                              timeout inode [...].
- * Only state == "0A" (LISTEN) is emitted.
+ *
+ * @param is_udp  0 = TCP (filter state == "0A" LISTEN)
+ *                1 = UDP (filter remote == 0:0, i.e. no connect()ed peer —
+ *                         covers bound server sockets and unconnected
+ *                         clients alike; engine can post-filter ephemeral
+ *                         high ports if needed)
  */
-static void scan_tcp_listen(const char *path, const char *proto, int is_v6,
-                            cJSON *arr,
-                            const struct sock_inode_owner *map, size_t map_n)
+static void scan_proto_sockets(const char *path, const char *proto,
+                               int is_v6, int is_udp,
+                               cJSON *arr,
+                               const struct sock_inode_owner *map, size_t map_n)
 {
 	char *content = read_file_all(path);
 	if (!content) return;
@@ -1191,7 +1215,12 @@ static void scan_tcp_listen(const char *path, const char *proto, int is_v6,
 		               local, remote, state, txrxq, trtm, retr,
 		               &uid, &timeout, &inode);
 		if (n < 9) continue;
-		if (strcmp(state, TCP_STATE_LISTEN_HEX) != 0) continue;
+
+		if (is_udp) {
+			if (!is_remote_unconnected(remote)) continue;
+		} else {
+			if (strcmp(state, TCP_STATE_LISTEN_HEX) != 0) continue;
+		}
 
 		char *port_sep = strrchr(local, ':');
 		if (!port_sep) continue;
@@ -1233,11 +1262,14 @@ static void scan_tcp_listen(const char *path, const char *proto, int is_v6,
 }
 
 /**
- * @brief Build inventory `listen_ports[]` from /proc/net/tcp{,6}.
+ * @brief Build inventory `listen_ports[]` from /proc/net/{tcp,udp}{,6}.
  *
- * Combines IPv4 + IPv6 listen sockets. Per-socket `pid`/`comm` may be
- * `null` when the socket is owned by a process the unprivileged agent
- * cannot inspect; `uid` is always populated.
+ * Combines:
+ *   - TCP LISTEN sockets (state == 0A)
+ *   - UDP unconnected sockets (no `connect()`ed peer — typical server pattern)
+ *
+ * Per-socket `pid`/`comm` may be `null` when the socket is owned by a
+ * process the unprivileged agent cannot inspect; `uid` is always populated.
  */
 static cJSON *collect_listen_ports(void)
 {
@@ -1247,8 +1279,10 @@ static cJSON *collect_listen_ports(void)
 	size_t map_n = 0;
 	struct sock_inode_owner *map = build_socket_owner_map(&map_n);
 
-	scan_tcp_listen("/proc/net/tcp",  "tcp",  0, arr, map, map_n);
-	scan_tcp_listen("/proc/net/tcp6", "tcp6", 1, arr, map, map_n);
+	scan_proto_sockets("/proc/net/tcp",  "tcp",  0, 0, arr, map, map_n);
+	scan_proto_sockets("/proc/net/tcp6", "tcp6", 1, 0, arr, map, map_n);
+	scan_proto_sockets("/proc/net/udp",  "udp",  0, 1, arr, map, map_n);
+	scan_proto_sockets("/proc/net/udp6", "udp6", 1, 1, arr, map, map_n);
 
 	free(map);
 	return arr;
