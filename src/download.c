@@ -1,0 +1,248 @@
+/**
+ * @file download.c
+ * @brief HTTPS download with sha256 + size cap + host whitelist + disk check.
+ *
+ * Pipeline: pre-flight checks (HTTPS scheme, host in whitelist, /tmp space) →
+ * libcurl streaming GET (redirects disabled, TLS verify on) → write callback
+ * tees body bytes to a sha256 EVP context and the destination file, aborting
+ * the transfer on byte overflow → final digest compare. None of the failure
+ * branches leave a partial file at the destination — partial files are
+ * deleted on every non-OK return.
+ */
+
+#define _POSIX_C_SOURCE 200809L
+
+#include "download.h"
+#include "util.h"
+
+#include <curl/curl.h>
+#include <openssl/evp.h>
+
+#include <ctype.h>
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/statvfs.h>
+#include <unistd.h>
+
+/* ============================================================
+ * Helpers — host parsing / whitelist
+ * ============================================================ */
+
+void download_str_tolower(char *s)
+{
+	if (!s) return;
+	for (; *s; s++) *s = (char)tolower((unsigned char)*s);
+}
+
+int download_url_extract_host(const char *url, char *out, size_t out_sz)
+{
+	if (!url || !out || out_sz == 0) return 0;
+	const char *prefix = "https://";
+	size_t plen = strlen(prefix);
+	if (strncasecmp(url, prefix, plen) != 0) return 0;
+
+	const char *p = url + plen;
+	/* Skip userinfo if present. */
+	const char *at = strchr(p, '@');
+	const char *slash = strchr(p, '/');
+	if (at && (!slash || at < slash)) p = at + 1;
+
+	/* End of host = first '/' or ':' or end-of-string. */
+	size_t i = 0;
+	while (p[i] && p[i] != '/' && p[i] != ':' && p[i] != '?' && p[i] != '#') i++;
+	if (i == 0 || i >= out_sz) return 0;
+
+	memcpy(out, p, i);
+	out[i] = '\0';
+	download_str_tolower(out);
+	return 1;
+}
+
+int download_host_allowed(const char *host, const char *allowed_hosts_csv)
+{
+	if (!host || !*host) return 0;
+	if (!allowed_hosts_csv || !*allowed_hosts_csv) return 0;
+
+	char host_lc[256];
+	size_t hlen = strlen(host);
+	if (hlen >= sizeof host_lc) return 0;
+	memcpy(host_lc, host, hlen + 1);
+	download_str_tolower(host_lc);
+
+	const char *p = allowed_hosts_csv;
+	while (*p) {
+		/* Skip leading whitespace and commas. */
+		while (*p == ',' || *p == ' ' || *p == '\t') p++;
+		if (!*p) break;
+
+		const char *start = p;
+		while (*p && *p != ',') p++;
+		size_t tlen = (size_t)(p - start);
+		/* Trim trailing whitespace. */
+		while (tlen > 0 && (start[tlen - 1] == ' ' || start[tlen - 1] == '\t')) tlen--;
+		if (tlen == 0 || tlen >= sizeof host_lc) continue;
+
+		char tok[256];
+		memcpy(tok, start, tlen);
+		tok[tlen] = '\0';
+		download_str_tolower(tok);
+
+		if (strcmp(tok, host_lc) == 0) return 1;
+	}
+	return 0;
+}
+
+/* ============================================================
+ * Disk space pre-flight
+ * ============================================================ */
+
+static int has_enough_space(const char *tmp_dir,
+                            int64_t expected_size_bytes,
+                            int disk_reserve_mb)
+{
+	struct statvfs st;
+	if (statvfs(tmp_dir, &st) != 0) return 0;
+	uint64_t avail = (uint64_t)st.f_bavail * (uint64_t)st.f_frsize;
+	uint64_t need  = (uint64_t)expected_size_bytes +
+	                 (uint64_t)disk_reserve_mb * 1024ULL * 1024ULL;
+	return avail >= need;
+}
+
+/* ============================================================
+ * libcurl write callback — tees to file + sha256 + size cap
+ * ============================================================ */
+
+struct sink {
+	FILE          *fp;
+	EVP_MD_CTX    *md;
+	int64_t        written;
+	int64_t        cap;
+	int            overflow;
+};
+
+static size_t write_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
+{
+	struct sink *s = (struct sink *)userdata;
+	size_t n = size * nmemb;
+	if (s->overflow) return 0;
+	if ((int64_t)(s->written + (int64_t)n) > s->cap) {
+		s->overflow = 1;
+		return 0; /* tells libcurl to abort the transfer */
+	}
+	if (fwrite(ptr, 1, n, s->fp) != n)            return 0;
+	if (EVP_DigestUpdate(s->md, ptr, n) != 1)     return 0;
+	s->written += (int64_t)n;
+	return n;
+}
+
+/* ============================================================
+ * Public — download_package
+ * ============================================================ */
+
+static int hex_eq_ci(const char *a, const char *b)
+{
+	if (!a || !b) return 0;
+	while (*a && *b) {
+		if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
+		a++; b++;
+	}
+	return *a == 0 && *b == 0;
+}
+
+download_status_t download_package(const char *url,
+                                   const char *expected_sha256_hex,
+                                   int64_t     expected_size_bytes,
+                                   const char *allowed_hosts_csv,
+                                   const char *tmp_dir,
+                                   int         disk_reserve_mb,
+                                   const char *out_path)
+{
+	if (!url || !expected_sha256_hex || !out_path) return DOWNLOAD_ERR_INTERNAL;
+	if (expected_size_bytes <= 0)                  return DOWNLOAD_ERR_DOWNLOAD_FAILED;
+
+	/* 1. HTTPS scheme + host whitelist (the only gate before opening files). */
+	char host[256];
+	if (!download_url_extract_host(url, host, sizeof host))   return DOWNLOAD_ERR_URL_NOT_ALLOWED;
+	if (!download_host_allowed(host, allowed_hosts_csv))      return DOWNLOAD_ERR_URL_NOT_ALLOWED;
+
+	/* 2. Disk space pre-flight. */
+	if (!has_enough_space(tmp_dir ? tmp_dir : "/tmp",
+	                      expected_size_bytes, disk_reserve_mb))
+		return DOWNLOAD_ERR_INSUFFICIENT_DISK;
+
+	/* 3. Open destination + sha256 context. */
+	FILE *fp = fopen(out_path, "wb");
+	if (!fp) return DOWNLOAD_ERR_INTERNAL;
+
+	EVP_MD_CTX *md = EVP_MD_CTX_new();
+	if (!md) { fclose(fp); unlink(out_path); return DOWNLOAD_ERR_INTERNAL; }
+	if (EVP_DigestInit_ex(md, EVP_sha256(), NULL) != 1) {
+		EVP_MD_CTX_free(md); fclose(fp); unlink(out_path);
+		return DOWNLOAD_ERR_INTERNAL;
+	}
+
+	struct sink s = { .fp = fp, .md = md, .written = 0,
+	                  .cap = expected_size_bytes, .overflow = 0 };
+
+	/* 4. libcurl easy handle with strict defaults. */
+	CURL *c = curl_easy_init();
+	if (!c) { EVP_MD_CTX_free(md); fclose(fp); unlink(out_path); return DOWNLOAD_ERR_INTERNAL; }
+
+	download_status_t rc = DOWNLOAD_OK;
+	long http_code = 0;
+
+	curl_easy_setopt(c, CURLOPT_URL, url);
+	curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR, "https");      /* HTTPS only */
+	curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 0L);          /* RD2: redirect off */
+	curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 1L);
+	curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 2L);
+	curl_easy_setopt(c, CURLOPT_FAILONERROR, 1L);             /* 4xx/5xx → error */
+	curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);                /* don't override SIGPIPE etc. */
+	curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 10L);
+	curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 1024L);      /* < 1 KB/s for */
+	curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, 60L);         /* 60s = abort */
+	curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
+	curl_easy_setopt(c, CURLOPT_WRITEDATA, &s);
+
+	CURLcode cc = curl_easy_perform(c);
+	curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &http_code);
+	curl_easy_cleanup(c);
+	fclose(fp);
+
+	if (cc != CURLE_OK) {
+		if (s.overflow) rc = DOWNLOAD_ERR_DOWNLOAD_FAILED;     /* size cap exceeded */
+		else            rc = DOWNLOAD_ERR_DOWNLOAD_FAILED;
+		EVP_MD_CTX_free(md); unlink(out_path); return rc;
+	}
+	if (http_code >= 300) {                                    /* incl. 3xx redirects */
+		EVP_MD_CTX_free(md); unlink(out_path);
+		return DOWNLOAD_ERR_DOWNLOAD_FAILED;
+	}
+	if (s.written != expected_size_bytes) {                    /* under-/over-shoot */
+		EVP_MD_CTX_free(md); unlink(out_path);
+		return DOWNLOAD_ERR_DOWNLOAD_FAILED;
+	}
+
+	/* 5. Final sha256 compare. */
+	unsigned char raw[EVP_MAX_MD_SIZE];
+	unsigned int  raw_len = 0;
+	if (EVP_DigestFinal_ex(md, raw, &raw_len) != 1 || raw_len != 32) {
+		EVP_MD_CTX_free(md); unlink(out_path);
+		return DOWNLOAD_ERR_INTERNAL;
+	}
+	EVP_MD_CTX_free(md);
+
+	char got[65] = { 0 };
+	for (unsigned int i = 0; i < raw_len; i++)
+		snprintf(got + i * 2, 3, "%02x", raw[i]);
+
+	if (!hex_eq_ci(got, expected_sha256_hex)) {
+		unlink(out_path);
+		return DOWNLOAD_ERR_SHA256_MISMATCH;
+	}
+	return DOWNLOAD_OK;
+}

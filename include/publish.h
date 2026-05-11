@@ -16,6 +16,7 @@
 #define ASSESSMENT_AGENT_PUBLISH_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 /**
  * @brief Broker connection settings.
@@ -68,5 +69,80 @@ int publish_message(const publish_config_t *cfg,
                     const char *routing_key,
                     const char *body,
                     size_t      body_len);
+
+/* ============================================================
+ * Long-lived connection (worker role — CM2 second connection)
+ *
+ * The collector uses publish_message() above, which opens-publishes-closes
+ * per call. The worker needs a persistent channel because the broker's
+ * delivery_tag for a `basic_get`'d message stays valid only until the
+ * channel closes — and the worker holds a message unacked across the
+ * minutes-long install. A separate connection (different credentials,
+ * agent-worker) also enforces CM2's privilege split.
+ * ============================================================ */
+
+typedef struct publish_conn_s publish_conn_t;
+
+/**
+ * @brief Open a persistent AMQP connection + channel with publisher confirms.
+ *
+ * The connection stays alive until publish_conn_close(). On any error the
+ * function returns NULL after logging to stderr.
+ */
+publish_conn_t *publish_conn_open(const publish_config_t *cfg);
+
+/**
+ * @brief Close the connection and free the handle.
+ */
+void publish_conn_close(publish_conn_t *c);
+
+/**
+ * @brief Publish a JSON body via this connection, waiting for confirm.
+ *
+ * Re-uses the same channel as `_get` / `_ack`. The exchange must already
+ * exist (declared by topology bootstrap). Returns 0 on success.
+ */
+int publish_conn_publish(publish_conn_t *c,
+                         const char *exchange,
+                         const char *routing_key,
+                         const char *body,
+                         size_t      body_len);
+
+/**
+ * @brief `basic.get` one message from @p queue (no_ack=false).
+ *
+ * @param c                Connection handle.
+ * @param queue            Queue name (e.g. `agent.tasks.<machine_id>`).
+ * @param out_body         Receives malloc'd body buffer on PUBLISH_GET_OK.
+ *                         Caller must free(). On empty/error, set to NULL.
+ * @param out_len          Body length in bytes on PUBLISH_GET_OK.
+ * @param out_delivery_tag Receives delivery_tag for the subsequent ack.
+ *
+ * @return 0 if a message was returned (body + delivery_tag valid),
+ *         1 if the queue is empty (no message),
+ *        -1 on transport / channel error (caller should reopen).
+ */
+int publish_conn_get(publish_conn_t *c,
+                     const char *queue,
+                     char      **out_body,
+                     size_t     *out_len,
+                     uint64_t   *out_delivery_tag);
+
+/**
+ * @brief Ack a previously fetched delivery_tag on the same channel.
+ *
+ * Returns 0 on success, -1 on send failure. After failure the connection
+ * is likely broken; caller should close and reopen.
+ */
+int publish_conn_ack(publish_conn_t *c, uint64_t delivery_tag);
+
+/**
+ * @brief Heartbeat tick — called from the main loop while idle.
+ *
+ * Drains any incoming frames (heartbeats from the broker) so the
+ * connection does not die from missed peer heartbeats while the parent
+ * loop sleeps. Non-blocking.
+ */
+void publish_conn_pump(publish_conn_t *c);
 
 #endif

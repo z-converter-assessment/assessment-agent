@@ -28,6 +28,7 @@
 #include "collect.h"
 #include "publish.h"
 #include "util.h"
+#include "worker.h"
 
 #include <cjson/cJSON.h>
 
@@ -35,6 +36,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -196,6 +198,22 @@ static int publish_with_retry(const publish_config_t *cfg,
 }
 
 /**
+ * @brief Build a publish_config_t for the worker's CM2 second connection.
+ *
+ * Identical to make_publish_config() but pulls the worker credentials
+ * (RABBITMQ_WORKER_USER / RABBITMQ_WORKER_PASS) instead. All other fields
+ * — host, port, vhost, TLS — are shared with the collector connection.
+ */
+static publish_config_t make_worker_publish_config(void)
+{
+	publish_config_t cfg = make_publish_config();
+	cfg.user     = getenv_default("RABBITMQ_WORKER_USER", "");
+	cfg.password = getenv_default("RABBITMQ_WORKER_PASS", "");
+	cfg.exchange = getenv_default("WORKER_TASK_EXCHANGE", "assessment.tasks");
+	return cfg;
+}
+
+/**
  * @brief Probe optional shell-out commands and log their availability.
  *
  * The agent has silent fallbacks (or `null`) for missing tools, so a
@@ -278,9 +296,41 @@ int main(void)
 		return rc == 0 ? 0 : 1;
 	}
 
+	/* --- Worker initialization (optional — gated by RABBITMQ_WORKER_USER) --- */
+	worker_ctx_t *worker = NULL;
+	const char *worker_user = getenv_default("RABBITMQ_WORKER_USER", "");
+	if (*worker_user) {
+		publish_config_t wcfg = make_worker_publish_config();
+
+		const char *queue_prefix = getenv_default("WORKER_TASK_QUEUE_PREFIX", "agent.tasks");
+		char queue_name[256];
+		snprintf(queue_name, sizeof queue_name, "%s.%s", queue_prefix, machine_id);
+
+		worker_config_t wc = {
+			.amqp                = wcfg,
+			.queue_name          = queue_name,
+			.result_routing_key  = getenv_default("WORKER_TASK_RESULT_KEY", "task.result"),
+			.machine_id          = machine_id,
+			.agent_version       = AGENT_VERSION,
+			.state_dir           = getenv_default("WORKER_STATE_DIR", "/var/lib/agent-worker"),
+			.tmp_dir             = getenv_default("WORKER_TMP_DIR",   "/tmp"),
+			.allowed_hosts_csv   = getenv_default("WORKER_DOWNLOAD_ALLOWED_HOSTS", ""),
+			.done_retention_sec  = atoi(getenv_default("WORKER_DONE_RETENTION_SEC", "604800")),
+			.disk_reserve_mb     = atoi(getenv_default("WORKER_DISK_RESERVE_MB", "50")),
+			.mem_limit_mb        = atoi(getenv_default("WORKER_INSTALL_MEM_LIMIT_MB",   "2048")),
+			.fsize_limit_mb      = atoi(getenv_default("WORKER_INSTALL_FSIZE_LIMIT_MB", "5120")),
+		};
+		worker = worker_init(&wc);
+		if (!worker) {
+			fprintf(stderr, "[agent] worker init failed — running collector only\n");
+		}
+	} else {
+		fprintf(stderr, "[agent] RABBITMQ_WORKER_USER unset — worker disabled\n");
+	}
+
 	/* --- Loop mode --- */
-	fprintf(stderr, "[agent] loop mode: interval=%ds, inventory_refresh=%ds (Ctrl+C to exit)\n",
-	        interval, inv_refresh);
+	fprintf(stderr, "[agent] loop mode: interval=%ds, inventory_refresh=%ds, worker=%s (Ctrl+C to exit)\n",
+	        interval, inv_refresh, worker ? "on" : "off");
 
 	time_t inv_next = (inv_refresh > 0)
 		? next_inventory_deadline(time(NULL), inv_refresh)
@@ -310,8 +360,24 @@ int main(void)
 			inv_next = next_inventory_deadline(time(NULL), inv_refresh);
 		}
 
+		if (worker) {
+			if (worker_tick(worker) < 0)
+				fprintf(stderr, "[agent] worker tick error — continuing\n");
+		}
+
 		if (g_stop) break;
 		sleep((unsigned int)interval);
+	}
+
+	/* --- Drain pattern (S2) — finish any in-flight install before exit --- */
+	if (worker) {
+		worker_begin_drain(worker);
+		fprintf(stderr, "[agent] SIGTERM received — draining worker\n");
+		while (!worker_idle(worker)) {
+			worker_tick(worker);          /* will reap when child finishes */
+			sleep(1);
+		}
+		worker_shutdown(worker);
 	}
 
 	free(machine_id);

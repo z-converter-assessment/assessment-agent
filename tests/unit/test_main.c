@@ -11,6 +11,16 @@
 /* collect.c sets _POSIX_C_SOURCE / _GNU_SOURCE for the whole TU. */
 #include "../../src/collect.c"
 
+/* Worker module pieces — header-only style so static helpers are reachable.
+ * These TUs avoid the libcurl / libarchive / rabbitmq-c dependencies because
+ * the unit tests do not exercise download/extract/exec/worker code paths
+ * end-to-end; they exercise small pure helpers (host whitelist, path safety,
+ * task_id validation). The TU includes only download.c and extract.c (which
+ * link to libcurl/openssl/libarchive at archive time — guarded by the
+ * Makefile test target's link line). */
+#include "../../src/download.c"
+#include "../../src/extract.c"
+
 #include "tinytest.h"
 
 #include <fcntl.h>
@@ -765,6 +775,124 @@ static void test_is_remote_unconnected_null_empty(void)
 }
 
 /* ============================================================
+ * download.c — host whitelist + URL parsing
+ * ============================================================ */
+
+static void test_download_url_extract_host_basic(void)
+{
+	char host[256];
+	ASSERT_EQ(download_url_extract_host("https://files.example.com/foo.tar", host, sizeof host), 1);
+	ASSERT_STR_EQ(host, "files.example.com");
+}
+
+static void test_download_url_extract_host_port_stripped(void)
+{
+	char host[256];
+	ASSERT_EQ(download_url_extract_host("https://files.example.com:8443/foo.tar", host, sizeof host), 1);
+	ASSERT_STR_EQ(host, "files.example.com");
+}
+
+static void test_download_url_extract_host_userinfo_stripped(void)
+{
+	char host[256];
+	ASSERT_EQ(download_url_extract_host("https://user:pw@files.example.com/foo.tar", host, sizeof host), 1);
+	ASSERT_STR_EQ(host, "files.example.com");
+}
+
+static void test_download_url_extract_host_lowercased(void)
+{
+	char host[256];
+	ASSERT_EQ(download_url_extract_host("https://Files.Example.COM/foo.tar", host, sizeof host), 1);
+	ASSERT_STR_EQ(host, "files.example.com");
+}
+
+static void test_download_url_extract_host_rejects_http(void)
+{
+	char host[256];
+	ASSERT_EQ(download_url_extract_host("http://files.example.com/foo.tar", host, sizeof host), 0);
+}
+
+static void test_download_url_extract_host_rejects_no_scheme(void)
+{
+	char host[256];
+	ASSERT_EQ(download_url_extract_host("files.example.com/foo.tar", host, sizeof host), 0);
+}
+
+static void test_download_host_allowed_exact(void)
+{
+	ASSERT_EQ(download_host_allowed("files.example.com",
+		"files.example.com,cdn.example.com"), 1);
+	ASSERT_EQ(download_host_allowed("cdn.example.com",
+		"files.example.com,cdn.example.com"), 1);
+}
+
+static void test_download_host_allowed_case_insensitive(void)
+{
+	ASSERT_EQ(download_host_allowed("Files.Example.COM",
+		"files.example.com"), 1);
+	ASSERT_EQ(download_host_allowed("files.example.com",
+		"FILES.EXAMPLE.COM"), 1);
+}
+
+static void test_download_host_allowed_no_wildcard(void)
+{
+	/* W1 decision: no subdomain wildcards. "sub.files.example.com" must
+	 * NOT match when only "files.example.com" is listed. */
+	ASSERT_EQ(download_host_allowed("sub.files.example.com",
+		"files.example.com"), 0);
+}
+
+static void test_download_host_allowed_empty_blocks_all(void)
+{
+	ASSERT_EQ(download_host_allowed("files.example.com", ""),   0);
+	ASSERT_EQ(download_host_allowed("files.example.com", NULL), 0);
+}
+
+static void test_download_host_allowed_trims_whitespace(void)
+{
+	ASSERT_EQ(download_host_allowed("files.example.com",
+		" files.example.com , cdn.example.com "), 1);
+}
+
+static void test_download_host_allowed_rejects_unlisted(void)
+{
+	ASSERT_EQ(download_host_allowed("evil.example.org",
+		"files.example.com,cdn.example.com"), 0);
+}
+
+/* ============================================================
+ * extract.c — path safety (path traversal guard)
+ * ============================================================ */
+
+static void test_extract_path_safe_relative(void)
+{
+	ASSERT_EQ(extract_path_safe("install.sh"),       1);
+	ASSERT_EQ(extract_path_safe("dir/file"),         1);
+	ASSERT_EQ(extract_path_safe("./install.sh"),     1);
+	ASSERT_EQ(extract_path_safe("a/b/c"),            1);
+}
+
+static void test_extract_path_safe_rejects_absolute(void)
+{
+	ASSERT_EQ(extract_path_safe("/etc/passwd"),      0);
+	ASSERT_EQ(extract_path_safe("/foo"),             0);
+}
+
+static void test_extract_path_safe_rejects_dotdot(void)
+{
+	ASSERT_EQ(extract_path_safe(".."),               0);
+	ASSERT_EQ(extract_path_safe("../etc/passwd"),    0);
+	ASSERT_EQ(extract_path_safe("a/../b"),           0);
+	ASSERT_EQ(extract_path_safe("a/b/.."),           0);
+}
+
+static void test_extract_path_safe_rejects_empty_null(void)
+{
+	ASSERT_EQ(extract_path_safe(""),                 0);
+	ASSERT_EQ(extract_path_safe(NULL),               0);
+}
+
+/* ============================================================
  * runner
  * ============================================================ */
 
@@ -872,6 +1000,26 @@ int main(void)
 	RUN_TEST(test_is_remote_unconnected_with_peer_v4);
 	RUN_TEST(test_is_remote_unconnected_only_port_set);
 	RUN_TEST(test_is_remote_unconnected_null_empty);
+
+	/* worker — download host whitelist + URL parsing */
+	RUN_TEST(test_download_url_extract_host_basic);
+	RUN_TEST(test_download_url_extract_host_port_stripped);
+	RUN_TEST(test_download_url_extract_host_userinfo_stripped);
+	RUN_TEST(test_download_url_extract_host_lowercased);
+	RUN_TEST(test_download_url_extract_host_rejects_http);
+	RUN_TEST(test_download_url_extract_host_rejects_no_scheme);
+	RUN_TEST(test_download_host_allowed_exact);
+	RUN_TEST(test_download_host_allowed_case_insensitive);
+	RUN_TEST(test_download_host_allowed_no_wildcard);
+	RUN_TEST(test_download_host_allowed_empty_blocks_all);
+	RUN_TEST(test_download_host_allowed_trims_whitespace);
+	RUN_TEST(test_download_host_allowed_rejects_unlisted);
+
+	/* worker — extract path safety */
+	RUN_TEST(test_extract_path_safe_relative);
+	RUN_TEST(test_extract_path_safe_rejects_absolute);
+	RUN_TEST(test_extract_path_safe_rejects_dotdot);
+	RUN_TEST(test_extract_path_safe_rejects_empty_null);
 
 	return tt_summary();
 }
