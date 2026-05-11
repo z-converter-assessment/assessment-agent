@@ -68,4 +68,13 @@ char *iso8601_utc_ms(struct timespec ts, char *buf, size_t len);
  */
 char *uuid_v4(char *buf, size_t len);
 
+/**
+ * @brief Apply ±@p frac uniform jitter to @p base_sec, using rand().
+ *
+ * Result is `base_sec * (1 + U(-frac, +frac))` rounded down. Caller is
+ * responsible for seeding rand() once at process start. @p frac is clamped
+ * to [0, 1). Returns @p base_sec unchanged when @p base_sec <= 0.
+ */
+int jitter_seconds(int base_sec, double frac);
+
 #endif

@@ -114,6 +114,53 @@ static void test_iso8601_utc_ms_zero_ms(void)
 }
 
 /* ============================================================
+ * util.c — jitter_seconds
+ * ============================================================ */
+
+static void test_jitter_seconds_within_bounds(void)
+{
+	srand(42);
+	int base = 3600;
+	double frac = 0.15;
+	int lo = (int)(base * (1.0 - frac));   /* 3060 */
+	int hi = (int)(base * (1.0 + frac));   /* 4140 */
+	for (int i = 0; i < 1000; i++) {
+		int v = jitter_seconds(base, frac);
+		ASSERT_TRUE(v >= lo);
+		ASSERT_TRUE(v <= hi);
+	}
+}
+
+static void test_jitter_seconds_zero_or_negative_passthrough(void)
+{
+	ASSERT_EQ(jitter_seconds(0, 0.15),  0);
+	ASSERT_EQ(jitter_seconds(-5, 0.15), -5);
+}
+
+static void test_jitter_seconds_zero_frac_no_change(void)
+{
+	srand(1);
+	for (int i = 0; i < 100; i++) {
+		ASSERT_EQ(jitter_seconds(60, 0.0), 60);
+	}
+}
+
+static void test_jitter_seconds_distribution_spans_range(void)
+{
+	/* Confirm the jitter actually moves both directions, not stuck at one end. */
+	srand(7);
+	int base = 1000;
+	int saw_below = 0, saw_above = 0;
+	for (int i = 0; i < 500 && (!saw_below || !saw_above); i++) {
+		int v = jitter_seconds(base, 0.15);
+		if (v < base) saw_below = 1;
+		if (v > base) saw_above = 1;
+	}
+	ASSERT_TRUE(saw_below);
+	ASSERT_TRUE(saw_above);
+}
+
+/* ============================================================
  * util.c — read_file_all
  * ============================================================ */
 
@@ -370,6 +417,37 @@ static void test_add_kb_or_null_negative(void)
 	ASSERT_NOT_NULL(v);
 	ASSERT_EQ((long)cJSON_IsNull(v), 1L);
 	cJSON_Delete(obj);
+}
+
+/* ============================================================
+ * collect.c — boot_time / agent_started_at caches
+ * ============================================================ */
+
+static void test_cached_boot_time_iso_idempotent(void)
+{
+	const char *a = cached_boot_time_iso();
+	const char *b = cached_boot_time_iso();
+	const char *c = cached_boot_time_iso();
+	/* On Linux test runners /proc/uptime always exists → non-NULL. */
+	ASSERT_NOT_NULL(a);
+	/* Same backing buffer (literal pointer identity), so values must match. */
+	ASSERT_TRUE(a == b);
+	ASSERT_TRUE(b == c);
+	ASSERT_STR_EQ(a, b);
+	/* ISO 8601 "YYYY-MM-DDTHH:MM:SSZ" = 20 chars. */
+	ASSERT_EQ((long)strlen(a), 20L);
+}
+
+static void test_cached_agent_started_at_iso_idempotent(void)
+{
+	const char *a = cached_agent_started_at_iso();
+	struct timespec sleep = { .tv_sec = 1, .tv_nsec = 0 };
+	nanosleep(&sleep, NULL);
+	const char *b = cached_agent_started_at_iso();
+	ASSERT_NOT_NULL(a);
+	ASSERT_TRUE(a == b);
+	ASSERT_STR_EQ(a, b);
+	ASSERT_EQ((long)strlen(a), 20L);
 }
 
 /* ============================================================
@@ -709,6 +787,12 @@ int main(void)
 	RUN_TEST(test_iso8601_utc_known);
 	RUN_TEST(test_iso8601_utc_ms_format);
 	RUN_TEST(test_iso8601_utc_ms_zero_ms);
+
+	/* util.c — jitter_seconds */
+	RUN_TEST(test_jitter_seconds_within_bounds);
+	RUN_TEST(test_jitter_seconds_zero_or_negative_passthrough);
+	RUN_TEST(test_jitter_seconds_zero_frac_no_change);
+	RUN_TEST(test_jitter_seconds_distribution_spans_range);
 
 	/* util.c — read_file_all */
 	RUN_TEST(test_read_file_all_basic);

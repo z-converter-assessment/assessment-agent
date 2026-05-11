@@ -86,9 +86,11 @@ Exchange: `assessment` (**direct**, durable). Delivery mode: persistent (2). Vho
 
 | Type | Routing key | Trigger | Description |
 |------|-------------|---------|-------------|
-| `inventory` | `server.inventory` | startup + on detected static change | OS, kernel, CPU model, total memory, disks, mounts, IPs |
+| `inventory` | `server.inventory` | startup + on detected static change + periodic refresh (`AGENT_INVENTORY_REFRESH_SEC` ±15% jitter, default 3600s, 0 disables) | OS, kernel, CPU model, total memory, disks, mounts, IPs |
 | `metrics`   | `server.metrics`   | every `AGENT_INTERVAL_SEC` (default 60) | raw `/proc` counters: `cpu_stat`, `mem_*_kb`, `swap_*_kb`, `load_{1,5,15}m`, `disk_io[]`, `net_io[]`, `mounts[]` |
 | `error`     | `server.error`     | collection / publish failure (see policy below) | `error_code`, `error_message`, `failed_component` |
+
+**Inventory periodic refresh** is a recovery safety net for the engine. When the engine loses inventory state (restart, cache eviction, lost message), the next refresh restores it without an agent restart. The engine MUST treat repeat inventories as idempotent (hash compare → skip DB write/event when unchanged) so the periodic traffic does not amplify into DB load.
 
 **Error publish policy** (must match the team agreement to keep the queue useful):
 
@@ -98,9 +100,14 @@ Exchange: `assessment` (**direct**, durable). Delivery mode: persistent (2). Vho
 
 `server.error` is for agent-side failures only. Consumer-side failures (parse / DB / TTL) are handled by RabbitMQ DLX → `assessment.dlx` → `server.{type}.dead`. Different alert channels for each.
 
-Common metadata (every message): `message_type`, `machine_id`, `agent_version`, `collected_at` (ISO 8601 UTC), `hostname`, `message_id` (UUID v4).
+Common metadata (every message): `message_type`, `machine_id`, `agent_version`, `collected_at` (ISO 8601 UTC), `hostname`, `message_id` (UUID v4), `boot_time` (ISO 8601 UTC, nullable), `agent_started_at` (ISO 8601 UTC).
 
 `machine_id` is the canonical server identifier (read from `/etc/machine-id`). When the file is empty (containers, custom images), the agent falls back to `dbus-uuidgen --get`, then to the cloud IMDS instance-id. `hostname` is captured for human readability but **must not** be used as a primary key by the engine.
+
+`boot_time` and `agent_started_at` carry distinct responsibilities and **must not be confused**:
+
+- `boot_time` — system boot wall-clock, captured once at process start from `/proc/uptime` + `CLOCK_REALTIME` and cached for the process lifetime. Re-reading `/proc/stat`'s `btime` would jitter by 1–2s per NTP correction within a single boot, so caching is mandatory. This field is the **sole authoritative source** for counter-reset detection on the engine. The engine compares `prev.boot_time != curr.boot_time` (change detection only — never absolute-time comparisons like `now() - boot_time < 5min`, which break under clock skew). When changed, the engine MUST skip the differential for that sample (warm-up).
+- `agent_started_at` — agent process start wall-clock, captured once at process start. **Observability/debugging only**. The reset-detection path must not key off this field; an agent-only restart leaves kernel counters intact and the differential is still valid.
 
 Full schema and JSON examples: [`docs/payload-schema.md`](../docs/payload-schema.md).
 
@@ -122,7 +129,8 @@ Full schema and JSON examples: [`docs/payload-schema.md`](../docs/payload-schema
 | `statfs(2)` per fstab entry | `mounts[]` | Raw bytes |
 | `getifaddrs(3)` | `ip_internal[]` | All targets ✅ |
 | Cloud metadata API (AWS IMDSv2 / Azure / GCP) | `ip_external[]` | Optional. 1s timeout, non-blocking |
-| `/proc/uptime` or `stat /proc/1` | `boot_time` | For timeline reconstruction |
+
+> `boot_time` is no longer part of the `inventory` body. It moved to common metadata (every message) for per-metric counter-reset detection — see "Message Types & Routing" above.
 
 ### Dynamic (`metrics` — phase 4)
 
@@ -220,6 +228,7 @@ Local dev uses plain AMQP and the default vhost. Production must not.
 | `RABBITMQ_ROUTING_KEY_METRICS` | `server.metrics` | contract — must match engine |
 | `RABBITMQ_ROUTING_KEY_ERROR` | `server.error` | contract — must match engine |
 | `AGENT_INTERVAL_SEC` | `60` | `0` means one-shot |
+| `AGENT_INVENTORY_REFRESH_SEC` | `3600` | inventory periodic re-publish base interval. Actual delay is `value × (1 + uniform(-0.15, +0.15))`. `0` disables the periodic refresh (startup + change-trigger only) |
 | `AGENT_HOSTNAME_OVERRIDE` | — | testing aid |
 | `AGENT_EXTERNAL_IP` | — | skip IMDS lookup if set |
 
@@ -238,7 +247,8 @@ Shell environment variables override values in `.env`.
 | 5 | Adopt v2 schema (raw values, `machine_id` common, `cpu_stat` / `disk_io[]` / `net_io[]` / `mounts[]`) | ✅ Done (v2.1: kB nullable + lsblk fallback) |
 | 6 | TLS (AMQPS / mTLS) / vhost / agent-publisher credentials env | ✅ Done |
 | 7 | Library vendoring (rabbitmq-c, cJSON) — `make USE_VENDORED=1` static build | ✅ Done |
-| 8 | Deployment artifacts (cron + systemd timer) | Pending |
+| 8 | Inventory periodic refresh + boot_time/agent_started_at in common metadata | ✅ Done (v3.1) |
+| 9 | Deployment artifacts (cron + systemd timer) | Pending |
 
 ---
 

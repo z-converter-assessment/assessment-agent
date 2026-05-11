@@ -8,7 +8,10 @@
  *   3. Publish `inventory` once. Failure here is fatal in one-shot mode but
  *      not in loop mode (we keep trying with backoff so a slow startup
  *      doesn't kill the agent).
- *   4. Loop: publish `metrics` every AGENT_INTERVAL_SEC seconds.
+ *   4. Loop: publish `metrics` every AGENT_INTERVAL_SEC seconds, and
+ *      republish `inventory` every AGENT_INVENTORY_REFRESH_SEC ±15% jitter
+ *      (default 3600s; 0 disables) so the engine can recover inventory
+ *      state without an agent restart.
  *
  * Error policy (matches docs/payload-schema.md §3):
  *   - Optional source unavailable → field is null/empty, no error message.
@@ -41,6 +44,18 @@
 
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
+
+/**
+ * @brief Compute the next inventory-refresh deadline with ±15% jitter.
+ *
+ * Spreads herd-formed publishes (e.g., a fleet booted by the same
+ * orchestrator at the same minute) across a ~18-minute window for a
+ * 1-hour base.
+ */
+static time_t next_inventory_deadline(time_t now, int refresh_sec)
+{
+	return now + (time_t)jitter_seconds(refresh_sec, 0.15);
+}
 
 /**
  * @brief Build a publish_config_t from current environment.
@@ -211,7 +226,11 @@ int main(void)
 	load_env_file(".env");
 	log_optional_cmds();
 
+	/* Jitter seed — once per process, mixing pid so co-booted hosts diverge. */
+	srand((unsigned int)(time(NULL) ^ getpid()));
+
 	int interval = atoi(getenv_default("AGENT_INTERVAL_SEC", "60"));
+	int inv_refresh = atoi(getenv_default("AGENT_INVENTORY_REFRESH_SEC", "3600"));
 	publish_config_t cfg = make_publish_config();
 
 	const char *rk_inv = getenv_default("RABBITMQ_ROUTING_KEY_INVENTORY", "server.inventory");
@@ -260,7 +279,13 @@ int main(void)
 	}
 
 	/* --- Loop mode --- */
-	fprintf(stderr, "[agent] loop mode: interval=%ds (Ctrl+C to exit)\n", interval);
+	fprintf(stderr, "[agent] loop mode: interval=%ds, inventory_refresh=%ds (Ctrl+C to exit)\n",
+	        interval, inv_refresh);
+
+	time_t inv_next = (inv_refresh > 0)
+		? next_inventory_deadline(time(NULL), inv_refresh)
+		: 0;
+
 	while (!g_stop) {
 		cJSON *m = collect_metrics_payload(machine_id, AGENT_VERSION);
 		if (!m) {
@@ -271,6 +296,20 @@ int main(void)
 		} else {
 			publish_with_retry(&cfg, rk_met, m, machine_id, interval);
 		}
+
+		if (inv_refresh > 0 && time(NULL) >= inv_next) {
+			cJSON *iv = collect_inventory_payload(machine_id, AGENT_VERSION);
+			if (!iv) {
+				emit_error(&cfg, machine_id,
+				           "COLLECT_INVENTORY_FAILED",
+				           "core inventory source unreadable", "collect",
+				           -1, NULL, NULL);
+			} else if (publish_with_retry(&cfg, rk_inv, iv, machine_id, interval) == 0) {
+				fprintf(stderr, "[agent] republished inventory (periodic)\n");
+			}
+			inv_next = next_inventory_deadline(time(NULL), inv_refresh);
+		}
+
 		if (g_stop) break;
 		sleep((unsigned int)interval);
 	}

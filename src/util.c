@@ -215,3 +215,14 @@ char *uuid_v4(char *buf, size_t len)
 	         (long)tv.tv_sec, (long)tv.tv_usec);
 	return buf;
 }
+
+int jitter_seconds(int base_sec, double frac)
+{
+	if (base_sec <= 0) return base_sec;
+	if (frac < 0)      frac = 0;
+	if (frac >= 1.0)   frac = 0.999;
+
+	double u = ((double)rand() / (double)RAND_MAX) * (2.0 * frac) - frac;
+	double v = (double)base_sec * (1.0 + u);
+	return (int)v;
+}
