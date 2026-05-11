@@ -7,6 +7,12 @@
 
 ## 변경 이력
 
+- **v3.2 (2026-05-11)**
+  - **Worker (task.install) 도입**. agent가 portal로부터 `task.install` 메시지를 받아 HTTPS tar 다운로드 → 압축 해제 → user-level `install.sh` 실행 → `task.result` 회신
+  - 신규 exchange `assessment.tasks` (direct) + 머신별 큐 `agent.tasks.<machine_id>` + DLX `assessment.tasks.dlx` → `assessment.tasks.dead`
+  - 신규 권한 사용자: `agent-worker` (agent용), `portal-task-issuer` (portal 발행 + 머신별 큐 declare), `portal-task-consumer` (portal result consume)
+  - CM2 모델 — agent는 두 connection 사용 (collector용 `agent-publisher` + worker용 `agent-worker`)
+  - "No-Execution" 원칙 폐기. 단, 실행은 비특권 user + clearenv + setrlimit + setsid + sandbox extraction directory로 격리
 - **v3.1 (2026-05-11)**
   - 공통 메타데이터에 `boot_time`, `agent_started_at` 추가 — 모든 메시지에 실림. 카운터 리셋 감지를 매 metric 단위로 가능하게 함
   - `boot_time`은 프로세스 시작 시 1회 캐시 (`/proc/uptime` + `CLOCK_REALTIME` 합성). NTP 보정으로 인한 매 read 흔들림 제거. **차분 로직의 유일한 권위 소스**
@@ -353,6 +359,147 @@ DLX(`assessment.dlx`)는 컨슈머 측 NAK / TTL 만료 / `x-max-length` 초과 
   "retry_count":      5,
   "first_failed_at":  "2026-04-23T14:30:14Z",
   "recovered_at":     "2026-04-23T14:36:42Z"
+}
+```
+
+---
+
+## 4. task.install (수신: portal → agent)
+
+portal이 발행, agent가 consume. agent는 user-level `install.sh`를 실행하고 `task.result`로 회신.
+
+### 라우팅
+
+- Exchange: `assessment.tasks` (direct, durable)
+- Routing key: `task.install.<target_machine_id>` — broker가 정확히 해당 머신의 큐로만 배달
+- Queue: `agent.tasks.<machine_id>` (durable, `x-message-ttl=3600000` 1h, `x-max-length=100`, `x-overflow=reject-publish`, DLX bound)
+
+> 머신별 큐는 portal이 머신 등록(첫 inventory 수신) 시점에 declare한다. agent는 declare 권한 없이 consume만.
+
+### 필드 정의
+
+| 필드 | 타입 | 의미 |
+|---|---|---|
+| `message_type` | string | 고정 `"task.install"` |
+| `task_id` | string (UUID v4) | 작업 고유 ID. 결과 회신·중복 검출·로그 추적 키 |
+| `machine_id` | string | 타겟 머신. agent는 자기 `/etc/machine-id`와 비교하여 불일치 시 ack drop (정상 라우팅이면 발생하지 않음) |
+| `issued_at` | string (ISO 8601 UTC) | 발행 시각. **agent 측 절대값 검증 없음** (broker TTL이 만료 처리) — 운영 로깅/디버깅용 |
+| `download.url` | string | HTTPS URL. host는 `WORKER_DOWNLOAD_ALLOWED_HOSTS` 화이트리스트와 case-insensitive 정확 매치 필요. 30x redirect 비활성 |
+| `download.sha256` | string (hex 64) | 다운로드 파일 SHA256. OpenSSL EVP로 스트리밍 검증 |
+| `download.size_bytes` | integer | 예상 크기 (byte). 다운로드 중 초과 시 abort + `failure_reason: download_failed`. `WORKER_TMP_DIR` statvfs 여유 < size + `WORKER_DISK_RESERVE_MB` 면 다운로드 시작 전 `failure_reason: insufficient_disk` |
+| `install.script` | string | tar 내부에서 실행할 스크립트 경로. 보통 `install.sh` |
+| `install.args` | array of string | 스크립트 인자. 빈 배열 가능 |
+| `install.timeout_sec` | integer | wall-clock timeout. 초과 시 SIGTERM → 5s 후 SIGKILL. `RLIMIT_CPU`로도 같은 값 적용 |
+
+### 예시
+
+```json
+{
+  "message_type":     "task.install",
+  "task_id":          "550e8400-e29b-41d4-a716-446655440010",
+  "machine_id":       "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+  "issued_at":        "2026-04-23T15:00:00Z",
+  "download": {
+    "url":        "https://files.example.com/packages/foo-1.2.3.tar.gz",
+    "sha256":     "9b71d224bd62f3785d96d46ad3ea3d73319bfbc2890caadae2dff72519673ca7",
+    "size_bytes": 12345678
+  },
+  "install": {
+    "script":      "install.sh",
+    "args":        [],
+    "timeout_sec": 600
+  }
+}
+```
+
+---
+
+## 5. task.result (송신: agent → portal)
+
+agent가 task 처리 종료 시점에 발행 (성공·실패 무관 — K3). portal이 consume.
+
+### 라우팅
+
+- Exchange: `assessment.tasks` (재사용)
+- Routing key: `task.result`
+- Queue: `worker.result` (durable, portal consume)
+
+### 필드 정의
+
+공통 메타데이터(`message_type`, `machine_id`, `agent_version`, `collected_at`, `hostname`, `message_id`, `boot_time`, `agent_started_at`) 그대로 포함.
+
+| 필드 | 타입 | 의미 |
+|---|---|---|
+| `message_type` | string | 고정 `"task.result"` |
+| `task_id` | string | 수신한 task.install의 `task_id` 그대로 |
+| `status` | string | `"success"` \| `"failure"` |
+| `failure_reason` | string \| null | 실패 시 분류 (아래 enum). 성공 시 `null` |
+| `exit_code` | int \| null | install.sh 종료 코드. 실행 전 실패 시 `null` |
+| `duration_ms` | int | 다운로드+추출+install 합계 시간 |
+| `stdout_tail` | string | install.sh stdout의 끝 4KB. 미실행 시 `""` |
+| `stderr_tail` | string | install.sh stderr의 끝 4KB. 미실행 시 `""` |
+| `completed_at` | string | 처리 완료 시각 (ISO 8601 UTC) |
+
+### `failure_reason` enum
+
+| 값 | 의미 |
+|---|---|
+| `url_not_allowed` | `download.url`의 host가 화이트리스트 위반 |
+| `download_failed` | HTTP 4xx/5xx, 네트워크 오류, redirect 수신, size_bytes 초과 |
+| `sha256_mismatch` | 다운로드 완료 후 sha256 불일치 |
+| `extract_failed` | tar 파싱 실패, symlink/hardlink/device/FIFO/socket 엔트리, path traversal (`..` 또는 절대경로) |
+| `script_not_found` | 추출 후 `install.script` 경로 없음 |
+| `script_failed` | exit_code != 0 |
+| `script_timeout` | `install.timeout_sec` 초과로 강제 종료 |
+| `insufficient_disk` | 다운로드 시작 전 statvfs 체크에서 여유 공간 부족 |
+| `internal_error` | 그 외 (자식 비정상 종료, 디스크 풀, fork 실패 등). 부모가 합성 result로 보고할 때도 사용 |
+| `already_done` | 동일 `task_id`로 이전에 처리 완료된 task가 재배달됨 (멱등성 마커 발견). agent는 install 안 함 |
+
+### 예시 (성공)
+
+```json
+{
+  "message_type":     "task.result",
+  "machine_id":       "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+  "agent_version":    "1.0.0",
+  "collected_at":     "2026-04-23T15:08:34Z",
+  "hostname":         "web-server-01",
+  "message_id":       "550e8400-e29b-41d4-a716-446655440011",
+  "boot_time":        "2026-04-20T09:12:33Z",
+  "agent_started_at": "2026-04-23T14:29:55Z",
+
+  "task_id":        "550e8400-e29b-41d4-a716-446655440010",
+  "status":         "success",
+  "failure_reason": null,
+  "exit_code":      0,
+  "duration_ms":    513412,
+  "stdout_tail":    "...installed foo-1.2.3 successfully\n",
+  "stderr_tail":    "",
+  "completed_at":   "2026-04-23T15:08:34Z"
+}
+```
+
+### 예시 (sha256 불일치 실패)
+
+```json
+{
+  "message_type":     "task.result",
+  "machine_id":       "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+  "agent_version":    "1.0.0",
+  "collected_at":     "2026-04-23T15:01:12Z",
+  "hostname":         "web-server-01",
+  "message_id":       "550e8400-e29b-41d4-a716-446655440012",
+  "boot_time":        "2026-04-20T09:12:33Z",
+  "agent_started_at": "2026-04-23T14:29:55Z",
+
+  "task_id":        "550e8400-e29b-41d4-a716-446655440010",
+  "status":         "failure",
+  "failure_reason": "sha256_mismatch",
+  "exit_code":      null,
+  "duration_ms":    8341,
+  "stdout_tail":    "",
+  "stderr_tail":    "",
+  "completed_at":   "2026-04-23T15:01:12Z"
 }
 ```
 

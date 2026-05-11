@@ -6,7 +6,11 @@
 
 The full service collects customer-server resources, runs AI analysis (avg / p95 / peak, over/under-provisioning detection) and produces sizing recommendations as a PDF report. **This agent owns the collection step.**
 
-Pipeline: `agent (this repo) → RabbitMQ → assessment-engine (consumer + web)`
+Beyond collection, the agent also accepts `task.install` commands from the portal — HTTPS-downloaded tarballs containing a user-level `install.sh` — and reports execution results. This is the **worker** role. Collection (producer) and worker (consumer + executor) share a single binary and a single process; the parent loop publishes metrics on a 1-minute tick and polls a per-machine task queue on the same tick, forking a child for each install. The original "no-execution" principle has been deliberately retired — see "Worker (task.install)" below for the boundaries.
+
+Pipelines:
+- Inventory/metrics/error: `agent (this repo) → RabbitMQ → assessment-engine (consumer + web)`
+- Task install: `assessment-portal → RabbitMQ → agent (this repo, worker role)`
 
 ---
 
@@ -33,10 +37,12 @@ Pipeline: `agent (this repo) → RabbitMQ → assessment-engine (consumer + web)
 - **Language**: C
 - **AMQP client**: `rabbitmq-c` (librabbitmq) with TLS via OpenSSL
 - **JSON serialization**: `cJSON`
-- **Build**: `make` → single `./assessment-agent` binary. `make USE_VENDORED=1` links statically against `vendor/{cJSON,rabbitmq-c}` (after `make vendor-fetch && make vendor-build`).
+- **HTTPS download (worker)**: `libcurl` with OpenSSL backend
+- **tar extract (worker)**: `libarchive`
+- **Build**: `make` → single `./assessment-agent` binary. `make USE_VENDORED=1` links statically against `vendor/{cJSON,rabbitmq-c,curl,libarchive}` (after `make vendor-fetch && make vendor-build`). OpenSSL is shared across rabbitmq-c, libcurl, and the sha256 verification path.
 - **Execution mode**:
-  - one-shot (`AGENT_INTERVAL_SEC=0`) — for cron / systemd timer
-  - loop mode (positive interval) — single long-running process with exponential backoff on publish failure
+  - one-shot (`AGENT_INTERVAL_SEC=0`) — for cron / systemd timer. Worker disabled in one-shot.
+  - loop mode (positive interval) — single long-running process. Each tick: poll metrics → publish → if idle and a task message exists, fork a worker child for it → reap any finished child → sleep.
 - **Optional runtime commands** (silent fallback when missing — startup logs availability to stderr):
   - `lsblk` — disk listing; falls back to `/sys/block` scan
   - `curl` — IMDS / external IP; missing → `null`
@@ -46,10 +52,14 @@ Pipeline: `agent (this repo) → RabbitMQ → assessment-engine (consumer + web)
 
 ```
 src/
-  main.c        # env parsing, collection/publish loop, entry point
+  main.c        # env parsing, collection/publish + worker loop, entry point
   collect.c/.h  # /proc, /sys, syscall-based collectors
-  publish.c/.h  # rabbitmq-c connection, TLS, basic_publish, deadline-bounded confirm
+  publish.c/.h  # rabbitmq-c connection, TLS, basic_publish, basic_get, deadline-bounded confirm
   util.c/.h     # env file loader, string helpers
+  worker.c/.h   # task.install consumer state machine — basic_get poll, fork/reap, idempotency markers
+  download.c/.h # libcurl HTTPS download with sha256 streaming + host whitelist + size cap
+  extract.c/.h  # libarchive tar extract with entry-type whitelist + permission stripping
+  exec.c/.h     # fork/execve install.sh with clearenv + setrlimit + setsid + 4KB tail capture
 include/        # public headers for the source files above
 docs/
   payload-schema.md   # message schema (canonical contract with the engine)
@@ -65,18 +75,24 @@ tests/
 scripts/
   rabbitmq-up.sh      # local dev broker (Docker)
   rabbitmq-down.sh
+deploy/
+  systemd/
+    assessment-agent.service  # systemd unit with User= and TimeoutStopSec= aligned with worker drain
 vendor/                # gitignored; populated by `make vendor-fetch`
   cJSON/               # static lib build target
   rabbitmq-c/          # static lib build target
+  curl/                # static lib build target (worker download)
+  libarchive/          # static lib build target (worker extract)
 ```
 
 ### Core Principles
 
-1. **No-execution.** The agent only reads. It must never modify anything on the target host (no writes outside its own log file, no package operations, no service control).
-2. **Stateless.** The agent does not retain previous tick / counter values across cycles. It emits raw cumulative counters from `/proc`. All delta, percentage and rate computations happen in the engine.
+1. **Restricted execution.** Beyond pure read of `/proc` and `/sys`, the agent now executes `install.sh` scripts supplied by `task.install` messages from the portal. Execution runs as the agent's non-privileged user (no root, no sudo) with a hardened environment (`clearenv` + `setrlimit` + `setsid` + a /tmp extraction sandbox). No other side effects — the agent does not manage packages, services, or its own binary outside the explicit task channel.
+2. **Stateless metric counters.** The agent does not retain previous tick / counter values across cycles. It emits raw cumulative counters from `/proc`. All delta, percentage and rate computations happen in the engine.
 3. **Raw values only.** No `avg`, no `pct`, no `iops_per_second`. The 1-minute metric message is a snapshot of `/proc` raw fields.
 4. **Single normalized schema.** OS-specific command differences are absorbed inside the agent (collector branches by `os_id` / kernel). The wire format is **identical** regardless of OS.
 5. **Optional features are not errors.** Missing `ethtool`, `lvs`, `docker`, etc. produce `null` / empty arrays. They do not generate `server.error` messages.
+6. **Task durability over speed.** Worker prefers correctness over latency: at-most-one install at a time per host (M1), one-minute task pickup poll (T1), result persisted to disk before broker ack so a parent crash never silently loses a completed install (R2 + I1).
 
 ---
 
@@ -162,30 +178,41 @@ Full schema and JSON examples: [`docs/payload-schema.md`](../docs/payload-schema
 ## RabbitMQ Topology (Target Production)
 
 ```
-Exchange: assessment       (direct, durable)
-  ├── server.inventory  → queue: server.inventory      (durable, DLX-bound)
-  ├── server.metrics    → queue: server.metrics        (durable, DLX-bound, x-message-ttl=72h, x-max-length=1M)
-  └── server.error      → queue: server.error          (durable, DLX-bound)
+Exchange: assessment             (direct, durable)
+  ├── server.inventory        → queue: server.inventory      (durable, DLX-bound)
+  ├── server.metrics          → queue: server.metrics        (durable, DLX-bound, x-message-ttl=72h, x-max-length=1M)
+  └── server.error            → queue: server.error          (durable, DLX-bound)
 
-DLX: assessment.dlx        (direct, durable)
-  ├── server.inventory  → queue: server.inventory.dead
-  ├── server.metrics    → queue: server.metrics.dead
-  └── server.error      → queue: server.error.dead
+DLX: assessment.dlx              (direct, durable)
+  ├── server.inventory        → queue: server.inventory.dead
+  ├── server.metrics          → queue: server.metrics.dead
+  └── server.error            → queue: server.error.dead
+
+Exchange: assessment.tasks       (direct, durable)
+  ├── task.install.<m1>       → queue: agent.tasks.<m1>      (durable, DLX-bound, x-message-ttl=1h, x-max-length=100, x-overflow=reject-publish)
+  ├── task.install.<m2>       → queue: agent.tasks.<m2>      (...)
+  └── task.result             → queue: worker.result          (portal consumes)
+
+DLX: assessment.tasks.dlx        (direct, durable)
+  └── task.install.*          → queue: assessment.tasks.dead (durable, x-message-ttl=7d)
 ```
 
-The agent only publishes. Queue / exchange / DLX declaration is owned by the engine (run once with the `topology-admin` user).
+The agent publishes to `assessment` (inventory/metrics/error) and `assessment.tasks` (task.result), and consumes from its own `agent.tasks.<machine_id>` queue via `basic_get`. Exchange + DLX declarations are owned by the engine (run once with `topology-admin`). The per-machine `agent.tasks.<machine_id>` queue is declared by the **portal** when it first registers a new machine.
 
 ### Permissions Model (least privilege)
 
 | Vhost user | configure | write | read | Used by |
 |---|---|---|---|---|
-| `agent-publisher` | `^$` | `^assessment$` | `^$` | this agent |
+| `agent-publisher` | `^$` | `^assessment$` | `^$` | this agent (collector) |
+| `agent-worker` | `^$` | `^assessment\.tasks$` | `^agent\.tasks\..*$` | this agent (worker) — task.result publish + own queue consume |
 | `worker-consumer` | `^$` | `^$` | `^server\.(inventory\|metrics\|error)$` | engine consumer |
 | `dlq-handler` | `^$` | `^$` | `^server\.(inventory\|metrics\|error)\.dead$` | engine DLQ inspection |
-| `topology-admin` | `^(assessment(\.dlx)?\|server\..*)$` | `^(assessment(\.dlx)?\|server\..*)$` | `^server\..*$` | one-shot bootstrap |
+| `portal-task-issuer` | `^agent\.tasks\..*$` | `^assessment\.tasks$` | `^$` | portal — publishes task.install + declares per-machine queue |
+| `portal-task-consumer` | `^$` | `^$` | `^worker\.result$` | portal — consumes task.result |
+| `topology-admin` | `^(assessment(\.tasks)?(\.dlx)?\|server\..*\|worker\.result\|assessment\.tasks\.dead)$` | `^(assessment(\.tasks)?(\.dlx)?\|server\..*\|worker\.result\|assessment\.tasks\.dead)$` | `^(server\..*\|agent\.tasks\..*\|worker\.result)$` | one-shot bootstrap |
 | `monitor-readonly` | `^$` | `^$` | `^$` | management UI (`monitoring` tag) |
 
-The agent ships with `agent-publisher` credentials only. Compromise scope is bounded to publishing arbitrary payloads — it cannot consume or reconfigure topology.
+The agent ships with two credentials: `agent-publisher` (collector connection) and `agent-worker` (worker connection — CM2 model: separate AMQP connections per role). `agent-worker` is a single shared credential across the fleet, so the read scope is the wildcard `^agent\.tasks\..*$` — a malicious agent could theoretically subscribe to another machine's queue, but machine_ids are UUIDs from `/etc/machine-id` so guessing is impractical. For stricter isolation, fleet provisioning may issue per-machine credentials.
 
 ### TLS
 
@@ -213,8 +240,10 @@ Local dev uses plain AMQP and the default vhost. Production must not.
 | `RABBITMQ_HOST` | `localhost` | broker hostname |
 | `RABBITMQ_PORT` | `5671` | AMQPS in production |
 | `RABBITMQ_VHOST` | `/assessment` | dedicated vhost (production) |
-| `RABBITMQ_USER` | — | `agent-publisher` in production |
+| `RABBITMQ_USER` | — | `agent-publisher` in production (collector connection) |
 | `RABBITMQ_PASS` | — | injected from secret store |
+| `RABBITMQ_WORKER_USER` | — | `agent-worker` in production (worker connection). When unset, worker is disabled |
+| `RABBITMQ_WORKER_PASS` | — | injected from secret store |
 | `RABBITMQ_TLS_ENABLED` | `true` | disable only for local dev |
 | `RABBITMQ_TLS_CA_PATH` | `/etc/assessment-agent/ca.pem` | CA pem |
 | `RABBITMQ_TLS_VERIFY_PEER` | `true` | |
@@ -231,8 +260,113 @@ Local dev uses plain AMQP and the default vhost. Production must not.
 | `AGENT_INVENTORY_REFRESH_SEC` | `3600` | inventory periodic re-publish base interval. Actual delay is `value × (1 + uniform(-0.15, +0.15))`. `0` disables the periodic refresh (startup + change-trigger only) |
 | `AGENT_HOSTNAME_OVERRIDE` | — | testing aid |
 | `AGENT_EXTERNAL_IP` | — | skip IMDS lookup if set |
+| `WORKER_DOWNLOAD_ALLOWED_HOSTS` | — | comma-separated hostname whitelist for `task.install` downloads. Case-insensitive exact match (no wildcards). Empty/unset = **all hosts blocked** = worker effectively disabled |
+| `WORKER_STATE_DIR` | `/var/lib/agent-worker` | base directory for `/results` (pending publish), `/done` (idempotency markers, 7-day retention) |
+| `WORKER_TMP_DIR` | `/tmp` | base directory for extraction sandboxes (`agent-task-<task_id>/`) |
+| `WORKER_DONE_RETENTION_SEC` | `604800` | retention for `/done/<task_id>.json` idempotency markers (default 7 days) |
+| `WORKER_DISK_RESERVE_MB` | `50` | required free space margin on `WORKER_TMP_DIR` above `download.size_bytes` before download starts |
+| `WORKER_INSTALL_MEM_LIMIT_MB` | `2048` | `RLIMIT_AS` applied to `install.sh` (address-space cap) |
+| `WORKER_INSTALL_FSIZE_LIMIT_MB` | `5120` | `RLIMIT_FSIZE` applied to `install.sh` (max file size) |
+| `WORKER_TASK_QUEUE_PREFIX` | `agent.tasks` | queue name prefix; agent consumes `<prefix>.<machine_id>` |
+| `WORKER_TASK_EXCHANGE` | `assessment.tasks` | exchange to which task.result is published |
+| `WORKER_TASK_RESULT_KEY` | `task.result` | routing key for task.result |
 
 Shell environment variables override values in `.env`.
+
+---
+
+## Worker (task.install)
+
+The worker consumes `task.install` messages from a per-machine queue, executes a packaged `install.sh`, and publishes a `task.result` summary. It runs inside the same process as the collector — there is no separate worker binary, daemon, or thread.
+
+### Architecture
+
+```
+                                                 ┌──────────────────────┐
+                                                 │ assessment-portal    │
+                                                 │ (publisher / consumer)
+                                                 └──────────┬───────────┘
+                                                            │ publishes task.install.<machine_id>
+                                                            ▼
+        ┌──────────────────────[assessment.tasks (direct exchange)]──────────────────────┐
+        │                                                                                 │
+        │   task.install.<m1> → agent.tasks.<m1>   (TTL 1h, max 100, reject-publish, DLX) │
+        │   task.install.<m2> → agent.tasks.<m2>   (...)                                  │
+        │   task.result       → worker.result      (portal consumes)                      │
+        │                                                                                 │
+        └────────────────┬────────────────────────────────────────────────────────────────┘
+                         │ basic_get (1-min poll)
+                         ▼
+            ┌─────────────────────────────────────────────┐
+            │  agent parent process (single thread)        │
+            │   tick: collect/publish metrics →            │
+            │         if idle: basic_get(agent.tasks.<m>)  │
+            │         if got task: fork() child            │
+            │         reap any finished child →            │
+            │           read /var/lib/agent-worker/results/│
+            │           publish task.result + ack + move   │
+            │             file to /var/lib/agent-worker/done/│
+            │         sleep AGENT_INTERVAL_SEC             │
+            └────────────────────┬────────────────────────┘
+                                 │ fork (M1: one child at a time)
+                                 ▼
+                ┌────────────────────────────────────────┐
+                │ worker child (one task)                 │
+                │  1. machine_id sanity check             │
+                │  2. /done/<task_id>.json present?       │
+                │       yes → write "already_done" result │
+                │             file, exit                  │
+                │  3. host whitelist + HTTPS download +   │
+                │       sha256 streaming + size cap +     │
+                │       statvfs disk check                │
+                │  4. libarchive extract (TP1 policy)     │
+                │  5. fork/execve install.sh under EC1    │
+                │     environment, capture 4KB tails      │
+                │  6. write /var/lib/agent-worker/results/│
+                │       <task_id>.json (success/failure)  │
+                │  7. rm -rf /tmp/agent-task-<task_id>/   │
+                │  8. _exit(0)                            │
+                └─────────────────────────────────────────┘
+```
+
+### Design Decisions (see [`docs/worker-task-design.md`](../docs/worker-task-design.md))
+
+| Area | Decision |
+|---|---|
+| Execution model | **B-f**: single binary, single process, fork-per-task |
+| Concurrency | **M1**: at most one in-flight install per host |
+| Task pickup | **T1**: `basic_get` polled at each 1-minute tick (no `basic_consume`) |
+| Ack timing | **K3**: ack after `install.sh` terminates (success or failure both ack) |
+| Result delivery | **R2**: child writes result file; parent reads, publishes, acks, moves to `/done/` |
+| Idempotency | **I1**: `/done/<task_id>.json` marker → redelivered tasks publish `already_done` result and skip install |
+| SIGTERM | **S2**: drain in-flight install (no new tasks, finish current). systemd `TimeoutStopSec` must accommodate |
+| Install user | **U1**: same non-privileged user as the agent process (no setuid, no sudo) |
+| install.sh env | **EC1**: `clearenv` + whitelisted PATH/HOME/USER/LANG + TASK_ID/MACHINE_ID, `setrlimit` caps, `setsid`, stdin /dev/null, stdout/stderr captured as 4KB tail, CWD = extraction directory |
+| Download | libcurl HTTPS only, **redirects disabled** (RD2), sha256 streaming (OpenSSL EVP), `size_bytes` byte cap, host whitelist (W1) |
+| Extract | libarchive, regular files + directories only (no symlink/hardlink/device/FIFO/socket), `mode &= 0777` (strip setuid/setgid/sticky), owner = agent user (TP1) |
+| AMQP connections | **CM2**: two separate connections — `agent-publisher` for collector, `agent-worker` for worker (task.result publish + own queue consume) |
+| sha256 trust | **P1**: portal-sourced sha256 trusted for now. Portal compromise = arbitrary code execution on every fleet host. Documented + audited |
+
+### Failure / Recovery Matrix
+
+| Scenario | Behavior |
+|---|---|
+| Child crashes before writing result file | Parent reaps with `WIFSIGNALED`; publishes synthesized `failure_reason: internal_error` result, acks, moves marker to `/done/` |
+| Parent crashes between child completion and broker ack | Broker re-delivers task on next reconnect. Parent's startup scans `/var/lib/agent-worker/results/` and publishes any pending file; redelivered task hits `/done/` marker and skips install (I1) |
+| Parent SIGTERM while child running | Parent enters drain mode (no new `basic_get`), waits for child reap, publishes result, then exits (S2) |
+| Download size exceeds `size_bytes` mid-transfer | libcurl progress callback aborts; result published with `failure_reason: download_failed` |
+| sha256 mismatch | Result `failure_reason: sha256_mismatch` |
+| tar contains symlink/hardlink/device/setuid file | Result `failure_reason: extract_failed` (entry filtered before extraction begins) |
+| `install.sh` exceeds `install.timeout_sec` | Child's `alarm()` sends SIGTERM to install.sh, +5s SIGKILL. Result `failure_reason: script_timeout` |
+| Disk insufficient before download | Result `failure_reason: insufficient_disk` |
+| Broker rejects task.result publish (network blip) | `publish_with_retry` (existing collector retry logic) reused. Result file remains in `/results/` until publish succeeds — durable across retries |
+
+### Out of Scope
+
+- Agent self-upgrade via `task.install` — agent binary lives in root-owned `/usr/local/bin`, so user-level install.sh **cannot replace it**. Self-upgrade goes through a separate deploy channel.
+- Privileged installs (system packages, systemd unit registration, kernel modules) — blocked by U1 user-level execution. Such installs must be performed out-of-band.
+- Multiple concurrent installs on the same host — blocked by M1. The MQ queue handles backpressure.
+- Automatic retry of failed downloads — F1: no agent-side retry. Portal re-issues with a new `task_id` if retry is desired.
 
 ---
 
@@ -248,7 +382,8 @@ Shell environment variables override values in `.env`.
 | 6 | TLS (AMQPS / mTLS) / vhost / agent-publisher credentials env | ✅ Done |
 | 7 | Library vendoring (rabbitmq-c, cJSON) — `make USE_VENDORED=1` static build | ✅ Done |
 | 8 | Inventory periodic refresh + boot_time/agent_started_at in common metadata | ✅ Done (v3.1) |
-| 9 | Deployment artifacts (cron + systemd timer) | Pending |
+| 9 | Worker (task.install) — fork-based consumer, libcurl/libarchive, idempotency, CM2 dual-connection | In progress |
+| 10 | Deployment artifacts (systemd unit with worker drain TimeoutStopSec) | In progress |
 
 ---
 
