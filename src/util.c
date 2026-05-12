@@ -8,10 +8,12 @@
 #include "util.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -107,6 +109,32 @@ const char *getenv_default(const char *name, const char *fallback)
 {
 	const char *v = getenv(name);
 	return (v && *v) ? v : fallback;
+}
+
+int parse_bool(const char *s, int fallback)
+{
+	if (!s || !*s) return fallback;
+	if (!strcasecmp(s, "1")    || !strcasecmp(s, "true") ||
+	    !strcasecmp(s, "yes")  || !strcasecmp(s, "on")   ||
+	    !strcasecmp(s, "y")    || !strcasecmp(s, "t"))
+		return 1;
+	return 0;
+}
+
+int getenv_bool(const char *name, int fallback)
+{
+	return parse_bool(getenv(name), fallback);
+}
+
+int getenv_int_or(const char *name, int fallback)
+{
+	const char *v = getenv(name);
+	if (!v || !*v) return fallback;
+	char *end = NULL;
+	errno = 0;
+	long n = strtol(v, &end, 10);
+	if (errno != 0 || end == v || *end != '\0') return fallback;
+	return (int)n;
 }
 
 char *trim_inplace(char *s)

@@ -66,7 +66,7 @@ static int check_rpc(amqp_rpc_reply_t r, const char *ctx)
  */
 static int wait_confirm(amqp_connection_state_t conn)
 {
-	int t = atoi(getenv_default("RABBITMQ_CONFIRM_TIMEOUT_SEC", "5"));
+	int t = getenv_int_or("RABBITMQ_CONFIRM_TIMEOUT_SEC", 5);
 	long limit_ms = (long)(t > 0 ? t : 5) * 1000;
 
 	struct timespec start;

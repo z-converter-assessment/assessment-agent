@@ -41,6 +41,31 @@ void load_env_file(const char *path);
 const char *getenv_default(const char *name, const char *fallback);
 
 /**
+ * @brief Parse @p s as a boolean (case-insensitive).
+ *
+ * True: "1", "true", "yes", "on", "y", "t".
+ * False: anything else (including NULL, empty, "0", "false", "no", "off",
+ * AND non-numeric strings like "true" that previously evaluated to 0 via
+ * `atoi("true")` — that silent downgrade was a security bug for TLS flags).
+ *
+ * Returns @p fallback when @p s is NULL or empty.
+ */
+int parse_bool(const char *s, int fallback);
+
+/**
+ * @brief Read env var @p name and parse as boolean. Wraps getenv + parse_bool.
+ */
+int getenv_bool(const char *name, int fallback);
+
+/**
+ * @brief Read env var @p name and parse as int (defensively).
+ *
+ * Like atoi but: returns @p fallback when env unset, empty, or unparseable
+ * (instead of silently returning 0 which can disable safety caps).
+ */
+int getenv_int_or(const char *name, int fallback);
+
+/**
  * @brief Trim ASCII whitespace from both ends of @p s in place.
  */
 char *trim_inplace(char *s);

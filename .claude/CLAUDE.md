@@ -361,7 +361,7 @@ The worker consumes `task.install` messages from a per-machine queue, executes a
 | Download size exceeds `size_bytes` mid-transfer | libcurl progress callback aborts; result published with `failure_reason: download_failed` |
 | sha256 mismatch | Result `failure_reason: sha256_mismatch` |
 | tar contains symlink/hardlink/device/setuid file | Result `failure_reason: extract_failed` (entry filtered before extraction begins) |
-| `install.sh` exceeds `install.timeout_sec` | Child's `alarm()` sends SIGTERM to install.sh, +5s SIGKILL. Result `failure_reason: script_timeout` |
+| `install.sh` exceeds `install.timeout_sec` | Parent (worker child) wall-clock loop sends SIGTERM(grandchild) at deadline, +5s SIGKILL. `RLIMIT_CPU` also caps CPU time. Result `failure_reason: script_timeout` |
 | Disk insufficient before download | Result `failure_reason: insufficient_disk` |
 | Broker rejects task.result publish (network blip) | `publish_with_retry` (existing collector retry logic) reused. Result file remains in `/results/` until publish succeeds — durable across retries |
 

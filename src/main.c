@@ -63,21 +63,26 @@ static time_t next_inventory_deadline(time_t now, int refresh_sec)
  */
 static publish_config_t make_publish_config(void)
 {
+	/*
+	 * Round 7 CRITICAL: TLS / verify flags MUST use parse_bool, not atoi.
+	 * `atoi("true") == 0` would silently disable TLS even when the operator
+	 * sets RABBITMQ_TLS_ENABLED=true (the value we ship in agent.env.example).
+	 * That would downgrade production deploys to plain TCP — security regression.
+	 */
 	publish_config_t cfg = {
 		.host        = getenv_default("RABBITMQ_HOST", "localhost"),
-		.port        = atoi(getenv_default("RABBITMQ_PORT", "5672")),
+		.port        = getenv_int_or("RABBITMQ_PORT", 0),
 		.vhost       = getenv_default("RABBITMQ_VHOST", "/"),
 		.user        = getenv_default("RABBITMQ_USER", "admin"),
 		.password    = getenv_default("RABBITMQ_PASS", "admin"),
 		.exchange    = getenv_default("RABBITMQ_EXCHANGE", "assessment"),
 
-		/* RabbitMQ recommends 60s heartbeat. */
-		.heartbeat_sec = atoi(getenv_default("RABBITMQ_HEARTBEAT_SEC", "60")),
+		.heartbeat_sec = getenv_int_or("RABBITMQ_HEARTBEAT_SEC", 60),
 
-		.tls_enabled = atoi(getenv_default("RABBITMQ_TLS_ENABLED", "0")),
+		.tls_enabled = getenv_bool("RABBITMQ_TLS_ENABLED", 0),
 		.tls_ca_path = getenv_default("RABBITMQ_TLS_CA_PATH", ""),
-		.tls_verify_peer     = atoi(getenv_default("RABBITMQ_TLS_VERIFY_PEER", "1")),
-		.tls_verify_hostname = atoi(getenv_default("RABBITMQ_TLS_VERIFY_HOSTNAME", "1")),
+		.tls_verify_peer     = getenv_bool("RABBITMQ_TLS_VERIFY_PEER", 1),
+		.tls_verify_hostname = getenv_bool("RABBITMQ_TLS_VERIFY_HOSTNAME", 1),
 		.tls_cert_path = getenv_default("RABBITMQ_TLS_CERT_PATH", ""),
 		.tls_key_path  = getenv_default("RABBITMQ_TLS_KEY_PATH", ""),
 	};
@@ -246,8 +251,8 @@ int main(void)
 	/* Jitter seed — once per process, mixing pid so co-booted hosts diverge. */
 	srand((unsigned int)(time(NULL) ^ getpid()));
 
-	int interval = atoi(getenv_default("AGENT_INTERVAL_SEC", "60"));
-	int inv_refresh = atoi(getenv_default("AGENT_INVENTORY_REFRESH_SEC", "3600"));
+	int interval = getenv_int_or("AGENT_INTERVAL_SEC", 60);
+	int inv_refresh = getenv_int_or("AGENT_INVENTORY_REFRESH_SEC", 3600);
 	publish_config_t cfg = make_publish_config();
 
 	const char *rk_inv = getenv_default("RABBITMQ_ROUTING_KEY_INVENTORY", "server.inventory");
@@ -299,6 +304,7 @@ int main(void)
 	worker_ctx_t *worker = NULL;
 	const char *worker_user = getenv_default("RABBITMQ_WORKER_USER", "");
 	if (*worker_user) {
+		/* RABBITMQ_WORKER_USER blank disables worker entirely. */
 		publish_config_t wcfg = make_worker_publish_config();
 
 		const char *queue_prefix = getenv_default("WORKER_TASK_QUEUE_PREFIX", "agent.tasks");
@@ -314,11 +320,11 @@ int main(void)
 			.state_dir           = getenv_default("WORKER_STATE_DIR", "/var/lib/agent-worker"),
 			.tmp_dir             = getenv_default("WORKER_TMP_DIR",   "/tmp"),
 			.allowed_hosts_csv   = getenv_default("WORKER_DOWNLOAD_ALLOWED_HOSTS", ""),
-			.done_retention_sec  = atoi(getenv_default("WORKER_DONE_RETENTION_SEC", "604800")),
-			.disk_reserve_mb     = atoi(getenv_default("WORKER_DISK_RESERVE_MB", "50")),
-			.mem_limit_mb        = atoi(getenv_default("WORKER_INSTALL_MEM_LIMIT_MB",   "2048")),
-			.fsize_limit_mb      = atoi(getenv_default("WORKER_INSTALL_FSIZE_LIMIT_MB", "5120")),
-			.nofile_limit        = atoi(getenv_default("WORKER_INSTALL_NOFILE",        "4096")),
+			.done_retention_sec  = getenv_int_or("WORKER_DONE_RETENTION_SEC", 604800),
+			.disk_reserve_mb     = getenv_int_or("WORKER_DISK_RESERVE_MB", 50),
+			.mem_limit_mb        = getenv_int_or("WORKER_INSTALL_MEM_LIMIT_MB",   2048),
+			.fsize_limit_mb      = getenv_int_or("WORKER_INSTALL_FSIZE_LIMIT_MB", 5120),
+			.nofile_limit        = getenv_int_or("WORKER_INSTALL_NOFILE",        4096),
 		};
 		worker = worker_init(&wc);
 		if (!worker) {
@@ -407,14 +413,14 @@ int main(void)
 	 */
 	if (worker) {
 		worker_begin_drain(worker);
-		int grace_sec   = atoi(getenv_default("AGENT_DRAIN_GRACE_SEC",   "600"));
-		int term_sec    = atoi(getenv_default("AGENT_DRAIN_TERM_SEC",    "30"));
+		int grace_sec   = getenv_int_or("AGENT_DRAIN_GRACE_SEC",   600);
+		int term_sec    = getenv_int_or("AGENT_DRAIN_TERM_SEC",    30);
 		/*
 		 * Round 6: default publish-stuck deadline must comfortably exceed
 		 * WORKER_RECONNECT_BACKOFF_MAX (60s) so at least 2-3 reconnect
 		 * attempts can fire during drain. 180s gives ~3 reconnect windows.
 		 */
-		int publish_sec = atoi(getenv_default("AGENT_DRAIN_PUBLISH_SEC", "180"));
+		int publish_sec = getenv_int_or("AGENT_DRAIN_PUBLISH_SEC", 180);
 		fprintf(stderr, "[agent] draining worker (grace=%ds, term=%ds, publish-stuck=%ds)\n",
 		        grace_sec, term_sec, publish_sec);
 
