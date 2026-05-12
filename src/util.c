@@ -10,6 +10,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -118,12 +119,25 @@ int parse_bool(const char *s, int fallback)
 	    !strcasecmp(s, "yes")  || !strcasecmp(s, "on")   ||
 	    !strcasecmp(s, "y")    || !strcasecmp(s, "t"))
 		return 1;
-	return 0;
+	if (!strcasecmp(s, "0")    || !strcasecmp(s, "false") ||
+	    !strcasecmp(s, "no")   || !strcasecmp(s, "off")   ||
+	    !strcasecmp(s, "n")    || !strcasecmp(s, "f"))
+		return 0;
+	/* Unrecognized — return -1 sentinel; getenv_bool surfaces a warning. */
+	return -1;
 }
 
 int getenv_bool(const char *name, int fallback)
 {
-	return parse_bool(getenv(name), fallback);
+	const char *v = getenv(name);
+	if (!v || !*v) return fallback;
+	int parsed = parse_bool(v, -1);
+	if (parsed < 0) {
+		fprintf(stderr, "[agent] WARN: env %s=\"%s\" not a recognized boolean (use true/false/1/0/yes/no/on/off); using default %d\n",
+		        name, v, fallback);
+		return fallback;
+	}
+	return parsed;
 }
 
 int getenv_int_or(const char *name, int fallback)
@@ -133,7 +147,16 @@ int getenv_int_or(const char *name, int fallback)
 	char *end = NULL;
 	errno = 0;
 	long n = strtol(v, &end, 10);
-	if (errno != 0 || end == v || *end != '\0') return fallback;
+	if (errno != 0 || end == v || *end != '\0') {
+		fprintf(stderr, "[agent] WARN: env %s=\"%s\" not a valid integer; using default %d\n",
+		        name, v, fallback);
+		return fallback;
+	}
+	if (n < INT_MIN || n > INT_MAX) {
+		fprintf(stderr, "[agent] WARN: env %s=\"%s\" out of int range; using default %d\n",
+		        name, v, fallback);
+		return fallback;
+	}
 	return (int)n;
 }
 

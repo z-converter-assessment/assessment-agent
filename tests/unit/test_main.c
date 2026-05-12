@@ -89,6 +89,92 @@ static void test_getenv_default_set(void)
 }
 
 /* ============================================================
+ * util.c — parse_bool
+ * ============================================================ */
+
+static void test_parse_bool_true_tokens(void)
+{
+	ASSERT_EQ(parse_bool("1",     0), 1);
+	ASSERT_EQ(parse_bool("true",  0), 1);
+	ASSERT_EQ(parse_bool("TRUE",  0), 1);
+	ASSERT_EQ(parse_bool("True",  0), 1);
+	ASSERT_EQ(parse_bool("yes",   0), 1);
+	ASSERT_EQ(parse_bool("YES",   0), 1);
+	ASSERT_EQ(parse_bool("on",    0), 1);
+	ASSERT_EQ(parse_bool("y",     0), 1);
+	ASSERT_EQ(parse_bool("t",     0), 1);
+}
+
+static void test_parse_bool_false_tokens(void)
+{
+	ASSERT_EQ(parse_bool("0",     1), 0);
+	ASSERT_EQ(parse_bool("false", 1), 0);
+	ASSERT_EQ(parse_bool("FALSE", 1), 0);
+	ASSERT_EQ(parse_bool("no",    1), 0);
+	ASSERT_EQ(parse_bool("off",   1), 0);
+	ASSERT_EQ(parse_bool("n",     1), 0);
+	ASSERT_EQ(parse_bool("f",     1), 0);
+}
+
+static void test_parse_bool_null_empty_fallback(void)
+{
+	ASSERT_EQ(parse_bool(NULL,  42), 42);
+	ASSERT_EQ(parse_bool("",    42), 42);
+}
+
+static void test_parse_bool_unrecognized_returns_sentinel(void)
+{
+	/* Round 8: unrecognized tokens return -1 sentinel, not silent 0.
+	 * getenv_bool catches -1 and emits a warning + fallback. */
+	ASSERT_EQ(parse_bool("2",       0), -1);
+	ASSERT_EQ(parse_bool("enabled", 0), -1);
+	ASSERT_EQ(parse_bool("garbage", 0), -1);
+	ASSERT_EQ(parse_bool("True!",   0), -1);
+}
+
+/* ============================================================
+ * util.c — getenv_int_or
+ * ============================================================ */
+
+static void test_getenv_int_or_unset(void)
+{
+	unsetenv("TT_INT_VAR");
+	ASSERT_EQ(getenv_int_or("TT_INT_VAR", 99), 99);
+}
+
+static void test_getenv_int_or_empty_fallback(void)
+{
+	setenv("TT_INT_VAR", "", 1);
+	ASSERT_EQ(getenv_int_or("TT_INT_VAR", 99), 99);
+	unsetenv("TT_INT_VAR");
+}
+
+static void test_getenv_int_or_valid(void)
+{
+	setenv("TT_INT_VAR", "42", 1);
+	ASSERT_EQ(getenv_int_or("TT_INT_VAR", 99), 42);
+	setenv("TT_INT_VAR", "-7", 1);
+	ASSERT_EQ(getenv_int_or("TT_INT_VAR", 99), -7);
+	unsetenv("TT_INT_VAR");
+}
+
+static void test_getenv_int_or_garbage_fallback(void)
+{
+	setenv("TT_INT_VAR", "abc", 1);
+	ASSERT_EQ(getenv_int_or("TT_INT_VAR", 99), 99);
+	setenv("TT_INT_VAR", "123abc", 1);
+	ASSERT_EQ(getenv_int_or("TT_INT_VAR", 99), 99);
+	unsetenv("TT_INT_VAR");
+}
+
+static void test_getenv_int_or_overflow_fallback(void)
+{
+	setenv("TT_INT_VAR", "99999999999999", 1);   /* > INT_MAX */
+	ASSERT_EQ(getenv_int_or("TT_INT_VAR", 99), 99);
+	unsetenv("TT_INT_VAR");
+}
+
+/* ============================================================
  * util.c — iso8601_utc / iso8601_utc_ms
  * ============================================================ */
 
@@ -909,6 +995,19 @@ int main(void)
 	RUN_TEST(test_getenv_default_unset);
 	RUN_TEST(test_getenv_default_empty);
 	RUN_TEST(test_getenv_default_set);
+
+	/* util.c — parse_bool */
+	RUN_TEST(test_parse_bool_true_tokens);
+	RUN_TEST(test_parse_bool_false_tokens);
+	RUN_TEST(test_parse_bool_null_empty_fallback);
+	RUN_TEST(test_parse_bool_unrecognized_returns_sentinel);
+
+	/* util.c — getenv_int_or */
+	RUN_TEST(test_getenv_int_or_unset);
+	RUN_TEST(test_getenv_int_or_empty_fallback);
+	RUN_TEST(test_getenv_int_or_valid);
+	RUN_TEST(test_getenv_int_or_garbage_fallback);
+	RUN_TEST(test_getenv_int_or_overflow_fallback);
 
 	/* util.c — iso8601 */
 	RUN_TEST(test_iso8601_utc_epoch);

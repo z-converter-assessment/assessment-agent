@@ -43,12 +43,14 @@ const char *getenv_default(const char *name, const char *fallback);
 /**
  * @brief Parse @p s as a boolean (case-insensitive).
  *
- * True: "1", "true", "yes", "on", "y", "t".
- * False: anything else (including NULL, empty, "0", "false", "no", "off",
- * AND non-numeric strings like "true" that previously evaluated to 0 via
- * `atoi("true")` — that silent downgrade was a security bug for TLS flags).
+ *   True:  "1", "true", "yes", "on", "y", "t" → returns 1
+ *   False: "0", "false", "no", "off", "n", "f" → returns 0
+ *   NULL/empty: returns @p fallback
+ *   Other (e.g. "2", "enabled", typos): returns -1 (sentinel)
  *
- * Returns @p fallback when @p s is NULL or empty.
+ * `getenv_bool` translates the -1 sentinel into a warning + fallback,
+ * so unrecognized operator values are surfaced rather than silently
+ * disabling features.
  */
 int parse_bool(const char *s, int fallback);
 
