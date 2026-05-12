@@ -36,6 +36,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -244,6 +245,25 @@ int main(void)
 {
 	signal(SIGINT,  on_signal);
 	signal(SIGTERM, on_signal);
+	/*
+	 * Round 9: ignore SIGPIPE. librabbitmq does not pass MSG_NOSIGNAL to
+	 * its write()/SSL_write() calls, so a broker-side TCP reset mid-publish
+	 * would otherwise raise SIGPIPE → default disposition is process
+	 * termination. With SIG_IGN the write returns EPIPE, the publish path
+	 * sees an error, and the existing reconnect logic recovers. Same risk
+	 * applies to install.sh stdout/stderr pipes (round-3 exec.c reads them
+	 * via select+read, but install.sh writing to a closed pipe — e.g. agent
+	 * was killed mid-task — would also raise SIGPIPE without this guard).
+	 */
+	signal(SIGPIPE, SIG_IGN);
+
+	/*
+	 * Round 9: tighten default umask so /var/lib/agent-worker/{done,running,results}
+	 * files are owner-only (0600). systemd's StateDirectoryMode=0700 already
+	 * protects the directory; this hardens the files inside it (which contain
+	 * task_id, machine_id, install.sh stdout/stderr tails).
+	 */
+	umask(077);
 
 	load_env_file(".env");
 	log_optional_cmds();
