@@ -62,7 +62,8 @@ struct worker_ctx_s {
 
 	int  drain;                    /* set by worker_begin_drain */
 	int  conn_dead;                /* CRITICAL #2: set on transport failure; reconnect on next tick */
-	time_t last_reconnect_attempt; /* HIGH (round 2): backoff vs broker rate-limit */
+	/* Round 3: monotonic clock to avoid NTP step skew. */
+	struct timespec last_reconnect_attempt;
 	int  reconnect_backoff_sec;    /* current backoff window */
 
 	/* IDLE when child_pid == 0, BUSY otherwise. */
@@ -323,8 +324,12 @@ static void child_run_task(worker_ctx_t *ctx, cJSON *task)
 	 * worker child shares the agent's pgid; -child_pid points to a non-
 	 * existent pgid and silently returns ESRCH — drain becomes dead code.
 	 */
-	close_inherited_fds();
+	/*
+	 * Round 3: setpgid first so drain escalation has a target group
+	 * even if close_inherited_fds takes a moment.
+	 */
 	(void)setpgid(0, 0);
+	close_inherited_fds();
 
 	const cJSON *jid       = cJSON_GetObjectItemCaseSensitive(task, "task_id");
 	const cJSON *jmachine  = cJSON_GetObjectItemCaseSensitive(task, "machine_id");
@@ -479,20 +484,31 @@ static int publish_result_and_ack(worker_ctx_t *ctx,
 		return -1;
 	}
 	/*
-	 * CRITICAL #3 (round 2): if delivery_tag was zeroed by reconnect_if_dead
-	 * (channel that owned the tag is gone), do NOT call basic_ack — the
-	 * broker treats `delivery_tag=0, multiple=0` as PRECONDITION_FAILED
-	 * and closes the new channel, triggering a flap. Skip ack; the broker
-	 * will redeliver and the /done marker just written will gate it via I1.
+	 * Round 3 CRIT-N1: move /results → /done BEFORE ack so that an
+	 * ack failure (or any crash between publish and ack) leaves the
+	 * idempotency marker intact. Without this, the success path could
+	 * leave the broker still holding the message unacked while /done
+	 * is missing — a redelivery would re-execute the install.
+	 *
+	 * If ack subsequently succeeds, we're fully done.
+	 * If ack fails (or delivery_tag==0 from a reconnect), broker
+	 * eventually redelivers and I1 picks up the /done marker.
 	 */
-	if (delivery_tag != 0 && publish_conn_ack(ctx->conn, delivery_tag) != 0) {
-		fprintf(stderr, "[worker] basic.ack failed for %s — broker will redeliver, idempotency marker will gate it\n",
-		        task_id);
-		return -1;
-	}
 	if (move_to_done(ctx, task_id) != 0)
 		fprintf(stderr, "[worker] move to /done failed for %s: %s\n",
 		        task_id, strerror(errno));
+
+	/*
+	 * Round 2 CRIT-D: skip ack if delivery_tag was zeroed by
+	 * reconnect_if_dead (the channel that owned this tag is gone).
+	 * Broker would otherwise reject `tag=0, multiple=0` with
+	 * PRECONDITION_FAILED and close the new channel, triggering a flap.
+	 */
+	if (delivery_tag != 0 && publish_conn_ack(ctx->conn, delivery_tag) != 0) {
+		fprintf(stderr, "[worker] basic.ack failed for %s — broker will redeliver, /done marker will gate\n",
+		        task_id);
+		return -1;
+	}
 	return 0;
 }
 
@@ -659,17 +675,41 @@ static void recover_stale_running(worker_ctx_t *ctx)
 		if ((size_t)snprintf(results_path, sizeof results_path, "%s/%s.json", ctx->results_dir, task_id) < sizeof results_path)
 			have_results = file_exists(results_path);
 
+		int safe_to_unlink_running = 1;
+
 		if (!have_done && !have_results) {
 			char *body = build_result_json(ctx, task_id, "failure", "internal_error",
 			                               0, 0, 0, "",
 			                               "agent terminated mid-install; recovered on restart\n");
-			if (body) {
-				/* Best-effort publish; don't ack (no live delivery_tag here). */
-				(void)publish_conn_publish(ctx->conn,
-				                           ctx->cfg.amqp.exchange,
-				                           ctx->cfg.result_routing_key,
-				                           body, strlen(body));
-				write_file_atomic(done_path, body);
+			if (!body) {
+				/* OOM: leave /running in place; next startup retries. */
+				safe_to_unlink_running = 0;
+			} else {
+				/*
+				 * Round 3 CRIT-N3+N4: write /done BEFORE publish (same
+				 * pattern as publish_synth_failure). If the write fails
+				 * (disk full, RO mount, perms), do NOT publish and do
+				 * NOT unlink /running — the next startup retries. Without
+				 * this guard we could end up with /done missing AND
+				 * /running unlinked → broker redelivers → fresh install
+				 * of an already-attempted task.
+				 */
+				if (write_file_atomic(done_path, body) != 0) {
+					fprintf(stderr, "[worker] recover: /done write failed for %s — leaving /running for next startup\n", task_id);
+					safe_to_unlink_running = 0;
+				} else {
+					/* /done is durable. Best-effort publish — failure is
+					 * acceptable because next startup will republish via
+					 * replay_pending_results path (no, actually /done is
+					 * already written so I1 will skip). The portal may
+					 * never see this synth-failure if publish fails AND
+					 * broker never redelivers — accepted as "best-effort
+					 * recovery on a permanently-broken connection". */
+					(void)publish_conn_publish(ctx->conn,
+					                           ctx->cfg.amqp.exchange,
+					                           ctx->cfg.result_routing_key,
+					                           body, strlen(body));
+				}
 				free(body);
 			}
 		} else {
@@ -677,7 +717,8 @@ static void recover_stale_running(worker_ctx_t *ctx)
 			        task_id, have_done, have_results);
 		}
 
-		if ((size_t)snprintf(src_path, sizeof src_path, "%s/%s", ctx->running_dir, e->d_name) < sizeof src_path)
+		if (safe_to_unlink_running &&
+		    (size_t)snprintf(src_path, sizeof src_path, "%s/%s", ctx->running_dir, e->d_name) < sizeof src_path)
 			unlink(src_path);
 	}
 	closedir(d);
@@ -800,14 +841,15 @@ void worker_shutdown(worker_ctx_t *ctx)
  * worker_tick — one main-loop step
  * ============================================================ */
 
-static int try_reap_child(worker_ctx_t *ctx)
+/*
+ * Publish the result for the just-reaped child. Called only after
+ * reap_child_only returned 1 (child reaped) AND the AMQP connection
+ * is alive. Reads /results/<task_id>.json (or synthesizes a failure
+ * if missing), publishes, acks, moves to /done, clears /running.
+ */
+static int publish_reaped_result(worker_ctx_t *ctx)
 {
-	if (ctx->child_pid == 0) return 0;
-
-	int status = 0;
-	pid_t rc = waitpid(ctx->child_pid, &status, WNOHANG);
-	if (rc == 0) return 0;        /* still running */
-	if (rc < 0)  return -1;
+	if (ctx->inflight_task_id[0] == '\0') return 0;  /* nothing to publish */
 
 	const char *task_id = ctx->inflight_task_id;
 	uint64_t    tag     = ctx->inflight_delivery_tag;
@@ -831,28 +873,15 @@ static int try_reap_child(worker_ctx_t *ctx)
 		                                   "worker child exited without writing result\n");
 	}
 
-	/*
-	 * CRITICAL #6 (round 2): propagate publish failure into conn_dead so
-	 * the next tick reconnects instead of attempting a fresh basic_get on
-	 * a corrupted channel. We still clear child_pid (waitpid succeeded —
-	 * the OS-level child resource is reaped) so worker_idle returns true.
-	 *
-	 * /running marker is cleared even on publish failure: the result file
-	 * either lives in /results (publish_result_and_ack failure path) or
-	 * the /done marker has been written by publish_synth_failure. Either
-	 * way, redelivery is gated by I1 and we are not stuck in /running
-	 * "in-flight" state forever (CRITICAL #10 corner addressed in round 2).
-	 */
-	clear_running_marker(ctx, task_id);
-
-	ctx->child_pid               = 0;
-	ctx->inflight_delivery_tag   = 0;
-	ctx->inflight_task_id[0]     = '\0';
-
 	if (publish_rc != 0) {
-		ctx->conn_dead = 1;
+		/* Leave inflight_task_id intact so a later tick can retry. */
 		return -1;
 	}
+
+	/* Success: clear /running and inflight state. */
+	clear_running_marker(ctx, task_id);
+	ctx->inflight_delivery_tag   = 0;
+	ctx->inflight_task_id[0]     = '\0';
 	return 0;
 }
 
@@ -949,16 +978,23 @@ static int try_pick_new_task(worker_ctx_t *ctx)
 		return -1;
 	}
 	if (pid == 0) {
-		/* Child: close inherited AMQP fd is handled by us not touching
-		 * the connection. cJSON tree owned by child. */
-		publish_conn_t *inherited = ctx->conn;
-		ctx->conn = NULL;                       /* don't double-close on _exit */
-		(void)inherited;                        /* fd closes at _exit */
+		/*
+		 * Child: do not double-close the AMQP connection on _exit. The
+		 * actual fd closure happens via close_inherited_fds() at the top
+		 * of child_run_task (round 2 CRIT-E).
+		 */
+		ctx->conn = NULL;
 		child_run_task(ctx, task);
 		_exit(0);                               /* unreachable */
 	}
 
-	/* Parent: remember inflight. */
+	/*
+	 * Parent: also call setpgid(child_pid, child_pid) to close the race
+	 * where drain runs before the child's own setpgid takes effect (round 3
+	 * C-2). One of the two calls is redundant; either succeeding is enough.
+	 */
+	(void)setpgid(pid, pid);
+
 	ctx->child_pid             = pid;
 	ctx->inflight_delivery_tag = tag;
 	strncpy(ctx->inflight_task_id, task_id, sizeof ctx->inflight_task_id - 1);
@@ -989,10 +1025,13 @@ static int reconnect_if_dead(worker_ctx_t *ctx)
 {
 	if (!ctx->conn_dead && ctx->conn) return 0;
 
-	time_t now = time(NULL);
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
 	if (ctx->reconnect_backoff_sec > 0 &&
-	    (now - ctx->last_reconnect_attempt) < ctx->reconnect_backoff_sec) {
-		return -1;   /* still inside backoff window */
+	    ctx->last_reconnect_attempt.tv_sec != 0) {
+		long elapsed = (long)(now.tv_sec - ctx->last_reconnect_attempt.tv_sec);
+		if (elapsed < ctx->reconnect_backoff_sec)
+			return -1;   /* still inside backoff window */
 	}
 	ctx->last_reconnect_attempt = now;
 
@@ -1027,17 +1066,61 @@ void worker_keepalive(worker_ctx_t *ctx)
 		ctx->conn_dead = 1;
 }
 
+/*
+ * Round 3: split waitpid from publish so drain can reap even when the
+ * AMQP connection is dead and stuck in backoff. Without this, the OS
+ * child becomes a zombie and worker_idle never returns true → drain
+ * loop spins forever (or until systemd's TimeoutStopSec SIGKILLs us,
+ * losing the broker ack and the result publish).
+ */
+static int reap_child_only(worker_ctx_t *ctx)
+{
+	if (ctx->child_pid == 0) return 0;
+	int status = 0;
+	pid_t rc = waitpid(ctx->child_pid, &status, WNOHANG);
+	if (rc == 0) return 0;        /* still running */
+	if (rc < 0)  return -1;
+
+	/* Mark task as no longer in-flight on our side. The result file
+	 * (if any) stays in /results until publish succeeds — either later
+	 * this session (when conn comes back) or on next agent startup
+	 * via replay_pending_results. */
+	pid_t reaped = ctx->child_pid;
+	ctx->child_pid = 0;
+	(void)status;
+	(void)reaped;
+	return 1;                     /* reaped — caller decides whether to publish */
+}
+
 int worker_tick(worker_ctx_t *ctx)
 {
 	if (!ctx) return -1;
 
-	if (reconnect_if_dead(ctx) < 0) return -1;
+	/*
+	 * Reap first — independent of AMQP state. Lets drain progress even
+	 * when broker is unreachable.
+	 */
+	int reaped = reap_child_only(ctx);
+	if (reaped < 0) return -1;
+
+	if (reconnect_if_dead(ctx) < 0) {
+		/* Connection still down. If we just reaped, the result file
+		 * remains in /results for next-tick or next-startup replay. */
+		return -1;
+	}
 	if (publish_conn_pump(ctx->conn) < 0) {  /* CRITICAL #1: heartbeat keepalive */
 		ctx->conn_dead = 1;
 		return -1;
 	}
 
-	if (try_reap_child(ctx) < 0)    { ctx->conn_dead = 1; return -1; }
+	if (reaped == 1) {
+		/* Publish the just-reaped task's result. */
+		if (publish_reaped_result(ctx) < 0) {
+			ctx->conn_dead = 1;
+			return -1;
+		}
+	}
+
 	if (try_pick_new_task(ctx) < 0) { ctx->conn_dead = 1; return -1; }
 
 	return 0;

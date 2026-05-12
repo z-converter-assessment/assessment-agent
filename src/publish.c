@@ -34,7 +34,6 @@
 #include <string.h>
 #include <sys/time.h>
 #include <time.h>
-#include <unistd.h>
 
 static int check_rpc(amqp_rpc_reply_t r, const char *ctx)
 {

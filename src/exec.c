@@ -99,15 +99,25 @@ static void tail_finalize(tail_buf_t *t, char *out, size_t out_sz)
  * Child-side bootstrap
  * ============================================================ */
 
-static int set_rlimit(int resource, long mb_value)
+/*
+ * Round 3: parameter is overloaded by resource type:
+ *   RLIMIT_CPU      → seconds (raw value)
+ *   RLIMIT_NOFILE   → fd count (raw value)
+ *   RLIMIT_AS / RLIMIT_FSIZE → MB (multiplied to bytes)
+ *
+ * Previously RLIMIT_NOFILE was treated as MB and multiplied by 1024*1024,
+ * setting fd table to 1 GB entries — kernel clamps to a hard limit but
+ * the requested value was nonsense.
+ */
+static int set_rlimit(int resource, long value)
 {
-	if (mb_value <= 0) return 0;
+	if (value <= 0) return 0;
 	struct rlimit rl;
-	if (resource == RLIMIT_CPU) {
-		rl.rlim_cur = (rlim_t)mb_value;       /* mb_value reused as seconds */
-		rl.rlim_max = (rlim_t)mb_value;
+	if (resource == RLIMIT_CPU || resource == RLIMIT_NOFILE) {
+		rl.rlim_cur = (rlim_t)value;
+		rl.rlim_max = (rlim_t)value;
 	} else {
-		rl.rlim_cur = (rlim_t)mb_value * 1024ULL * 1024ULL;
+		rl.rlim_cur = (rlim_t)value * 1024ULL * 1024ULL;
 		rl.rlim_max = rl.rlim_cur;
 	}
 	return setrlimit(resource, &rl);
@@ -118,7 +128,14 @@ static int child_bootstrap(const char *extract_dir,
                            int stdin_fd, int stdout_fd, int stderr_fd,
                            int timeout_sec, int mem_mb, int fsize_mb)
 {
-	if (setsid() < 0)                       return -1;
+	/*
+	 * Round 3 C-1: do NOT call setsid() here. The grandchild must stay
+	 * in the worker child's process group so that the agent's drain
+	 * escalation `kill(-worker_child_pid, SIGTERM)` reaches install.sh.
+	 * Previously setsid() created a new session; -worker_child_pid then
+	 * targeted only the worker child, leaving install.sh as a long-running
+	 * orphan reparented to init.
+	 */
 	if (chdir(extract_dir) != 0)            return -1;
 
 	if (dup2(stdin_fd, STDIN_FILENO)   < 0) return -1;
@@ -135,10 +152,8 @@ static int child_bootstrap(const char *extract_dir,
 	if (clearenv() != 0) return -1;
 	setenv("PATH", "/usr/local/bin:/usr/bin:/bin", 1);
 	setenv("LANG", "C.UTF-8", 1);
-	const char *home = getenv("HOME");        /* always NULL after clearenv */
-	(void)home;
-	setenv("HOME", "/tmp", 1);                /* harmless default; replaced below if known */
-	setenv("USER", "agent",  1);
+	setenv("HOME", "/tmp", 1);
+	setenv("USER", "agent", 1);
 	if (task_id)    setenv("TASK_ID",    task_id, 1);
 	if (machine_id) setenv("MACHINE_ID", machine_id, 1);
 
@@ -309,11 +324,18 @@ exec_status_t exec_install_script(const char  *extract_dir,
 
 		long elapsed = elapsed_ms(t0);
 		if (term_at_ms >= 0 && !term_sent && elapsed >= term_at_ms) {
-			kill(-pid, SIGTERM);          /* process group */
+			/*
+			 * Round 3 C-1: grandchild no longer setsid()s, so it shares
+			 * our pgid. `kill(-pid)` would target a non-existent group.
+			 * Use single-process kill — install.sh's own forked helpers
+			 * (rare) inherit our group and will be cleaned up when the
+			 * agent's drain escalation targets the worker_child pgid.
+			 */
+			kill(pid, SIGTERM);
 			term_sent = 1;
 		}
 		if (term_sent && !kill_sent && elapsed >= term_at_ms + 5000L) {
-			kill(-pid, SIGKILL);
+			kill(pid, SIGKILL);
 			kill_sent = 1;
 		}
 
@@ -347,7 +369,7 @@ exec_status_t exec_install_script(const char  *extract_dir,
 	/* Unreachable in well-behaved cases — fall-through. */
 	if (out_pipe[0] >= 0) { close(out_pipe[0]); out_pipe[0] = -1; }
 	if (err_pipe[0] >= 0) { close(err_pipe[0]); err_pipe[0] = -1; }
-	kill(-pid, SIGKILL);
+	kill(pid, SIGKILL);
 	waitpid(pid, NULL, 0);
 	out->duration_ms = elapsed_ms(t0);
 	tail_finalize(&out_t, out->stdout_tail, sizeof out->stdout_tail);

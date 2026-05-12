@@ -35,7 +35,7 @@
  * Helpers — host parsing / whitelist
  * ============================================================ */
 
-void download_str_tolower(char *s)
+static void download_str_tolower(char *s)
 {
 	if (!s) return;
 	for (; *s; s++) *s = (char)tolower((unsigned char)*s);
@@ -127,12 +127,17 @@ static int has_enough_space(const char *tmp_dir,
 	if (disk_reserve_mb < 0)        disk_reserve_mb = 0;
 	if (disk_reserve_mb > 1024 * 1024) disk_reserve_mb = 1024 * 1024; /* 1 TB margin cap */
 
-	/* HIGH (round 2): guard avail multiplication against corrupt/exotic
-	 * f_bavail*f_frsize overflow. */
+	/*
+	 * HIGH (round 2/3): guard avail multiplication against corrupt/exotic
+	 * f_bavail*f_frsize overflow. Round 3: fail CLOSED on overflow — a
+	 * filesystem reporting nonsense block counts is not safe to trust
+	 * with a multi-gigabyte download. The other defensive branches in
+	 * this function fail closed; making this one fail open was inconsistent.
+	 */
 	uint64_t bavail = (uint64_t)st.f_bavail;
 	uint64_t frsize = (uint64_t)st.f_frsize;
 	if (frsize == 0) return 0;
-	if (bavail > UINT64_MAX / frsize) return 1;          /* astronomical free space — pass */
+	if (bavail > UINT64_MAX / frsize) return 0;          /* nonsense statvfs */
 	uint64_t avail = bavail * frsize;
 
 	uint64_t need_bytes = (uint64_t)expected_size_bytes;
@@ -258,9 +263,11 @@ download_status_t download_package(const char *url,
 	fclose(fp);
 
 	if (cc != CURLE_OK) {
-		if (s.overflow) rc = DOWNLOAD_ERR_DOWNLOAD_FAILED;     /* size cap exceeded */
-		else            rc = DOWNLOAD_ERR_DOWNLOAD_FAILED;
-		EVP_MD_CTX_free(md); unlink(out_path); return rc;
+		/* Both size-cap-exceeded (s.overflow) and network errors map to
+		 * the same outward failure_reason; retain s.overflow if a future
+		 * schema split is desired. */
+		EVP_MD_CTX_free(md); unlink(out_path);
+		return DOWNLOAD_ERR_DOWNLOAD_FAILED;
 	}
 	if (http_code >= 300) {                                    /* incl. 3xx redirects */
 		EVP_MD_CTX_free(md); unlink(out_path);

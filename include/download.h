@@ -63,13 +63,6 @@ download_status_t download_package(const char *url,
                                    const char *out_path);
 
 /**
- * @brief Convert @p s to lower case in place (ASCII).
- *
- * Exposed for the unit tests that exercise host matching directly.
- */
-void download_str_tolower(char *s);
-
-/**
  * @brief Return 1 if @p host is allowed by @p allowed_hosts_csv.
  *
  * Matching is case-insensitive ASCII exact compare against comma-separated

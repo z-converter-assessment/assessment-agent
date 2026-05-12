@@ -6,15 +6,19 @@
  *   - clearenv() then whitelist-rebuild (PATH, HOME, USER, LANG, TASK_ID,
  *     MACHINE_ID). Parent's RABBITMQ_* / .env contents are NEVER inherited.
  *   - chdir(extraction_dir) → install.sh's CWD is the unpacked package.
- *   - setsid() → child becomes its own process-group leader so wall-clock
- *     timeout / SIGTERM cleanup can be targeted via killpg().
+ *   - The grandchild (install.sh) inherits the worker child's process
+ *     group. The agent's drain escalation kills that group via
+ *     `kill(-worker_child_pid, SIG)`.
  *   - stdin redirected to /dev/null; stdout + stderr piped to ring buffers
  *     that retain only the **last** 4096 bytes each (the tails surfaced in
  *     task.result).
  *   - setrlimit(NOFILE/AS/FSIZE/CPU) caps. CPU cap mirrors the wall-clock
  *     timeout so a CPU-bound runaway is also bounded.
  *   - Wall-clock timeout enforced by parent via timed waitpid loop: at
- *     timeout_sec → SIGTERM(pgid), +5s → SIGKILL(pgid).
+ *     timeout_sec → SIGTERM(grandchild), +5s → SIGKILL(grandchild).
+ *     Single-process kill (not killpg) because grandchild is not a pgid
+ *     leader; install.sh's own forked helpers (rare) are cleaned up by
+ *     the agent's drain escalation against the worker_child pgid.
  */
 
 #ifndef ASSESSMENT_AGENT_EXEC_H
