@@ -61,6 +61,7 @@ struct worker_ctx_s {
 	publish_conn_t *conn;
 
 	int  drain;                    /* set by worker_begin_drain */
+	int  conn_dead;                /* CRITICAL #2: set on transport failure; reconnect on next tick */
 
 	/* IDLE when child_pid == 0, BUSY otherwise. */
 	pid_t    child_pid;
@@ -70,6 +71,7 @@ struct worker_ctx_s {
 	/* Cached dir paths so we don't re-derive on every tick. */
 	char results_dir[512];
 	char done_dir[512];
+	char running_dir[512];   /* CRITICAL #10: in-flight task markers */
 };
 
 /* ============================================================
@@ -101,6 +103,34 @@ static int file_exists(const char *path)
 	return stat(path, &st) == 0 && S_ISREG(st.st_mode);
 }
 
+/*
+ * Atomic write with full durability:
+ *   1. write tmp file, fsync the file fd
+ *   2. rename(tmp, path) — atomic on POSIX filesystems
+ *   3. fsync the parent directory so the rename is durable across power loss
+ *
+ * Without the dir fsync, a rename can be lost on crash even though the file
+ * data is durable. /done idempotency markers must survive crash so we don't
+ * silently double-execute redelivered tasks (CRITICAL #13).
+ */
+static int fsync_parent_dir(const char *path)
+{
+	char dir[1024];
+	size_t n = strnlen(path, sizeof dir);
+	if (n >= sizeof dir) return -1;
+	memcpy(dir, path, n + 1);
+	char *slash = strrchr(dir, '/');
+	if (!slash) { dir[0] = '.'; dir[1] = '\0'; }
+	else if (slash == dir) { dir[1] = '\0'; }    /* path is `/foo`, dir is `/` */
+	else *slash = '\0';
+
+	int dfd = open(dir, O_RDONLY | O_DIRECTORY);
+	if (dfd < 0) return -1;
+	int rc = fsync(dfd);
+	close(dfd);
+	return rc;
+}
+
 static int write_file_atomic(const char *path, const char *content)
 {
 	char tmp[1024];
@@ -111,9 +141,10 @@ static int write_file_atomic(const char *path, const char *content)
 	if (fwrite(content, 1, len, f) != len) { fclose(f); unlink(tmp); return -1; }
 	if (fflush(f) != 0)                    { fclose(f); unlink(tmp); return -1; }
 	int fd = fileno(f);
-	if (fd >= 0) (void)fsync(fd);
+	if (fd >= 0 && fsync(fd) != 0)         { fclose(f); unlink(tmp); return -1; }
 	if (fclose(f) != 0) { unlink(tmp); return -1; }
 	if (rename(tmp, path) != 0) { unlink(tmp); return -1; }
+	(void)fsync_parent_dir(path);
 	return 0;
 }
 
@@ -442,6 +473,20 @@ static int publish_synth_failure(worker_ctx_t *ctx,
 	char *body = build_result_json(ctx, task_id, "failure", reason,
 	                               0, 0, 0, "", err_tail ? err_tail : "");
 	if (!body) return -1;
+
+	/*
+	 * Order matters for crash safety (CRITICAL #13):
+	 *   1. write /done marker durably first so any redelivery is gated by I1
+	 *   2. publish to broker
+	 *   3. ack
+	 * If we crash between 1 and 2, the redelivered task hits /done and
+	 * publishes a synth-failure here again — duplicate but bounded. If we
+	 * crash before 1, broker simply redelivers and we re-do the work.
+	 */
+	char dst[1024];
+	if ((size_t)snprintf(dst, sizeof dst, "%s/%s.json", ctx->done_dir, task_id) < sizeof dst)
+		write_file_atomic(dst, body);
+
 	int rc = publish_conn_publish(ctx->conn,
 	                              ctx->cfg.amqp.exchange,
 	                              ctx->cfg.result_routing_key,
@@ -449,10 +494,6 @@ static int publish_synth_failure(worker_ctx_t *ctx,
 	free(body);
 	if (rc != 0) return -1;
 	publish_conn_ack(ctx->conn, delivery_tag);
-	/* Marker: write empty file to /done so redeliveries skip. */
-	char dst[1024];
-	snprintf(dst, sizeof dst, "%s/%s.json", ctx->done_dir, task_id);
-	FILE *f = fopen(dst, "wb"); if (f) fclose(f);
 	return 0;
 }
 
@@ -477,6 +518,26 @@ static void purge_expired_done(const worker_ctx_t *ctx)
 	closedir(d);
 }
 
+/*
+ * Filename must look like `<task_id>.json` where task_id passes the same
+ * validator used for incoming messages. Anything else (write_file_atomic
+ * leftovers like `*.tmp`, hand-dropped files, files with embedded
+ * separators) is left untouched.
+ */
+static int replay_filename_to_task_id(const char *fname, char *out, size_t out_sz)
+{
+	size_t n = strlen(fname);
+	const char *suffix = ".json";
+	size_t slen = strlen(suffix);
+	if (n <= slen) return 0;
+	if (strcmp(fname + n - slen, suffix) != 0) return 0;
+	size_t base = n - slen;
+	if (base >= out_sz) return 0;
+	memcpy(out, fname, base);
+	out[base] = '\0';
+	return task_id_valid(out);
+}
+
 static void replay_pending_results(worker_ctx_t *ctx)
 {
 	DIR *d = opendir(ctx->results_dir);
@@ -484,6 +545,13 @@ static void replay_pending_results(worker_ctx_t *ctx)
 	struct dirent *e;
 	while ((e = readdir(d)) != NULL) {
 		if (e->d_name[0] == '.') continue;
+
+		char task_id[64];
+		if (!replay_filename_to_task_id(e->d_name, task_id, sizeof task_id)) {
+			fprintf(stderr, "[worker] replay: skipping unrecognized file '%s'\n", e->d_name);
+			continue;
+		}
+
 		char path[1024];
 		if ((size_t)snprintf(path, sizeof path, "%s/%s", ctx->results_dir, e->d_name) >= sizeof path) continue;
 
@@ -502,7 +570,7 @@ static void replay_pending_results(worker_ctx_t *ctx)
 		 * long gone after our crash; the redelivered task (if any) hits
 		 * the /done marker and is acked + skipped in worker_tick. */
 		char done_path[1024];
-		snprintf(done_path, sizeof done_path, "%s/%s", ctx->done_dir, e->d_name);
+		snprintf(done_path, sizeof done_path, "%s/%s.json", ctx->done_dir, task_id);
 		rename(path, done_path);
 	}
 	closedir(d);
@@ -522,6 +590,86 @@ static void purge_stale_workspaces(const worker_ctx_t *ctx)
 	closedir(d);
 }
 
+/*
+ * CRITICAL #10: any /running/<task_id> marker present at startup means a
+ * previous agent instance died mid-install. We can't know whether the
+ * child finished or not; treat as crashed-during-install. Publish a synth
+ * failure (best-effort — connection may not be up yet on first init), and
+ * move marker to /done so future redeliveries are gated by I1.
+ */
+static void recover_stale_running(worker_ctx_t *ctx)
+{
+	DIR *d = opendir(ctx->running_dir);
+	if (!d) return;
+	struct dirent *e;
+	while ((e = readdir(d)) != NULL) {
+		if (e->d_name[0] == '.') continue;
+		char task_id[64];
+		if (!replay_filename_to_task_id(e->d_name, task_id, sizeof task_id)) continue;
+
+		char *body = build_result_json(ctx, task_id, "failure", "internal_error",
+		                               0, 0, 0, "",
+		                               "agent terminated mid-install; recovered on restart\n");
+		if (!body) continue;
+
+		/* Best-effort publish; don't ack (no live delivery_tag here). */
+		(void)publish_conn_publish(ctx->conn,
+		                           ctx->cfg.amqp.exchange,
+		                           ctx->cfg.result_routing_key,
+		                           body, strlen(body));
+
+		/* Always promote /running -> /done so future redeliveries are gated. */
+		char done_path[1024];
+		if ((size_t)snprintf(done_path, sizeof done_path, "%s/%s.json", ctx->done_dir, task_id) < sizeof done_path)
+			write_file_atomic(done_path, body);
+
+		char src_path[1024];
+		if ((size_t)snprintf(src_path, sizeof src_path, "%s/%s", ctx->running_dir, e->d_name) < sizeof src_path)
+			unlink(src_path);
+
+		free(body);
+	}
+	closedir(d);
+}
+
+/*
+ * Returns 1 if a /running/<task_id> marker currently exists. Used by
+ * try_pick_new_task to detect mid-install redeliveries (broker
+ * consumer_timeout fired while child was still running). The current
+ * parent will publish the result when the child reaps, so the redelivery
+ * just acks and drops with no extra publish.
+ */
+static int running_marker_present(const worker_ctx_t *ctx, const char *task_id)
+{
+	char path[1024];
+	if ((size_t)snprintf(path, sizeof path, "%s/%s.json", ctx->running_dir, task_id) >= sizeof path)
+		return 0;
+	return file_exists(path);
+}
+
+static void write_running_marker(const worker_ctx_t *ctx, const char *task_id)
+{
+	char path[1024];
+	if ((size_t)snprintf(path, sizeof path, "%s/%s.json", ctx->running_dir, task_id) >= sizeof path) return;
+
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	char now_buf[32];
+	iso8601_utc(ts.tv_sec, now_buf, sizeof now_buf);
+
+	char body[256];
+	snprintf(body, sizeof body,
+	         "{\"task_id\":\"%s\",\"started_at\":\"%s\"}\n", task_id, now_buf);
+	write_file_atomic(path, body);
+}
+
+static void clear_running_marker(const worker_ctx_t *ctx, const char *task_id)
+{
+	char path[1024];
+	if ((size_t)snprintf(path, sizeof path, "%s/%s.json", ctx->running_dir, task_id) >= sizeof path) return;
+	(void)unlink(path);
+}
+
 /* ============================================================
  * Public API
  * ============================================================ */
@@ -535,9 +683,11 @@ worker_ctx_t *worker_init(const worker_config_t *cfg)
 
 	snprintf(ctx->results_dir, sizeof ctx->results_dir, "%s/results", ctx->cfg.state_dir);
 	snprintf(ctx->done_dir,    sizeof ctx->done_dir,    "%s/done",    ctx->cfg.state_dir);
+	snprintf(ctx->running_dir, sizeof ctx->running_dir, "%s/running", ctx->cfg.state_dir);
 
 	if (mkdir_p(ctx->results_dir, 0700) != 0 ||
-	    mkdir_p(ctx->done_dir,    0700) != 0) {
+	    mkdir_p(ctx->done_dir,    0700) != 0 ||
+	    mkdir_p(ctx->running_dir, 0700) != 0) {
 		fprintf(stderr, "[worker] state directory init failed: %s\n", strerror(errno));
 		free(ctx);
 		return NULL;
@@ -552,6 +702,7 @@ worker_ctx_t *worker_init(const worker_config_t *cfg)
 
 	purge_stale_workspaces(ctx);
 	replay_pending_results(ctx);
+	recover_stale_running(ctx);
 	purge_expired_done(ctx);
 
 	fprintf(stderr, "[worker] initialized — queue=%s exchange=%s\n",
@@ -562,6 +713,17 @@ worker_ctx_t *worker_init(const worker_config_t *cfg)
 void worker_begin_drain(worker_ctx_t *ctx)
 {
 	if (ctx) ctx->drain = 1;
+}
+
+void worker_force_child_term(worker_ctx_t *ctx, int hard)
+{
+	if (!ctx || ctx->child_pid == 0) return;
+	int sig = hard ? SIGKILL : SIGTERM;
+	if (kill(-ctx->child_pid, sig) != 0 && errno == ESRCH) {
+		/* process group already gone; treat as success */
+	}
+	fprintf(stderr, "[worker] forced %s to child pgid=%d\n",
+	        hard ? "SIGKILL" : "SIGTERM", (int)ctx->child_pid);
 }
 
 int worker_idle(const worker_ctx_t *ctx)
@@ -609,6 +771,9 @@ static int try_reap_child(worker_ctx_t *ctx)
 		publish_synth_failure(ctx, task_id, tag, "internal_error",
 		                      "worker child exited without writing result\n");
 	}
+
+	/* Reaped — clear the in-flight running marker (CRITICAL #10). */
+	clear_running_marker(ctx, task_id);
 
 	ctx->child_pid               = 0;
 	ctx->inflight_delivery_tag   = 0;
@@ -666,6 +831,28 @@ static int try_pick_new_task(worker_ctx_t *ctx)
 		return 0;
 	}
 
+	/*
+	 * CRITICAL #10: redelivery while a previous attempt is still running.
+	 * The /running marker says some agent (this one or a previous instance
+	 * before crash) is mid-install. The original parent will publish the
+	 * result; this redelivery should just be acked and dropped without
+	 * publishing anything to avoid double results. If the original parent
+	 * is dead, recover_stale_running on next startup will publish the synth
+	 * failure for that abandoned task.
+	 */
+	if (running_marker_present(ctx, task_id)) {
+		fprintf(stderr, "[worker] task %s already in-flight — redelivery dropped\n", task_id);
+		publish_conn_ack(ctx->conn, tag);
+		cJSON_Delete(task);
+		free(body);
+		return 0;
+	}
+
+	/* Write /running marker BEFORE fork so a redelivery during this run
+	 * (broker consumer_timeout, agent restart) can detect the in-flight
+	 * state and not double-execute. */
+	write_running_marker(ctx, task_id);
+
 	/* Fork. */
 	pid_t pid = fork();
 	if (pid < 0) {
@@ -699,14 +886,53 @@ static int try_pick_new_task(worker_ctx_t *ctx)
 	return 0;
 }
 
+/*
+ * CRITICAL #2 + #3: reconnect after transport / channel failures.
+ * Closing and re-opening the connection is the simplest way to recover
+ * from any of: heartbeat-driven socket close, broker-side channel
+ * exception (e.g. NOT_FOUND from basic_get on a queue the portal hasn't
+ * declared yet), or TLS-level read/write errors. Outstanding delivery
+ * tags are dropped — this is fine because we have not yet acked them and
+ * the broker will redeliver after timeout / requeue.
+ */
+static int reconnect_if_dead(worker_ctx_t *ctx)
+{
+	if (!ctx->conn_dead && ctx->conn) return 0;
+
+	if (ctx->conn) { publish_conn_close(ctx->conn); ctx->conn = NULL; }
+	ctx->conn = publish_conn_open(&ctx->cfg.amqp);
+	if (!ctx->conn) {
+		fprintf(stderr, "[worker] reconnect failed — will retry next tick\n");
+		return -1;
+	}
+	ctx->conn_dead = 0;
+	fprintf(stderr, "[worker] AMQP connection re-established\n");
+
+	/*
+	 * After a reconnect the in-flight delivery_tag is stale — that channel
+	 * is gone. The broker still has the message unacked from the old
+	 * channel and will redeliver after timeout. /running marker keeps I1
+	 * gating intact for the redelivery.
+	 */
+	ctx->inflight_delivery_tag = 0;
+	return 0;
+}
+
+void worker_keepalive(worker_ctx_t *ctx)
+{
+	if (ctx && ctx->conn && !ctx->conn_dead)
+		publish_conn_pump(ctx->conn);
+}
+
 int worker_tick(worker_ctx_t *ctx)
 {
-	if (!ctx || !ctx->conn) return -1;
+	if (!ctx) return -1;
 
-	publish_conn_pump(ctx->conn);   /* keep heartbeat alive */
+	if (reconnect_if_dead(ctx) < 0) return -1;
+	publish_conn_pump(ctx->conn);   /* CRITICAL #1: heartbeat keepalive */
 
-	if (try_reap_child(ctx) < 0) return -1;
-	if (try_pick_new_task(ctx) < 0) return -1;
+	if (try_reap_child(ctx) < 0)    { ctx->conn_dead = 1; return -1; }
+	if (try_pick_new_task(ctx) < 0) { ctx->conn_dead = 1; return -1; }
 
 	return 0;
 }

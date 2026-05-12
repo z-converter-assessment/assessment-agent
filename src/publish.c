@@ -28,6 +28,7 @@
 #include <amqp_tcp_socket.h>
 #include <amqp_ssl_socket.h>
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -259,6 +260,18 @@ static int open_amqp_connection(const publish_config_t *cfg,
 
 	if (amqp_socket_open(socket, cfg->host, cfg->port) != AMQP_STATUS_OK) {
 		amqp_destroy_connection(conn); return -1;
+	}
+
+	/*
+	 * CRITICAL #4: keep this socket out of forked children (install.sh).
+	 * Without FD_CLOEXEC the worker fork inherits a duplicate of the broker
+	 * TLS socket; install.sh could read/write broker frames. Set CLOEXEC
+	 * immediately after the socket is connected so the next fork+exec drops it.
+	 */
+	int sockfd = amqp_get_sockfd(conn);
+	if (sockfd >= 0) {
+		int fl = fcntl(sockfd, F_GETFD, 0);
+		if (fl >= 0) (void)fcntl(sockfd, F_SETFD, fl | FD_CLOEXEC);
 	}
 
 	const char *vhost = (cfg->vhost && *cfg->vhost) ? cfg->vhost : "/";

@@ -20,6 +20,7 @@
 
 #include "exec.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -29,6 +30,7 @@
 #include <sys/resource.h>
 #include <sys/select.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -37,7 +39,16 @@
 
 extern char **environ;
 
-#define EXEC_CHILD_BOOTSTRAP_FAIL 127
+/*
+ * Distinguishable from POSIX shell conventions:
+ *   126 = "command found but not executable"
+ *   127 = "command not found"
+ *   128+N = "killed by signal N"
+ * Picking 124 leaves all of those alone so a parent waitpid can tell
+ * "child failed to set up its environment" from "the install script
+ * itself died with a similar status".
+ */
+#define EXEC_CHILD_BOOTSTRAP_FAIL 124
 
 /* ============================================================
  * Tail-buffer helpers — keep only the last N bytes
@@ -103,6 +114,40 @@ static int set_rlimit(int resource, long mb_value)
 	return setrlimit(resource, &rl);
 }
 
+/*
+ * Close every inherited fd > 2 (CRITICAL #5). Without this, install.sh
+ * inherits everything the agent had open: AMQP TLS sockets, .env file
+ * handles, log fds. We've also set FD_CLOEXEC on the AMQP socket as a
+ * belt; this is the suspenders. Linux 5.9+ has close_range; for older
+ * kernels we walk /proc/self/fd, falling back to a tight numeric sweep
+ * on the rlimit ceiling.
+ */
+static void close_all_fds_above_stderr(void)
+{
+#if defined(__linux__) && defined(SYS_close_range)
+	if (syscall(SYS_close_range, (unsigned int)3, ~0u, 0u) == 0) return;
+#endif
+	DIR *d = opendir("/proc/self/fd");
+	if (d) {
+		int dirfd_to_skip = dirfd(d);
+		struct dirent *e;
+		while ((e = readdir(d)) != NULL) {
+			if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+			int fd = atoi(e->d_name);
+			if (fd <= STDERR_FILENO || fd == dirfd_to_skip) continue;
+			(void)close(fd);
+		}
+		closedir(d);
+		return;
+	}
+	/* Last-resort fallback: walk up to the soft fd rlimit. */
+	struct rlimit rl;
+	long max_fd = 1024;
+	if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY)
+		max_fd = (long)rl.rlim_cur;
+	for (long fd = STDERR_FILENO + 1; fd < max_fd; fd++) (void)close((int)fd);
+}
+
 static int child_bootstrap(const char *extract_dir,
                            const char *task_id, const char *machine_id,
                            int stdin_fd, int stdout_fd, int stderr_fd,
@@ -115,6 +160,8 @@ static int child_bootstrap(const char *extract_dir,
 	if (dup2(stdout_fd, STDOUT_FILENO) < 0) return -1;
 	if (dup2(stderr_fd, STDERR_FILENO) < 0) return -1;
 	close(stdin_fd); close(stdout_fd); close(stderr_fd);
+
+	close_all_fds_above_stderr();
 
 	umask(022);
 
@@ -157,13 +204,22 @@ static int set_nonblocking(int fd)
 	return fcntl(fd, F_SETFL, fl | O_NONBLOCK);
 }
 
-static void drain_once(int fd, tail_buf_t *t)
+/*
+ * Returns 1 if peer closed the pipe (EOF), 0 if more data may arrive,
+ * -1 on a real read error. Distinguishing EOF from EAGAIN lets the caller
+ * retire the fd from the select set instead of spinning at 200ms ticks
+ * on an already-closed pipe (CRITICAL #12).
+ */
+static int drain_once(int fd, tail_buf_t *t)
 {
 	char buf[4096];
 	for (;;) {
 		ssize_t n = read(fd, buf, sizeof buf);
-		if (n > 0) { tail_append(t, buf, (size_t)n); continue; }
-		break;
+		if (n > 0)            { tail_append(t, buf, (size_t)n); continue; }
+		if (n == 0)           return 1;             /* EOF */
+		if (errno == EINTR)   continue;
+		if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+		return -1;
 	}
 }
 
@@ -270,8 +326,19 @@ exec_status_t exec_install_script(const char  *extract_dir,
 		int sr = (maxfd >= 0) ? select(maxfd + 1, &rfds, NULL, NULL, &tv) : 0;
 		if (sr < 0 && errno != EINTR) break;
 
-		if (out_pipe[0] >= 0 && (sr <= 0 || FD_ISSET(out_pipe[0], &rfds))) drain_once(out_pipe[0], &out_t);
-		if (err_pipe[0] >= 0 && (sr <= 0 || FD_ISSET(err_pipe[0], &rfds))) drain_once(err_pipe[0], &err_t);
+		/*
+		 * After EOF, retire the fd from the select set (CRITICAL #12) by
+		 * closing it and setting it to -1 — otherwise select() would
+		 * report it ready every iteration and we'd burn CPU at 5Hz.
+		 */
+		if (out_pipe[0] >= 0 && (sr < 0 || FD_ISSET(out_pipe[0], &rfds))) {
+			int r = drain_once(out_pipe[0], &out_t);
+			if (r != 0) { close(out_pipe[0]); out_pipe[0] = -1; }
+		}
+		if (err_pipe[0] >= 0 && (sr < 0 || FD_ISSET(err_pipe[0], &rfds))) {
+			int r = drain_once(err_pipe[0], &err_t);
+			if (r != 0) { close(err_pipe[0]); err_pipe[0] = -1; }
+		}
 
 		long elapsed = elapsed_ms(t0);
 		if (term_at_ms >= 0 && !term_sent && elapsed >= term_at_ms) {
@@ -286,10 +353,9 @@ exec_status_t exec_install_script(const char  *extract_dir,
 		int status = 0;
 		pid_t rc = waitpid(pid, &status, WNOHANG);
 		if (rc == pid) {
-			/* final drain */
-			drain_once(out_pipe[0], &out_t);
-			drain_once(err_pipe[0], &err_t);
-			close(out_pipe[0]); close(err_pipe[0]);
+			/* final drain — pipes may still hold buffered output. */
+			if (out_pipe[0] >= 0) { drain_once(out_pipe[0], &out_t); close(out_pipe[0]); out_pipe[0] = -1; }
+			if (err_pipe[0] >= 0) { drain_once(err_pipe[0], &err_t); close(err_pipe[0]); err_pipe[0] = -1; }
 
 			out->duration_ms = elapsed_ms(t0);
 			tail_finalize(&out_t, out->stdout_tail, sizeof out->stdout_tail);
@@ -312,8 +378,8 @@ exec_status_t exec_install_script(const char  *extract_dir,
 	}
 
 	/* Unreachable in well-behaved cases — fall-through. */
-	if (out_pipe[0] >= 0) close(out_pipe[0]);
-	if (err_pipe[0] >= 0) close(err_pipe[0]);
+	if (out_pipe[0] >= 0) { close(out_pipe[0]); out_pipe[0] = -1; }
+	if (err_pipe[0] >= 0) { close(err_pipe[0]); err_pipe[0] = -1; }
 	kill(-pid, SIGKILL);
 	waitpid(pid, NULL, 0);
 	out->duration_ms = elapsed_ms(t0);

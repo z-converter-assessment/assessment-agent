@@ -64,9 +64,27 @@ worker_ctx_t *worker_init(const worker_config_t *cfg);
 int worker_tick(worker_ctx_t *ctx);
 
 /**
+ * @brief Keep the worker AMQP connection alive while the main loop sleeps.
+ *
+ * librabbitmq sends heartbeats from inside `amqp_simple_wait_frame_noblock`,
+ * so the connection dies if we sleep longer than the negotiated heartbeat
+ * interval without calling into the library (CRITICAL #1). Call this
+ * helper from short sleep intervals to keep heartbeats flowing.
+ */
+void worker_keepalive(worker_ctx_t *ctx);
+
+/**
  * @brief Signal that SIGTERM was received — stop accepting new tasks.
  */
 void worker_begin_drain(worker_ctx_t *ctx);
+
+/**
+ * @brief Send SIGTERM (or SIGKILL on @p hard) to the in-flight child's
+ *        process group. No-op if no child is in-flight. Used by the main
+ *        loop to bound drain time when the install script ignores normal
+ *        shutdown (CRITICAL #9).
+ */
+void worker_force_child_term(worker_ctx_t *ctx, int hard);
 
 /**
  * @brief Return 1 when no child is in-flight.

@@ -11,6 +11,7 @@
  */
 
 #define _POSIX_C_SOURCE 200809L
+#define _DARWIN_C_SOURCE                /* O_NOFOLLOW on macOS test builds */
 
 #include "download.h"
 #include "util.h"
@@ -20,11 +21,13 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
 
@@ -100,15 +103,35 @@ int download_host_allowed(const char *host, const char *allowed_hosts_csv)
  * Disk space pre-flight
  * ============================================================ */
 
+/*
+ * Sanity ceiling on a single download. 16 GB picked as 'definitely larger
+ * than any legitimate user-level package install bundle, well below any
+ * 64-bit overflow boundary'. Guards against portal-side typos / hostile
+ * INT64_MAX values (CRITICAL #7) that would otherwise wrap the additions
+ * in has_enough_space and disable both pre-flight + streaming caps.
+ */
+#define DOWNLOAD_MAX_SIZE_BYTES ((int64_t)16 * 1024 * 1024 * 1024)
+
+static int size_bytes_in_range(int64_t expected_size_bytes)
+{
+	return expected_size_bytes > 0 &&
+	       expected_size_bytes <= DOWNLOAD_MAX_SIZE_BYTES;
+}
+
 static int has_enough_space(const char *tmp_dir,
                             int64_t expected_size_bytes,
                             int disk_reserve_mb)
 {
 	struct statvfs st;
 	if (statvfs(tmp_dir, &st) != 0) return 0;
+	if (disk_reserve_mb < 0)        disk_reserve_mb = 0;
+	if (disk_reserve_mb > 1024 * 1024) disk_reserve_mb = 1024 * 1024; /* 1 TB margin cap */
+
 	uint64_t avail = (uint64_t)st.f_bavail * (uint64_t)st.f_frsize;
-	uint64_t need  = (uint64_t)expected_size_bytes +
-	                 (uint64_t)disk_reserve_mb * 1024ULL * 1024ULL;
+	uint64_t need_bytes = (uint64_t)expected_size_bytes;
+	uint64_t reserve   = (uint64_t)disk_reserve_mb * 1024ULL * 1024ULL;
+	if (need_bytes > UINT64_MAX - reserve) return 0;     /* would wrap */
+	uint64_t need = need_bytes + reserve;
 	return avail >= need;
 }
 
@@ -162,7 +185,7 @@ download_status_t download_package(const char *url,
                                    const char *out_path)
 {
 	if (!url || !expected_sha256_hex || !out_path) return DOWNLOAD_ERR_INTERNAL;
-	if (expected_size_bytes <= 0)                  return DOWNLOAD_ERR_DOWNLOAD_FAILED;
+	if (!size_bytes_in_range(expected_size_bytes)) return DOWNLOAD_ERR_DOWNLOAD_FAILED;
 
 	/* 1. HTTPS scheme + host whitelist (the only gate before opening files). */
 	char host[256];
@@ -174,9 +197,23 @@ download_status_t download_package(const char *url,
 	                      expected_size_bytes, disk_reserve_mb))
 		return DOWNLOAD_ERR_INSUFFICIENT_DISK;
 
-	/* 3. Open destination + sha256 context. */
-	FILE *fp = fopen(out_path, "wb");
-	if (!fp) return DOWNLOAD_ERR_INTERNAL;
+	/*
+	 * 3. Open destination + sha256 context.
+	 *
+	 * Race-safe open (CRITICAL #8):
+	 *   - unlink any pre-existing file (don't follow into a symlink target)
+	 *   - O_CREAT | O_EXCL → fail if a concurrent process re-created it
+	 *   - O_NOFOLLOW       → never traverse a symlink at out_path itself
+	 *   - 0600             → owner-only, no world-readable downloaded payload
+	 */
+	if (unlink(out_path) != 0 && errno != ENOENT)
+		return DOWNLOAD_ERR_INTERNAL;
+	int out_fd = open(out_path,
+	                  O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+	                  0600);
+	if (out_fd < 0) return DOWNLOAD_ERR_INTERNAL;
+	FILE *fp = fdopen(out_fd, "wb");
+	if (!fp) { close(out_fd); unlink(out_path); return DOWNLOAD_ERR_INTERNAL; }
 
 	EVP_MD_CTX *md = EVP_MD_CTX_new();
 	if (!md) { fclose(fp); unlink(out_path); return DOWNLOAD_ERR_INTERNAL; }

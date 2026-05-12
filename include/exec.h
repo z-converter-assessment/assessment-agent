@@ -28,7 +28,7 @@ typedef enum {
 	EXEC_ERR_SCRIPT_FAILED,      /* install.sh exit_code != 0 */
 	EXEC_ERR_SCRIPT_TIMEOUT,     /* wall-clock timeout — killed */
 	EXEC_ERR_SCRIPT_NOT_FOUND,   /* extract_dir/script does not exist or not regular */
-	EXEC_ERR_INTERNAL,           /* fork / pipe / setrlimit failure */
+	EXEC_ERR_INTERNAL,           /* fork / pipe / setrlimit failure (incl. child bootstrap exit 124) */
 } exec_status_t;
 
 /**

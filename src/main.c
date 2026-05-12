@@ -366,15 +366,58 @@ int main(void)
 		}
 
 		if (g_stop) break;
-		sleep((unsigned int)interval);
+
+		/*
+		 * CRITICAL #1: chunked sleep keeps the worker AMQP connection
+		 * alive. librabbitmq sends heartbeats inside `wait_frame_noblock`,
+		 * which we trigger via `worker_keepalive`. With heartbeat=60s,
+		 * sleeping in 25s chunks lands well inside the broker's
+		 * 2× heartbeat tolerance window.
+		 */
+		int remaining = interval;
+		const int chunk = 25;
+		while (remaining > 0 && !g_stop) {
+			int s = remaining > chunk ? chunk : remaining;
+			sleep((unsigned int)s);
+			remaining -= s;
+			if (worker) worker_keepalive(worker);
+		}
 	}
 
-	/* --- Drain pattern (S2) — finish any in-flight install before exit --- */
+	/*
+	 * --- Drain pattern (S2) with bounded escalation (CRITICAL #9) ---
+	 *
+	 * Phase 1 (grace): wait up to AGENT_DRAIN_GRACE_SEC for the in-flight
+	 *                  install to finish on its own.
+	 * Phase 2 (term):  send SIGTERM to the child's process group; wait
+	 *                  AGENT_DRAIN_TERM_SEC for clean shutdown.
+	 * Phase 3 (kill):  send SIGKILL.
+	 *
+	 * systemd's TimeoutStopSec is the hard outer bound; this internal
+	 * escalation guarantees we don't spin forever even if the script
+	 * ignores SIGTERM, leaving an orphan child that systemd then SIGKILLs
+	 * — losing both the result and the broker ack.
+	 */
 	if (worker) {
 		worker_begin_drain(worker);
-		fprintf(stderr, "[agent] SIGTERM received — draining worker\n");
+		int grace_sec = atoi(getenv_default("AGENT_DRAIN_GRACE_SEC", "600"));
+		int term_sec  = atoi(getenv_default("AGENT_DRAIN_TERM_SEC",  "30"));
+		fprintf(stderr, "[agent] draining worker (grace=%ds, term=%ds, then SIGKILL)\n",
+		        grace_sec, term_sec);
+
+		time_t t0 = time(NULL);
+		int term_sent = 0;
+		int kill_sent = 0;
 		while (!worker_idle(worker)) {
-			worker_tick(worker);          /* will reap when child finishes */
+			worker_tick(worker);          /* may reap; ignore errors */
+			long elapsed = (long)(time(NULL) - t0);
+			if (!term_sent && elapsed >= grace_sec) {
+				worker_force_child_term(worker, 0);
+				term_sent = 1;
+			} else if (term_sent && !kill_sent && elapsed >= grace_sec + term_sec) {
+				worker_force_child_term(worker, 1);
+				kill_sent = 1;
+			}
 			sleep(1);
 		}
 		worker_shutdown(worker);
