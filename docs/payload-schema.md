@@ -465,8 +465,8 @@ agent가 task 처리 종료 시점에 발행 (성공·실패 무관 — K3). por
   "collected_at":     "2026-04-23T15:08:34Z",
   "hostname":         "web-server-01",
   "message_id":       "550e8400-e29b-41d4-a716-446655440011",
-  "boot_time":        "2026-04-20T09:12:33Z",
-  "agent_started_at": "2026-04-23T14:29:55Z",
+  "boot_time":        null,
+  "agent_started_at": null,
 
   "task_id":        "550e8400-e29b-41d4-a716-446655440010",
   "status":         "success",
@@ -489,8 +489,8 @@ agent가 task 처리 종료 시점에 발행 (성공·실패 무관 — K3). por
   "collected_at":     "2026-04-23T15:01:12Z",
   "hostname":         "web-server-01",
   "message_id":       "550e8400-e29b-41d4-a716-446655440012",
-  "boot_time":        "2026-04-20T09:12:33Z",
-  "agent_started_at": "2026-04-23T14:29:55Z",
+  "boot_time":        null,
+  "agent_started_at": null,
 
   "task_id":        "550e8400-e29b-41d4-a716-446655440010",
   "status":         "failure",

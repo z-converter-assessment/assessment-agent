@@ -409,7 +409,12 @@ int main(void)
 		worker_begin_drain(worker);
 		int grace_sec   = atoi(getenv_default("AGENT_DRAIN_GRACE_SEC",   "600"));
 		int term_sec    = atoi(getenv_default("AGENT_DRAIN_TERM_SEC",    "30"));
-		int publish_sec = atoi(getenv_default("AGENT_DRAIN_PUBLISH_SEC", "120"));
+		/*
+		 * Round 6: default publish-stuck deadline must comfortably exceed
+		 * WORKER_RECONNECT_BACKOFF_MAX (60s) so at least 2-3 reconnect
+		 * attempts can fire during drain. 180s gives ~3 reconnect windows.
+		 */
+		int publish_sec = atoi(getenv_default("AGENT_DRAIN_PUBLISH_SEC", "180"));
 		fprintf(stderr, "[agent] draining worker (grace=%ds, term=%ds, publish-stuck=%ds)\n",
 		        grace_sec, term_sec, publish_sec);
 

@@ -262,7 +262,7 @@ Local dev uses plain AMQP and the default vhost. Production must not.
 | `AGENT_EXTERNAL_IP` | — | skip IMDS lookup if set |
 | `AGENT_DRAIN_GRACE_SEC` | `600` | on SIGTERM, max seconds to wait for in-flight install to finish before sending SIGTERM to it |
 | `AGENT_DRAIN_TERM_SEC` | `30` | additional seconds after SIGTERM before SIGKILL |
-| `AGENT_DRAIN_PUBLISH_SEC` | `120` | after install completes, max seconds to wait for result publish before giving up (file replays on next startup) |
+| `AGENT_DRAIN_PUBLISH_SEC` | `180` | after install completes, max seconds to wait for result publish before giving up (file replays on next startup). Should exceed `WORKER_RECONNECT_BACKOFF_MAX`(60) × ~3 to allow several reconnect attempts |
 | `WORKER_INSTALL_NOFILE` | `4096` | `RLIMIT_NOFILE` (raw fd count) for install.sh. `<= 0` substitutes 4096 |
 | `WORKER_DOWNLOAD_ALLOWED_HOSTS` | — | comma-separated hostname whitelist for `task.install` downloads. Case-insensitive exact match (no wildcards). Empty/unset = **all hosts blocked** = worker effectively disabled |
 | `WORKER_STATE_DIR` | `/var/lib/agent-worker` | base directory for `/results` (pending publish), `/done` (idempotency markers, 7-day retention) |
@@ -386,8 +386,8 @@ The worker consumes `task.install` messages from a per-machine queue, executes a
 | 6 | TLS (AMQPS / mTLS) / vhost / agent-publisher credentials env | ✅ Done |
 | 7 | Library vendoring (rabbitmq-c, cJSON) — `make USE_VENDORED=1` static build | ✅ Done |
 | 8 | Inventory periodic refresh + boot_time/agent_started_at in common metadata | ✅ Done (v3.1) |
-| 9 | Worker (task.install) — fork-based consumer, libcurl/libarchive, idempotency, CM2 dual-connection | In progress |
-| 10 | Deployment artifacts (systemd unit with worker drain TimeoutStopSec) | In progress |
+| 9 | Worker (task.install) — fork-based consumer, libcurl/libarchive, CM2 dual-connection, idempotency, drain escalation | ✅ Done (v3.2) |
+| 10 | Deployment artifacts (systemd unit + .env template with worker drain TimeoutStopSec) | ✅ Done |
 
 ---
 

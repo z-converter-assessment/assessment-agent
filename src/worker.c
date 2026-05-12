@@ -487,9 +487,18 @@ static int publish_result_and_ack(worker_ctx_t *ctx,
 		        task_id);
 		return -1;
 	}
-	if (move_to_done(ctx, task_id) != 0)
-		fprintf(stderr, "[worker] move to /done failed for %s: %s\n",
+	/*
+	 * Round 6 M5: rename(/results→/done) failure means /done won't exist.
+	 * If we ack now, broker drops the message and any future redelivery
+	 * (e.g. broker recovers, queue redeclares) re-executes the install.
+	 * Don't ack — let broker hold the unacked tag; replay_pending_results
+	 * on next startup will move /results→/done correctly.
+	 */
+	if (move_to_done(ctx, task_id) != 0) {
+		fprintf(stderr, "[worker] move to /done failed for %s: %s — leaving unacked\n",
 		        task_id, strerror(errno));
+		return -1;
+	}
 
 	/*
 	 * Round 5 H1: ack failure is a transport problem, NOT a task problem.
@@ -527,13 +536,23 @@ static int publish_synth_failure(worker_ctx_t *ctx,
 	 *   1. write /done marker durably first so any redelivery is gated by I1
 	 *   2. publish to broker
 	 *   3. ack
-	 * If we crash between 1 and 2, the redelivered task hits /done and
-	 * publishes a synth-failure here again — duplicate but bounded. If we
-	 * crash before 1, broker simply redelivers and we re-do the work.
+	 *
+	 * Round 6 M5: /done write failure (ENOSPC, EROFS, perms) MUST abort
+	 * the publish. Otherwise broker is acked but no /done marker exists,
+	 * and a future redelivery would re-execute the task — the very
+	 * idempotency hole this ordering exists to close.
 	 */
 	char dst[1024];
-	if ((size_t)snprintf(dst, sizeof dst, "%s/%s.json", ctx->done_dir, task_id) < sizeof dst)
-		write_file_atomic(dst, body);
+	if ((size_t)snprintf(dst, sizeof dst, "%s/%s.json", ctx->done_dir, task_id) >= sizeof dst) {
+		free(body);
+		return -1;
+	}
+	if (write_file_atomic(dst, body) != 0) {
+		fprintf(stderr, "[worker] /done write failed for %s — aborting synth (broker will redeliver)\n",
+		        task_id);
+		free(body);
+		return -1;
+	}
 
 	int rc = publish_conn_publish(ctx->conn,
 	                              ctx->cfg.amqp.exchange,
@@ -823,11 +842,10 @@ void worker_force_child_term(worker_ctx_t *ctx, int hard)
 {
 	if (!ctx || ctx->child_pid == 0) return;
 	int sig = hard ? SIGKILL : SIGTERM;
-	if (kill(-ctx->child_pid, sig) != 0 && errno == ESRCH) {
-		/* process group already gone; treat as success */
-	}
+	pid_t pgid = ctx->child_pid;
+	(void)kill(-pgid, sig);    /* ESRCH = pgid already gone — fine. */
 	fprintf(stderr, "[worker] forced %s to child pgid=%d\n",
-	        hard ? "SIGKILL" : "SIGTERM", (int)ctx->child_pid);
+	        hard ? "SIGKILL" : "SIGTERM", (int)pgid);
 }
 
 int worker_idle(const worker_ctx_t *ctx)
@@ -1147,11 +1165,9 @@ static int reap_child_only(worker_ctx_t *ctx)
 	 * (if any) stays in /results until publish succeeds — either later
 	 * this session (when conn comes back) or on next agent startup
 	 * via replay_pending_results. */
-	pid_t reaped = ctx->child_pid;
-	ctx->child_pid = 0;
 	(void)status;
-	(void)reaped;
-	return 1;                     /* reaped — caller decides whether to publish */
+	ctx->child_pid = 0;
+	return 1;
 }
 
 int worker_tick(worker_ctx_t *ctx)
