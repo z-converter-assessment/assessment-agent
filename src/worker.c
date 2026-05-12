@@ -246,13 +246,16 @@ static char *build_result_json(const worker_ctx_t *ctx,
 	cJSON_AddStringToObject(root, "message_id", msg_id);
 
 	/*
-	 * NOTE: boot_time / agent_started_at are intentionally omitted here.
-	 * The collector's add_common_metadata() in collect.c owns those fields
-	 * and caches them at process start. The worker module does not link
-	 * against collect.c, and ducking the cross-module access here keeps
-	 * the worker independently testable. Engine-side schema treats them
-	 * as nullable on task.result (the routing-key path is portal-only).
+	 * Round 4 F16: emit explicit nulls for boot_time / agent_started_at
+	 * so engine consumers see consistent schema between task.result and
+	 * inventory/metrics/error. The actual values live in collect.c's
+	 * static caches; worker.c is intentionally independent of collector
+	 * (CLAUDE.md "single binary single process" with worker module
+	 * separately testable). Portal sees null and knows to source these
+	 * from the same machine_id's most recent metric/inventory message.
 	 */
+	cJSON_AddNullToObject(root, "boot_time");
+	cJSON_AddNullToObject(root, "agent_started_at");
 
 	cJSON_AddStringToObject(root, "task_id", task_id ? task_id : "");
 	cJSON_AddStringToObject(root, "status",  status);
@@ -420,6 +423,7 @@ static void child_run_task(worker_ctx_t *ctx, cJSON *task)
 			                         timeout_sec,
 			                         ctx->cfg.mem_limit_mb,
 			                         ctx->cfg.fsize_limit_mb,
+			                         ctx->cfg.nofile_limit,
 			                         task_id, ctx->cfg.machine_id, &er);
 		}
 	}
@@ -827,7 +831,15 @@ void worker_force_child_term(worker_ctx_t *ctx, int hard)
 
 int worker_idle(const worker_ctx_t *ctx)
 {
-	return ctx && ctx->child_pid == 0;
+	/*
+	 * Round 4 F1+F2: idle requires BOTH no live child AND no pending
+	 * publish. After round-3's reap split, child_pid==0 alone means
+	 * "OS process reaped" but the result may still be sitting in
+	 * /results awaiting a successful publish_reaped_result. Drain
+	 * exiting at child_pid==0 alone would orphan that result until
+	 * next agent restart.
+	 */
+	return ctx && ctx->child_pid == 0 && ctx->inflight_task_id[0] == '\0';
 }
 
 void worker_shutdown(worker_ctx_t *ctx)
@@ -887,7 +899,14 @@ static int publish_reaped_result(worker_ctx_t *ctx)
 
 static int try_pick_new_task(worker_ctx_t *ctx)
 {
-	if (ctx->drain || ctx->child_pid != 0) return 0;
+	/*
+	 * Round 4 F1+F2: also bail when a previous task's publish is still
+	 * pending (inflight_task_id non-empty). Otherwise basic_get could
+	 * fetch task Y and overwrite inflight_task_id, orphaning task X's
+	 * result file in /results.
+	 */
+	if (ctx->drain || ctx->child_pid != 0 || ctx->inflight_task_id[0] != '\0')
+		return 0;
 
 	char    *body = NULL;
 	size_t   blen = 0;
@@ -900,7 +919,7 @@ static int try_pick_new_task(worker_ctx_t *ctx)
 	cJSON *task = cJSON_Parse(body);
 	if (!task) {
 		fprintf(stderr, "[worker] malformed task — dropping (ack)\n");
-		publish_conn_ack(ctx->conn, tag);
+		if (publish_conn_ack(ctx->conn, tag) != 0) ctx->conn_dead = 1;
 		free(body);
 		return 0;
 	}
@@ -909,13 +928,16 @@ static int try_pick_new_task(worker_ctx_t *ctx)
 	const char *task_id = cJSON_IsString(jid) ? jid->valuestring : NULL;
 	if (!task_id_valid(task_id)) {
 		fprintf(stderr, "[worker] invalid task_id — dropping (ack)\n");
-		publish_conn_ack(ctx->conn, tag);
+		if (publish_conn_ack(ctx->conn, tag) != 0) ctx->conn_dead = 1;
 		cJSON_Delete(task);
 		free(body);
 		return 0;
 	}
 
-	/* Idempotency: /done marker present → skip install. */
+	/* Idempotency: /done marker present → skip install.
+	 * Round 4 F4+F5: capture publish/ack rc; mark conn_dead on failure
+	 * so the next tick reconnects instead of attempting basic_get on a
+	 * corrupted channel. */
 	char done_path[1024];
 	snprintf(done_path, sizeof done_path, "%s/%s.json", ctx->done_dir, task_id);
 	if (file_exists(done_path)) {
@@ -923,13 +945,15 @@ static int try_pick_new_task(worker_ctx_t *ctx)
 		char *res = build_result_json(ctx, task_id, "failure", "already_done",
 		                              0, 0, 0, "", "");
 		if (res) {
-			publish_conn_publish(ctx->conn,
-			                     ctx->cfg.amqp.exchange,
-			                     ctx->cfg.result_routing_key,
-			                     res, strlen(res));
+			if (publish_conn_publish(ctx->conn,
+			                         ctx->cfg.amqp.exchange,
+			                         ctx->cfg.result_routing_key,
+			                         res, strlen(res)) != 0) {
+				ctx->conn_dead = 1;
+			}
 			free(res);
 		}
-		publish_conn_ack(ctx->conn, tag);
+		if (publish_conn_ack(ctx->conn, tag) != 0) ctx->conn_dead = 1;
 		cJSON_Delete(task);
 		free(body);
 		return 0;
@@ -946,7 +970,7 @@ static int try_pick_new_task(worker_ctx_t *ctx)
 	 */
 	if (running_marker_present(ctx, task_id)) {
 		fprintf(stderr, "[worker] task %s already in-flight — redelivery dropped\n", task_id);
-		publish_conn_ack(ctx->conn, tag);
+		if (publish_conn_ack(ctx->conn, tag) != 0) ctx->conn_dead = 1;
 		cJSON_Delete(task);
 		free(body);
 		return 0;
@@ -960,22 +984,31 @@ static int try_pick_new_task(worker_ctx_t *ctx)
 	 * so portal sees the task didn't run. */
 	if (write_running_marker(ctx, task_id) != 0) {
 		fprintf(stderr, "[worker] task %s: /running marker write failed — aborting\n", task_id);
-		publish_synth_failure(ctx, task_id, tag, "internal_error",
-		                      "agent could not write /running marker; install skipped to prevent double-execution\n");
+		if (publish_synth_failure(ctx, task_id, tag, "internal_error",
+		                          "agent could not write /running marker; install skipped to prevent double-execution\n") != 0)
+			ctx->conn_dead = 1;
 		cJSON_Delete(task);
 		free(body);
 		return 0;
 	}
 
-	/* Fork. */
+	/*
+	 * Round 4 F3: fork() failure is a LOCAL resource issue (EAGAIN under
+	 * memory/process pressure), not a broker problem. Don't tear down the
+	 * AMQP connection — we want to keep heartbeats and metric publishing
+	 * alive while we wait for resources. Just synthesize a failure for
+	 * this task and continue.
+	 */
 	pid_t pid = fork();
 	if (pid < 0) {
 		fprintf(stderr, "[worker] fork failed: %s\n", strerror(errno));
-		publish_synth_failure(ctx, task_id, tag, "internal_error",
-		                      "agent could not fork worker child\n");
+		clear_running_marker(ctx, task_id);   /* roll back the marker we just wrote */
+		if (publish_synth_failure(ctx, task_id, tag, "internal_error",
+		                          "agent could not fork worker child\n") != 0)
+			ctx->conn_dead = 1;
 		cJSON_Delete(task);
 		free(body);
-		return -1;
+		return 0;          /* NOT -1 — fork failure is local, conn is fine */
 	}
 	if (pid == 0) {
 		/*
@@ -1113,8 +1146,14 @@ int worker_tick(worker_ctx_t *ctx)
 		return -1;
 	}
 
-	if (reaped == 1) {
-		/* Publish the just-reaped task's result. */
+	/*
+	 * Round 4 F1+F2: publish ANY pending result, not only the just-reaped
+	 * one. After a publish failure on a previous tick, inflight_task_id
+	 * stays set with child_pid==0 (the comment in publish_reaped_result
+	 * documents this "leave intact for retry" intent — but the previous
+	 * gating only fired on `reaped == 1`, so the retry never happened).
+	 */
+	if (ctx->child_pid == 0 && ctx->inflight_task_id[0] != '\0') {
 		if (publish_reaped_result(ctx) < 0) {
 			ctx->conn_dead = 1;
 			return -1;

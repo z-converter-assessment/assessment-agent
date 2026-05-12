@@ -43,6 +43,7 @@ typedef struct {
 	int              disk_reserve_mb;
 	int              mem_limit_mb;
 	int              fsize_limit_mb;
+	int              nofile_limit;       /* RLIMIT_NOFILE for install.sh; raw fd count */
 } worker_config_t;
 
 /**

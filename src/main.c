@@ -318,6 +318,7 @@ int main(void)
 			.disk_reserve_mb     = atoi(getenv_default("WORKER_DISK_RESERVE_MB", "50")),
 			.mem_limit_mb        = atoi(getenv_default("WORKER_INSTALL_MEM_LIMIT_MB",   "2048")),
 			.fsize_limit_mb      = atoi(getenv_default("WORKER_INSTALL_FSIZE_LIMIT_MB", "5120")),
+			.nofile_limit        = atoi(getenv_default("WORKER_INSTALL_NOFILE",        "4096")),
 		};
 		worker = worker_init(&wc);
 		if (!worker) {

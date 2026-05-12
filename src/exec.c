@@ -126,7 +126,8 @@ static int set_rlimit(int resource, long value)
 static int child_bootstrap(const char *extract_dir,
                            const char *task_id, const char *machine_id,
                            int stdin_fd, int stdout_fd, int stderr_fd,
-                           int timeout_sec, int mem_mb, int fsize_mb)
+                           int timeout_sec, int mem_mb, int fsize_mb,
+                           int nofile)
 {
 	/*
 	 * Round 3 C-1: do NOT call setsid() here. The grandchild must stay
@@ -157,7 +158,7 @@ static int child_bootstrap(const char *extract_dir,
 	if (task_id)    setenv("TASK_ID",    task_id, 1);
 	if (machine_id) setenv("MACHINE_ID", machine_id, 1);
 
-	if (set_rlimit(RLIMIT_NOFILE, 1024L)            != 0) return -1;
+	if (set_rlimit(RLIMIT_NOFILE, (long)nofile)     != 0) return -1;
 	if (set_rlimit(RLIMIT_AS,     mem_mb)           != 0) return -1;
 	if (set_rlimit(RLIMIT_FSIZE,  fsize_mb)         != 0) return -1;
 	if (timeout_sec > 0 &&
@@ -215,6 +216,7 @@ exec_status_t exec_install_script(const char  *extract_dir,
                                   int          timeout_sec,
                                   int          mem_limit_mb,
                                   int          fsize_limit_mb,
+                                  int          nofile_limit,
                                   const char  *task_id,
                                   const char  *machine_id,
                                   exec_result_t *out)
@@ -263,7 +265,8 @@ exec_status_t exec_install_script(const char  *extract_dir,
 		close(out_pipe[0]); close(err_pipe[0]);
 		if (child_bootstrap(extract_dir, task_id, machine_id,
 		                    devnull, out_pipe[1], err_pipe[1],
-		                    timeout_sec, mem_limit_mb, fsize_limit_mb) != 0)
+		                    timeout_sec, mem_limit_mb, fsize_limit_mb,
+		                    nofile_limit > 0 ? nofile_limit : 4096) != 0)
 			_exit(EXEC_CHILD_BOOTSTRAP_FAIL);
 
 		/* Build argv: "./script" [+ argv_extra...]. */
