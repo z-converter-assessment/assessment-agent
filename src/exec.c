@@ -150,6 +150,17 @@ static int child_bootstrap(const char *extract_dir,
 
 	umask(022);
 
+	/*
+	 * Round 10: reset SIGPIPE to SIG_DFL before execve. POSIX guarantees
+	 * SIG_IGN dispositions survive execve, so without this reset install.sh
+	 * inherits the agent's SIGPIPE-ignore (round-9 fix for broker reset
+	 * crashes). install scripts relying on classic pipeline semantics
+	 * (`yes | foo`, `tar | head`) would then hang because SIGPIPE never
+	 * fires when the pipe peer closes. Restoring SIG_DFL here applies
+	 * only to the install.sh process tree.
+	 */
+	signal(SIGPIPE, SIG_DFL);
+
 	if (clearenv() != 0) return -1;
 	setenv("PATH", "/usr/local/bin:/usr/bin:/bin", 1);
 	setenv("LANG", "C.UTF-8", 1);
