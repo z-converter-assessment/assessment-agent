@@ -62,6 +62,8 @@ struct worker_ctx_s {
 
 	int  drain;                    /* set by worker_begin_drain */
 	int  conn_dead;                /* CRITICAL #2: set on transport failure; reconnect on next tick */
+	time_t last_reconnect_attempt; /* HIGH (round 2): backoff vs broker rate-limit */
+	int  reconnect_backoff_sec;    /* current backoff window */
 
 	/* IDLE when child_pid == 0, BUSY otherwise. */
 	pid_t    child_pid;
@@ -73,6 +75,12 @@ struct worker_ctx_s {
 	char done_dir[512];
 	char running_dir[512];   /* CRITICAL #10: in-flight task markers */
 };
+
+/*
+ * Backoff caps: start at 1s, double each consecutive failure, max 60s.
+ * Reset to 0 on a successful reconnect.
+ */
+#define WORKER_RECONNECT_BACKOFF_MAX 60
 
 /* ============================================================
  * Small filesystem helpers
@@ -301,6 +309,23 @@ static void child_write_result_file(const worker_ctx_t *ctx,
 
 static void child_run_task(worker_ctx_t *ctx, cJSON *task)
 {
+	/*
+	 * CRITICAL #5 (round 2): close the inherited AMQP TLS socket and any
+	 * other parent-side fds *immediately on entry*. FD_CLOEXEC fires only
+	 * at execve, so without this the worker child carries the broker
+	 * socket through download + extract + any helper fork-without-exec.
+	 * The grandchild (install.sh) gets another sweep in exec.c, but that
+	 * window is too late — libcurl/libarchive may fork before then.
+	 *
+	 * CRITICAL #9 (round 2): become our own process group leader so the
+	 * parent's drain escalation `kill(-child_pid, SIG)` actually targets
+	 * us (and our grandchild via group inheritance). Without this, the
+	 * worker child shares the agent's pgid; -child_pid points to a non-
+	 * existent pgid and silently returns ESRCH — drain becomes dead code.
+	 */
+	close_inherited_fds();
+	(void)setpgid(0, 0);
+
 	const cJSON *jid       = cJSON_GetObjectItemCaseSensitive(task, "task_id");
 	const cJSON *jmachine  = cJSON_GetObjectItemCaseSensitive(task, "machine_id");
 	const cJSON *jdownload = cJSON_GetObjectItemCaseSensitive(task, "download");
@@ -453,10 +478,17 @@ static int publish_result_and_ack(worker_ctx_t *ctx,
 		        task_id);
 		return -1;
 	}
-	if (publish_conn_ack(ctx->conn, delivery_tag) != 0) {
+	/*
+	 * CRITICAL #3 (round 2): if delivery_tag was zeroed by reconnect_if_dead
+	 * (channel that owned the tag is gone), do NOT call basic_ack — the
+	 * broker treats `delivery_tag=0, multiple=0` as PRECONDITION_FAILED
+	 * and closes the new channel, triggering a flap. Skip ack; the broker
+	 * will redeliver and the /done marker just written will gate it via I1.
+	 */
+	if (delivery_tag != 0 && publish_conn_ack(ctx->conn, delivery_tag) != 0) {
 		fprintf(stderr, "[worker] basic.ack failed for %s — broker will redeliver, idempotency marker will gate it\n",
 		        task_id);
-		/* still proceed to mark done — duplicate publish handled by I1 */
+		return -1;
 	}
 	if (move_to_done(ctx, task_id) != 0)
 		fprintf(stderr, "[worker] move to /done failed for %s: %s\n",
@@ -493,7 +525,12 @@ static int publish_synth_failure(worker_ctx_t *ctx,
 	                              body, strlen(body));
 	free(body);
 	if (rc != 0) return -1;
-	publish_conn_ack(ctx->conn, delivery_tag);
+	/* CRITICAL #3 (round 2): same delivery_tag=0 guard as above. */
+	if (delivery_tag != 0 && publish_conn_ack(ctx->conn, delivery_tag) != 0) {
+		fprintf(stderr, "[worker] synth ack failed for %s — broker will redeliver, /done marker will gate\n",
+		        task_id);
+		return -1;
+	}
 	return 0;
 }
 
@@ -607,27 +644,41 @@ static void recover_stale_running(worker_ctx_t *ctx)
 		char task_id[64];
 		if (!replay_filename_to_task_id(e->d_name, task_id, sizeof task_id)) continue;
 
-		char *body = build_result_json(ctx, task_id, "failure", "internal_error",
-		                               0, 0, 0, "",
-		                               "agent terminated mid-install; recovered on restart\n");
-		if (!body) continue;
+		/*
+		 * HIGH-C (round 2): if /done/<id>.json or /results/<id>.json
+		 * already exists, the task either completed in a prior run or
+		 * was just replayed by replay_pending_results. Either way the
+		 * authoritative result is already on disk — do NOT overwrite
+		 * with a synth failure body. Just unlink the stale /running
+		 * marker and move on.
+		 */
+		char done_path[1024], results_path[1024], src_path[1024];
+		int have_done    = 0, have_results = 0;
+		if ((size_t)snprintf(done_path,    sizeof done_path,    "%s/%s.json", ctx->done_dir,    task_id) < sizeof done_path)
+			have_done = file_exists(done_path);
+		if ((size_t)snprintf(results_path, sizeof results_path, "%s/%s.json", ctx->results_dir, task_id) < sizeof results_path)
+			have_results = file_exists(results_path);
 
-		/* Best-effort publish; don't ack (no live delivery_tag here). */
-		(void)publish_conn_publish(ctx->conn,
-		                           ctx->cfg.amqp.exchange,
-		                           ctx->cfg.result_routing_key,
-		                           body, strlen(body));
+		if (!have_done && !have_results) {
+			char *body = build_result_json(ctx, task_id, "failure", "internal_error",
+			                               0, 0, 0, "",
+			                               "agent terminated mid-install; recovered on restart\n");
+			if (body) {
+				/* Best-effort publish; don't ack (no live delivery_tag here). */
+				(void)publish_conn_publish(ctx->conn,
+				                           ctx->cfg.amqp.exchange,
+				                           ctx->cfg.result_routing_key,
+				                           body, strlen(body));
+				write_file_atomic(done_path, body);
+				free(body);
+			}
+		} else {
+			fprintf(stderr, "[worker] recover: task %s has prior result on disk — skipping synth (done=%d results=%d)\n",
+			        task_id, have_done, have_results);
+		}
 
-		/* Always promote /running -> /done so future redeliveries are gated. */
-		char done_path[1024];
-		if ((size_t)snprintf(done_path, sizeof done_path, "%s/%s.json", ctx->done_dir, task_id) < sizeof done_path)
-			write_file_atomic(done_path, body);
-
-		char src_path[1024];
 		if ((size_t)snprintf(src_path, sizeof src_path, "%s/%s", ctx->running_dir, e->d_name) < sizeof src_path)
 			unlink(src_path);
-
-		free(body);
 	}
 	closedir(d);
 }
@@ -647,10 +698,17 @@ static int running_marker_present(const worker_ctx_t *ctx, const char *task_id)
 	return file_exists(path);
 }
 
-static void write_running_marker(const worker_ctx_t *ctx, const char *task_id)
+/*
+ * Returns 0 on success, -1 on failure. CRITICAL #10 (round 2): caller
+ * MUST abort the fork on failure — without the marker, a redelivery
+ * during in-flight install will not be gated by I1 and double-execution
+ * becomes possible (the original C10 race uncovered).
+ */
+static int write_running_marker(const worker_ctx_t *ctx, const char *task_id)
 {
 	char path[1024];
-	if ((size_t)snprintf(path, sizeof path, "%s/%s.json", ctx->running_dir, task_id) >= sizeof path) return;
+	if ((size_t)snprintf(path, sizeof path, "%s/%s.json", ctx->running_dir, task_id) >= sizeof path)
+		return -1;
 
 	struct timespec ts;
 	clock_gettime(CLOCK_REALTIME, &ts);
@@ -660,7 +718,7 @@ static void write_running_marker(const worker_ctx_t *ctx, const char *task_id)
 	char body[256];
 	snprintf(body, sizeof body,
 	         "{\"task_id\":\"%s\",\"started_at\":\"%s\"}\n", task_id, now_buf);
-	write_file_atomic(path, body);
+	return write_file_atomic(path, body);
 }
 
 static void clear_running_marker(const worker_ctx_t *ctx, const char *task_id)
@@ -757,27 +815,44 @@ static int try_reap_child(worker_ctx_t *ctx)
 	char path[1024];
 	snprintf(path, sizeof path, "%s/%s.json", ctx->results_dir, task_id);
 
+	int publish_rc;
 	if (file_exists(path)) {
 		char *body = NULL;
 		if (read_result_file(path, &body) == 0 && body) {
-			publish_result_and_ack(ctx, task_id, tag, body);
+			publish_rc = publish_result_and_ack(ctx, task_id, tag, body);
 			free(body);
 		} else {
-			publish_synth_failure(ctx, task_id, tag, "internal_error",
-			                      "result file unreadable after child exit\n");
+			publish_rc = publish_synth_failure(ctx, task_id, tag, "internal_error",
+			                                   "result file unreadable after child exit\n");
 		}
 	} else {
 		/* Child died before writing the file (signal / OOM / abort). */
-		publish_synth_failure(ctx, task_id, tag, "internal_error",
-		                      "worker child exited without writing result\n");
+		publish_rc = publish_synth_failure(ctx, task_id, tag, "internal_error",
+		                                   "worker child exited without writing result\n");
 	}
 
-	/* Reaped — clear the in-flight running marker (CRITICAL #10). */
+	/*
+	 * CRITICAL #6 (round 2): propagate publish failure into conn_dead so
+	 * the next tick reconnects instead of attempting a fresh basic_get on
+	 * a corrupted channel. We still clear child_pid (waitpid succeeded —
+	 * the OS-level child resource is reaped) so worker_idle returns true.
+	 *
+	 * /running marker is cleared even on publish failure: the result file
+	 * either lives in /results (publish_result_and_ack failure path) or
+	 * the /done marker has been written by publish_synth_failure. Either
+	 * way, redelivery is gated by I1 and we are not stuck in /running
+	 * "in-flight" state forever (CRITICAL #10 corner addressed in round 2).
+	 */
 	clear_running_marker(ctx, task_id);
 
 	ctx->child_pid               = 0;
 	ctx->inflight_delivery_tag   = 0;
 	ctx->inflight_task_id[0]     = '\0';
+
+	if (publish_rc != 0) {
+		ctx->conn_dead = 1;
+		return -1;
+	}
 	return 0;
 }
 
@@ -850,8 +925,18 @@ static int try_pick_new_task(worker_ctx_t *ctx)
 
 	/* Write /running marker BEFORE fork so a redelivery during this run
 	 * (broker consumer_timeout, agent restart) can detect the in-flight
-	 * state and not double-execute. */
-	write_running_marker(ctx, task_id);
+	 * state and not double-execute. CRITICAL #10 (round 2): if marker
+	 * write fails (disk full, RO mount, perms), DO NOT fork — there is
+	 * no way to gate the redelivery race. Synthesize a failure result
+	 * so portal sees the task didn't run. */
+	if (write_running_marker(ctx, task_id) != 0) {
+		fprintf(stderr, "[worker] task %s: /running marker write failed — aborting\n", task_id);
+		publish_synth_failure(ctx, task_id, tag, "internal_error",
+		                      "agent could not write /running marker; install skipped to prevent double-execution\n");
+		cJSON_Delete(task);
+		free(body);
+		return 0;
+	}
 
 	/* Fork. */
 	pid_t pid = fork();
@@ -894,18 +979,35 @@ static int try_pick_new_task(worker_ctx_t *ctx)
  * declared yet), or TLS-level read/write errors. Outstanding delivery
  * tags are dropped — this is fine because we have not yet acked them and
  * the broker will redeliver after timeout / requeue.
+ *
+ * HIGH (round 2): exponential backoff against the broker. Without this,
+ * a persistent failure (queue not yet declared, broker down for hours)
+ * would trigger a TLS handshake every tick — broker rate-limits or
+ * connection counter alerts will fire.
  */
 static int reconnect_if_dead(worker_ctx_t *ctx)
 {
 	if (!ctx->conn_dead && ctx->conn) return 0;
 
+	time_t now = time(NULL);
+	if (ctx->reconnect_backoff_sec > 0 &&
+	    (now - ctx->last_reconnect_attempt) < ctx->reconnect_backoff_sec) {
+		return -1;   /* still inside backoff window */
+	}
+	ctx->last_reconnect_attempt = now;
+
 	if (ctx->conn) { publish_conn_close(ctx->conn); ctx->conn = NULL; }
 	ctx->conn = publish_conn_open(&ctx->cfg.amqp);
 	if (!ctx->conn) {
-		fprintf(stderr, "[worker] reconnect failed — will retry next tick\n");
+		int next = ctx->reconnect_backoff_sec * 2;
+		if (next < 1) next = 1;
+		if (next > WORKER_RECONNECT_BACKOFF_MAX) next = WORKER_RECONNECT_BACKOFF_MAX;
+		ctx->reconnect_backoff_sec = next;
+		fprintf(stderr, "[worker] reconnect failed — next attempt in ≥%ds\n", next);
 		return -1;
 	}
 	ctx->conn_dead = 0;
+	ctx->reconnect_backoff_sec = 0;
 	fprintf(stderr, "[worker] AMQP connection re-established\n");
 
 	/*
@@ -920,8 +1022,9 @@ static int reconnect_if_dead(worker_ctx_t *ctx)
 
 void worker_keepalive(worker_ctx_t *ctx)
 {
-	if (ctx && ctx->conn && !ctx->conn_dead)
-		publish_conn_pump(ctx->conn);
+	if (!ctx || !ctx->conn || ctx->conn_dead) return;
+	if (publish_conn_pump(ctx->conn) < 0)
+		ctx->conn_dead = 1;
 }
 
 int worker_tick(worker_ctx_t *ctx)
@@ -929,7 +1032,10 @@ int worker_tick(worker_ctx_t *ctx)
 	if (!ctx) return -1;
 
 	if (reconnect_if_dead(ctx) < 0) return -1;
-	publish_conn_pump(ctx->conn);   /* CRITICAL #1: heartbeat keepalive */
+	if (publish_conn_pump(ctx->conn) < 0) {  /* CRITICAL #1: heartbeat keepalive */
+		ctx->conn_dead = 1;
+		return -1;
+	}
 
 	if (try_reap_child(ctx) < 0)    { ctx->conn_dead = 1; return -1; }
 	if (try_pick_new_task(ctx) < 0) { ctx->conn_dead = 1; return -1; }

@@ -373,6 +373,11 @@ int main(void)
 		 * which we trigger via `worker_keepalive`. With heartbeat=60s,
 		 * sleeping in 25s chunks lands well inside the broker's
 		 * 2× heartbeat tolerance window.
+		 *
+		 * HIGH (round 2): re-check g_stop AFTER sleep returns (SIGTERM
+		 * may have woken it) BEFORE calling worker_keepalive — keepalive
+		 * could in principle block on a half-open socket and delay
+		 * shutdown.
 		 */
 		int remaining = interval;
 		const int chunk = 25;
@@ -380,6 +385,7 @@ int main(void)
 			int s = remaining > chunk ? chunk : remaining;
 			sleep((unsigned int)s);
 			remaining -= s;
+			if (g_stop) break;
 			if (worker) worker_keepalive(worker);
 		}
 	}

@@ -267,11 +267,19 @@ static int open_amqp_connection(const publish_config_t *cfg,
 	 * Without FD_CLOEXEC the worker fork inherits a duplicate of the broker
 	 * TLS socket; install.sh could read/write broker frames. Set CLOEXEC
 	 * immediately after the socket is connected so the next fork+exec drops it.
+	 *
+	 * HIGH (round 2): older librabbitmq (e.g. 0.8 on CentOS 7 EPEL) returns
+	 * -1 from amqp_get_sockfd for SSL connections. Log loudly so operators
+	 * notice CLOEXEC protection is unavailable. The worker also calls
+	 * close_inherited_fds() in the child as defense-in-depth.
 	 */
 	int sockfd = amqp_get_sockfd(conn);
 	if (sockfd >= 0) {
 		int fl = fcntl(sockfd, F_GETFD, 0);
 		if (fl >= 0) (void)fcntl(sockfd, F_SETFD, fl | FD_CLOEXEC);
+	} else {
+		fprintf(stderr, "[publish] WARN: amqp_get_sockfd returned -1; FD_CLOEXEC not set "
+		                "(install.sh fd-sweep is sole protection)\n");
 	}
 
 	const char *vhost = (cfg->vhost && *cfg->vhost) ? cfg->vhost : "/";
@@ -409,11 +417,33 @@ int publish_conn_ack(publish_conn_t *c, uint64_t delivery_tag)
 	return 0;
 }
 
-void publish_conn_pump(publish_conn_t *c)
+int publish_conn_pump(publish_conn_t *c)
 {
-	if (!c || !c->conn) return;
-	struct timeval tv = { .tv_sec = 0, .tv_usec = 0 };
+	if (!c || !c->conn) return -1;
+	/*
+	 * CRITICAL #1 (round 2): give librabbitmq a non-zero timeout so
+	 * `recv_with_timeout` enters its select() path. The library's
+	 * `amqp_try_send_heartbeat` is called from inside that select-wait
+	 * branch — with `tv={0,0}` the function may short-circuit before
+	 * the heartbeat send is triggered. 1ms is small enough to be
+	 * effectively non-blocking yet drives the heartbeat machinery.
+	 *
+	 * Returns -1 on detected transport failure so the caller can mark
+	 * the connection dead and trigger reconnect on the next tick.
+	 */
+	struct timeval tv = { .tv_sec = 0, .tv_usec = 1000 };
 	amqp_frame_t frame;
 	amqp_maybe_release_buffers(c->conn);
-	(void)amqp_simple_wait_frame_noblock(c->conn, &frame, &tv);
+	int s = amqp_simple_wait_frame_noblock(c->conn, &frame, &tv);
+	if (s == AMQP_STATUS_OK || s == AMQP_STATUS_TIMEOUT) return 0;
+	if (s == AMQP_STATUS_HEARTBEAT_TIMEOUT ||
+	    s == AMQP_STATUS_CONNECTION_CLOSED ||
+	    s == AMQP_STATUS_SOCKET_ERROR ||
+	    s == AMQP_STATUS_TCP_ERROR) {
+		fprintf(stderr, "[worker-publish] heartbeat pump detected dead connection: %s\n",
+		        amqp_error_string2(s));
+		return -1;
+	}
+	/* Other errors: log + treat as transient. */
+	return 0;
 }

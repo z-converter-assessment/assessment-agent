@@ -139,10 +139,14 @@ int publish_conn_ack(publish_conn_t *c, uint64_t delivery_tag);
 /**
  * @brief Heartbeat tick — called from the main loop while idle.
  *
- * Drains any incoming frames (heartbeats from the broker) so the
- * connection does not die from missed peer heartbeats while the parent
- * loop sleeps. Non-blocking.
+ * Triggers librabbitmq's heartbeat send (if due) and drains any
+ * incoming frames (broker heartbeats / async errors). Uses a 1ms
+ * select wait so `amqp_try_send_heartbeat` runs.
+ *
+ * Returns 0 if the connection looks alive, -1 if a transport-level
+ * failure (heartbeat timeout, socket error) was observed; caller should
+ * mark the connection dead and reconnect on the next tick.
  */
-void publish_conn_pump(publish_conn_t *c);
+int publish_conn_pump(publish_conn_t *c);
 
 #endif

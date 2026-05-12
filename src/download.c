@@ -110,7 +110,7 @@ int download_host_allowed(const char *host, const char *allowed_hosts_csv)
  * INT64_MAX values (CRITICAL #7) that would otherwise wrap the additions
  * in has_enough_space and disable both pre-flight + streaming caps.
  */
-#define DOWNLOAD_MAX_SIZE_BYTES ((int64_t)16 * 1024 * 1024 * 1024)
+#define DOWNLOAD_MAX_SIZE_BYTES (16LL * 1024 * 1024 * 1024)
 
 static int size_bytes_in_range(int64_t expected_size_bytes)
 {
@@ -127,7 +127,14 @@ static int has_enough_space(const char *tmp_dir,
 	if (disk_reserve_mb < 0)        disk_reserve_mb = 0;
 	if (disk_reserve_mb > 1024 * 1024) disk_reserve_mb = 1024 * 1024; /* 1 TB margin cap */
 
-	uint64_t avail = (uint64_t)st.f_bavail * (uint64_t)st.f_frsize;
+	/* HIGH (round 2): guard avail multiplication against corrupt/exotic
+	 * f_bavail*f_frsize overflow. */
+	uint64_t bavail = (uint64_t)st.f_bavail;
+	uint64_t frsize = (uint64_t)st.f_frsize;
+	if (frsize == 0) return 0;
+	if (bavail > UINT64_MAX / frsize) return 1;          /* astronomical free space — pass */
+	uint64_t avail = bavail * frsize;
+
 	uint64_t need_bytes = (uint64_t)expected_size_bytes;
 	uint64_t reserve   = (uint64_t)disk_reserve_mb * 1024ULL * 1024ULL;
 	if (need_bytes > UINT64_MAX - reserve) return 0;     /* would wrap */

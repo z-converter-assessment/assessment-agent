@@ -19,8 +19,8 @@
 #define _GNU_SOURCE
 
 #include "exec.h"
+#include "util.h"
 
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -30,7 +30,6 @@
 #include <sys/resource.h>
 #include <sys/select.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -114,40 +113,6 @@ static int set_rlimit(int resource, long mb_value)
 	return setrlimit(resource, &rl);
 }
 
-/*
- * Close every inherited fd > 2 (CRITICAL #5). Without this, install.sh
- * inherits everything the agent had open: AMQP TLS sockets, .env file
- * handles, log fds. We've also set FD_CLOEXEC on the AMQP socket as a
- * belt; this is the suspenders. Linux 5.9+ has close_range; for older
- * kernels we walk /proc/self/fd, falling back to a tight numeric sweep
- * on the rlimit ceiling.
- */
-static void close_all_fds_above_stderr(void)
-{
-#if defined(__linux__) && defined(SYS_close_range)
-	if (syscall(SYS_close_range, (unsigned int)3, ~0u, 0u) == 0) return;
-#endif
-	DIR *d = opendir("/proc/self/fd");
-	if (d) {
-		int dirfd_to_skip = dirfd(d);
-		struct dirent *e;
-		while ((e = readdir(d)) != NULL) {
-			if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
-			int fd = atoi(e->d_name);
-			if (fd <= STDERR_FILENO || fd == dirfd_to_skip) continue;
-			(void)close(fd);
-		}
-		closedir(d);
-		return;
-	}
-	/* Last-resort fallback: walk up to the soft fd rlimit. */
-	struct rlimit rl;
-	long max_fd = 1024;
-	if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY)
-		max_fd = (long)rl.rlim_cur;
-	for (long fd = STDERR_FILENO + 1; fd < max_fd; fd++) (void)close((int)fd);
-}
-
 static int child_bootstrap(const char *extract_dir,
                            const char *task_id, const char *machine_id,
                            int stdin_fd, int stdout_fd, int stderr_fd,
@@ -159,9 +124,11 @@ static int child_bootstrap(const char *extract_dir,
 	if (dup2(stdin_fd, STDIN_FILENO)   < 0) return -1;
 	if (dup2(stdout_fd, STDOUT_FILENO) < 0) return -1;
 	if (dup2(stderr_fd, STDERR_FILENO) < 0) return -1;
-	close(stdin_fd); close(stdout_fd); close(stderr_fd);
+	if (stdin_fd  > STDERR_FILENO) close(stdin_fd);
+	if (stdout_fd > STDERR_FILENO) close(stdout_fd);
+	if (stderr_fd > STDERR_FILENO) close(stderr_fd);
 
-	close_all_fds_above_stderr();
+	close_inherited_fds();
 
 	umask(022);
 

@@ -226,3 +226,58 @@ int jitter_seconds(int base_sec, double frac)
 	double v = (double)base_sec * (1.0 + u);
 	return (int)v;
 }
+
+/* ============================================================
+ * close_inherited_fds — fd hygiene for forked children
+ * ============================================================ */
+
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+
+static int sweep_via_proc_self_fd(void)
+{
+	DIR *d = opendir("/proc/self/fd");
+	if (!d) return -1;
+	int dirfd_to_skip = dirfd(d);
+	int saw_any = 0;
+	struct dirent *e;
+	while ((e = readdir(d)) != NULL) {
+		if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+		int fd = atoi(e->d_name);
+		if (fd <= STDERR_FILENO || fd == dirfd_to_skip) continue;
+		(void)close(fd);
+		saw_any = 1;
+	}
+	closedir(d);
+	/*
+	 * /proc may exist but readdir return zero numeric entries (hidepid=2,
+	 * unusual mount, security policy). Treat zero hits as "fall through to
+	 * numeric sweep" — empty success is indistinguishable from real success
+	 * but the numeric sweep is cheap.
+	 */
+	return saw_any ? 0 : -1;
+}
+
+static void sweep_numeric(void)
+{
+	struct rlimit rl;
+	long max_fd = 1024;
+	if (getrlimit(RLIMIT_NOFILE, &rl) == 0 &&
+	    rl.rlim_cur != RLIM_INFINITY) {
+		max_fd = (long)rl.rlim_cur;
+	}
+	if (max_fd > 4096) max_fd = 4096;   /* cap to prevent 1M-syscall storms */
+	for (long fd = STDERR_FILENO + 1; fd < max_fd; fd++)
+		(void)close((int)fd);
+}
+
+void close_inherited_fds(void)
+{
+#if defined(__linux__) && defined(SYS_close_range)
+	if (syscall(SYS_close_range, (unsigned int)3, ~0u, 0u) == 0) return;
+#endif
+	if (sweep_via_proc_self_fd() == 0) return;
+	sweep_numeric();
+}
