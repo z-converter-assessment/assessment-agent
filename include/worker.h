@@ -88,9 +88,23 @@ void worker_begin_drain(worker_ctx_t *ctx);
 void worker_force_child_term(worker_ctx_t *ctx, int hard);
 
 /**
- * @brief Return 1 when no child is in-flight.
+ * @brief Return 1 when no child is in-flight AND no result publish is pending.
+ *
+ * Round 4: stricter than just "no live child". After a successful reap,
+ * the result file may still be sitting in /results awaiting publish; the
+ * drain loop keeps spinning until that publish succeeds (or H3 publish-
+ * stuck deadline fires).
  */
 int worker_idle(const worker_ctx_t *ctx);
+
+/**
+ * @brief Return 1 when an OS child process is still being awaited.
+ *
+ * Used by the drain loop to detect "child reaped but publish pending"
+ * (worker_idle still false but no kill target) so escalation timers
+ * don't spin uselessly.
+ */
+int worker_has_live_child(const worker_ctx_t *ctx);
 
 /**
  * @brief Free resources. Caller must have already waited for the in-flight

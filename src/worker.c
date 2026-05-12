@@ -487,31 +487,27 @@ static int publish_result_and_ack(worker_ctx_t *ctx,
 		        task_id);
 		return -1;
 	}
-	/*
-	 * Round 3 CRIT-N1: move /results → /done BEFORE ack so that an
-	 * ack failure (or any crash between publish and ack) leaves the
-	 * idempotency marker intact. Without this, the success path could
-	 * leave the broker still holding the message unacked while /done
-	 * is missing — a redelivery would re-execute the install.
-	 *
-	 * If ack subsequently succeeds, we're fully done.
-	 * If ack fails (or delivery_tag==0 from a reconnect), broker
-	 * eventually redelivers and I1 picks up the /done marker.
-	 */
 	if (move_to_done(ctx, task_id) != 0)
 		fprintf(stderr, "[worker] move to /done failed for %s: %s\n",
 		        task_id, strerror(errno));
 
 	/*
-	 * Round 2 CRIT-D: skip ack if delivery_tag was zeroed by
-	 * reconnect_if_dead (the channel that owned this tag is gone).
-	 * Broker would otherwise reject `tag=0, multiple=0` with
-	 * PRECONDITION_FAILED and close the new channel, triggering a flap.
+	 * Round 5 H1: ack failure is a transport problem, NOT a task problem.
+	 * The result was published and /done is durable. Mark the connection
+	 * dead so the next tick reconnects, but RETURN SUCCESS so the caller
+	 * clears inflight state. Broker redelivery (after consumer_timeout
+	 * on the now-dead channel) hits I1 via /done and emits already_done.
+	 *
+	 * Returning -1 here as round 4 did caused publish_reaped_result to
+	 * retry on next tick, but the result file had already been moved to
+	 * /done — the retry then took the "no result file" branch and
+	 * published a spurious internal_error synth, contradicting the real
+	 * result the portal had already received.
 	 */
 	if (delivery_tag != 0 && publish_conn_ack(ctx->conn, delivery_tag) != 0) {
-		fprintf(stderr, "[worker] basic.ack failed for %s — broker will redeliver, /done marker will gate\n",
+		fprintf(stderr, "[worker] basic.ack failed for %s — task is durably done; broker will redeliver, I1 will gate\n",
 		        task_id);
-		return -1;
+		ctx->conn_dead = 1;
 	}
 	return 0;
 }
@@ -545,11 +541,16 @@ static int publish_synth_failure(worker_ctx_t *ctx,
 	                              body, strlen(body));
 	free(body);
 	if (rc != 0) return -1;
-	/* CRITICAL #3 (round 2): same delivery_tag=0 guard as above. */
+	/*
+	 * Round 5 H2: same fix as publish_result_and_ack. /done was already
+	 * written before publish; ack failure is purely transport. Mark conn
+	 * dead but return success so caller clears inflight. Broker redelivery
+	 * hits I1 via /done.
+	 */
 	if (delivery_tag != 0 && publish_conn_ack(ctx->conn, delivery_tag) != 0) {
-		fprintf(stderr, "[worker] synth ack failed for %s — broker will redeliver, /done marker will gate\n",
+		fprintf(stderr, "[worker] synth ack failed for %s — /done is durable; broker will redeliver, I1 will gate\n",
 		        task_id);
-		return -1;
+		ctx->conn_dead = 1;
 	}
 	return 0;
 }
@@ -842,6 +843,11 @@ int worker_idle(const worker_ctx_t *ctx)
 	return ctx && ctx->child_pid == 0 && ctx->inflight_task_id[0] == '\0';
 }
 
+int worker_has_live_child(const worker_ctx_t *ctx)
+{
+	return ctx && ctx->child_pid != 0;
+}
+
 void worker_shutdown(worker_ctx_t *ctx)
 {
 	if (!ctx) return;
@@ -944,14 +950,29 @@ static int try_pick_new_task(worker_ctx_t *ctx)
 		fprintf(stderr, "[worker] task %s already_done — synthesizing result\n", task_id);
 		char *res = build_result_json(ctx, task_id, "failure", "already_done",
 		                              0, 0, 0, "", "");
-		if (res) {
-			if (publish_conn_publish(ctx->conn,
-			                         ctx->cfg.amqp.exchange,
-			                         ctx->cfg.result_routing_key,
-			                         res, strlen(res)) != 0) {
-				ctx->conn_dead = 1;
-			}
-			free(res);
+		if (!res) {
+			/*
+			 * Round 5: OOM building synth body. Do NOT ack — leave the
+			 * message unacked so broker redelivers when memory recovers.
+			 * Acking without publishing would make portal believe the task
+			 * never reached the agent.
+			 */
+			fprintf(stderr, "[worker] OOM building already_done synth for %s — leaving unacked\n", task_id);
+			cJSON_Delete(task);
+			free(body);
+			return 0;
+		}
+		int pub_rc = publish_conn_publish(ctx->conn,
+		                                  ctx->cfg.amqp.exchange,
+		                                  ctx->cfg.result_routing_key,
+		                                  res, strlen(res));
+		free(res);
+		if (pub_rc != 0) {
+			/* publish failed → don't ack; broker redelivers. */
+			ctx->conn_dead = 1;
+			cJSON_Delete(task);
+			free(body);
+			return 0;
 		}
 		if (publish_conn_ack(ctx->conn, tag) != 0) ctx->conn_dead = 1;
 		cJSON_Delete(task);
@@ -993,22 +1014,30 @@ static int try_pick_new_task(worker_ctx_t *ctx)
 	}
 
 	/*
-	 * Round 4 F3: fork() failure is a LOCAL resource issue (EAGAIN under
-	 * memory/process pressure), not a broker problem. Don't tear down the
-	 * AMQP connection — we want to keep heartbeats and metric publishing
-	 * alive while we wait for resources. Just synthesize a failure for
-	 * this task and continue.
+	 * Round 4 F3 + Round 5: fork() failure is a LOCAL resource issue
+	 * (EAGAIN under memory/process pressure), not a broker problem.
+	 * publish_synth_failure writes /done BEFORE publish, so we clear the
+	 * /running marker only AFTER synth has at least committed /done. If
+	 * synth itself OOMs (no /done written, no publish), we leave /running
+	 * in place so the next startup's recover_stale_running can publish
+	 * the synth properly — preventing the double-execute hole where both
+	 * /running and /done would be missing.
 	 */
 	pid_t pid = fork();
 	if (pid < 0) {
 		fprintf(stderr, "[worker] fork failed: %s\n", strerror(errno));
-		clear_running_marker(ctx, task_id);   /* roll back the marker we just wrote */
-		if (publish_synth_failure(ctx, task_id, tag, "internal_error",
-		                          "agent could not fork worker child\n") != 0)
+		int synth_rc = publish_synth_failure(ctx, task_id, tag, "internal_error",
+		                                     "agent could not fork worker child\n");
+		if (synth_rc == 0) {
+			/* /done is durable; safe to drop the in-flight marker. */
+			clear_running_marker(ctx, task_id);
+		} else {
+			/* synth failed (publish or OOM); leave /running for next-startup recovery. */
 			ctx->conn_dead = 1;
+		}
 		cJSON_Delete(task);
 		free(body);
-		return 0;          /* NOT -1 — fork failure is local, conn is fine */
+		return 0;
 	}
 	if (pid == 0) {
 		/*

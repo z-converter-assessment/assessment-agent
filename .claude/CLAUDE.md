@@ -260,6 +260,10 @@ Local dev uses plain AMQP and the default vhost. Production must not.
 | `AGENT_INVENTORY_REFRESH_SEC` | `3600` | inventory periodic re-publish base interval. Actual delay is `value × (1 + uniform(-0.15, +0.15))`. `0` disables the periodic refresh (startup + change-trigger only) |
 | `AGENT_HOSTNAME_OVERRIDE` | — | testing aid |
 | `AGENT_EXTERNAL_IP` | — | skip IMDS lookup if set |
+| `AGENT_DRAIN_GRACE_SEC` | `600` | on SIGTERM, max seconds to wait for in-flight install to finish before sending SIGTERM to it |
+| `AGENT_DRAIN_TERM_SEC` | `30` | additional seconds after SIGTERM before SIGKILL |
+| `AGENT_DRAIN_PUBLISH_SEC` | `120` | after install completes, max seconds to wait for result publish before giving up (file replays on next startup) |
+| `WORKER_INSTALL_NOFILE` | `4096` | `RLIMIT_NOFILE` (raw fd count) for install.sh. `<= 0` substitutes 4096 |
 | `WORKER_DOWNLOAD_ALLOWED_HOSTS` | — | comma-separated hostname whitelist for `task.install` downloads. Case-insensitive exact match (no wildcards). Empty/unset = **all hosts blocked** = worker effectively disabled |
 | `WORKER_STATE_DIR` | `/var/lib/agent-worker` | base directory for `/results` (pending publish), `/done` (idempotency markers, 7-day retention) |
 | `WORKER_TMP_DIR` | `/tmp` | base directory for extraction sandboxes (`agent-task-<task_id>/`) |

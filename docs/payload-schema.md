@@ -57,8 +57,8 @@
 | `collected_at` | string | ISO 8601 UTC (예: `"2026-04-23T14:30:00Z"`). `error` 메시지에서는 에러 발생 시각 |
 | `hostname` | string | 보조 식별자 (운영 중 변경 가능) |
 | `message_id` | string | UUID v4 |
-| `boot_time` | string\|null | ISO 8601 UTC. 시스템 부팅 시각. 프로세스 시작 시 `/proc/uptime` + `CLOCK_REALTIME`으로 1회 캐시(NTP 보정 흔들림 제거). **카운터 리셋 판정의 유일한 권위 소스** — 변경 감지(`prev != curr`)만 사용, 절대값 비교 금지. `/proc/uptime` 미접근 시 `null` |
-| `agent_started_at` | string | ISO 8601 UTC. agent 프로세스 기동 시각. 프로세스 시작 시 1회 캡처. **관측·디버깅용** — 차분/리셋 로직에서 사용 금지 |
+| `boot_time` | string\|null | ISO 8601 UTC. 시스템 부팅 시각. 프로세스 시작 시 `/proc/uptime` + `CLOCK_REALTIME`으로 1회 캐시(NTP 보정 흔들림 제거). **카운터 리셋 판정의 유일한 권위 소스** — 변경 감지(`prev != curr`)만 사용, 절대값 비교 금지. `/proc/uptime` 미접근 시 `null`. `task.result`는 항상 `null` (worker가 collect.c 캐시와 분리됨) |
+| `agent_started_at` | string\|null | ISO 8601 UTC. agent 프로세스 기동 시각. 프로세스 시작 시 1회 캡처. **관측·디버깅용** — 차분/리셋 로직에서 사용 금지. `task.result`는 항상 `null` (위와 동일 사유) |
 
 > 컨슈머는 **`machine_id`를 기준으로 upsert** 한다. `hostname`은 표시용 보조 정보.
 >

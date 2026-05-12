@@ -60,7 +60,8 @@ typedef struct {
  * @param timeout_sec       Wall-clock timeout. <= 0 disables.
  * @param mem_limit_mb      RLIMIT_AS in MB. <= 0 leaves the system default.
  * @param fsize_limit_mb    RLIMIT_FSIZE in MB. <= 0 leaves the system default.
- * @param nofile_limit      RLIMIT_NOFILE raw fd count. <= 0 leaves system default.
+ * @param nofile_limit      RLIMIT_NOFILE raw fd count. <= 0 substitutes the
+ *                          internal default (4096) — does NOT inherit parent's rlimit.
  * @param task_id           Set as TASK_ID env in the child.
  * @param machine_id        Set as MACHINE_ID env in the child.
  * @param out               Populated on every non-INTERNAL return.

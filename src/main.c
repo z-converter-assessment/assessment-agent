@@ -398,31 +398,45 @@ int main(void)
 	 * Phase 2 (term):  send SIGTERM to the child's process group; wait
 	 *                  AGENT_DRAIN_TERM_SEC for clean shutdown.
 	 * Phase 3 (kill):  send SIGKILL.
-	 *
-	 * systemd's TimeoutStopSec is the hard outer bound; this internal
-	 * escalation guarantees we don't spin forever even if the script
-	 * ignores SIGTERM, leaving an orphan child that systemd then SIGKILLs
-	 * — losing both the result and the broker ack.
+	 * Phase 4 (publish-stuck): if the install completed but the result
+	 *                  publish keeps failing (broker unreachable) for
+	 *                  AGENT_DRAIN_PUBLISH_SEC, give up. The result file
+	 *                  in /results will be replayed on next startup.
+	 *                  Round 5 H3: prevents drain wedging when the only
+	 *                  thing keeping us busy is a dead broker.
 	 */
 	if (worker) {
 		worker_begin_drain(worker);
-		int grace_sec = atoi(getenv_default("AGENT_DRAIN_GRACE_SEC", "600"));
-		int term_sec  = atoi(getenv_default("AGENT_DRAIN_TERM_SEC",  "30"));
-		fprintf(stderr, "[agent] draining worker (grace=%ds, term=%ds, then SIGKILL)\n",
-		        grace_sec, term_sec);
+		int grace_sec   = atoi(getenv_default("AGENT_DRAIN_GRACE_SEC",   "600"));
+		int term_sec    = atoi(getenv_default("AGENT_DRAIN_TERM_SEC",    "30"));
+		int publish_sec = atoi(getenv_default("AGENT_DRAIN_PUBLISH_SEC", "120"));
+		fprintf(stderr, "[agent] draining worker (grace=%ds, term=%ds, publish-stuck=%ds)\n",
+		        grace_sec, term_sec, publish_sec);
 
 		time_t t0 = time(NULL);
+		time_t reap_done_at = 0;            /* when child_pid first hit 0 */
 		int term_sent = 0;
 		int kill_sent = 0;
 		while (!worker_idle(worker)) {
-			worker_tick(worker);          /* may reap; ignore errors */
+			worker_tick(worker);
 			long elapsed = (long)(time(NULL) - t0);
+
 			if (!term_sent && elapsed >= grace_sec) {
 				worker_force_child_term(worker, 0);
 				term_sent = 1;
 			} else if (term_sent && !kill_sent && elapsed >= grace_sec + term_sec) {
 				worker_force_child_term(worker, 1);
 				kill_sent = 1;
+			}
+
+			/* Round 5 H3: track when the OS child went away. */
+			if (reap_done_at == 0 && !worker_has_live_child(worker))
+				reap_done_at = time(NULL);
+			if (reap_done_at != 0 &&
+			    (long)(time(NULL) - reap_done_at) >= publish_sec) {
+				fprintf(stderr, "[agent] drain: result publish stuck for %ds — giving up; result file will replay on next startup\n",
+				        publish_sec);
+				break;
 			}
 			sleep(1);
 		}
