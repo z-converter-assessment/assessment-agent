@@ -1,0 +1,71 @@
+[Unit]
+Description=Assessment Agent — collector + worker (task.install)
+Documentation=file:/usr/local/share/doc/assessment-agent/CLAUDE.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Run as the dedicated non-privileged user. Create with:
+#   useradd --system --home /var/lib/agent-worker \
+#           --shell /usr/sbin/nologin assessment-agent
+User=assessment-agent
+Group=assessment-agent
+
+# Worker writes /var/lib/agent-worker/{results,done} and extracts under /tmp.
+# Both must be writable by the User above.
+WorkingDirectory=/var/lib/agent-worker
+ReadWritePaths=/var/lib/agent-worker /tmp
+StateDirectory=agent-worker
+StateDirectoryMode=0700
+RuntimeDirectory=assessment-agent
+RuntimeDirectoryMode=0700
+
+# Environment — point at the production .env (chmod 600, owned by User).
+# Sensitive variables (RABBITMQ_PASS, RABBITMQ_WORKER_PASS) MUST come via
+# secret store / drop-in, not committed to git.
+EnvironmentFile=-/etc/assessment-agent/agent.env
+EnvironmentFile=-/etc/assessment-agent/agent.env.local
+
+ExecStart=/usr/local/bin/assessment-agent
+
+# C5: drain in-flight install on SIGTERM. install.timeout_sec is normally
+# <= 600s, so 15 min covers the maximum drain plus result publish + ack.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=15min
+
+# Restart policy — survive transient broker outages and collector errors.
+Restart=on-failure
+RestartSec=10s
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+# Hardening — these are belt-and-suspenders on top of U1 (running as a
+# non-privileged user) and EC1 (clearenv + setrlimit on install.sh
+# children). All flags below are tightened to the level the agent + the
+# worker child (running install.sh) actually need.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+PrivateDevices=yes
+PrivateTmp=no                     # install.sh extraction sandbox lives under /tmp
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+# Logging — stderr captured by systemd-journald (E1 decision).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=assessment-agent
+
+[Install]
+WantedBy=multi-user.target

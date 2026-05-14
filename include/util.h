@@ -41,6 +41,33 @@ void load_env_file(const char *path);
 const char *getenv_default(const char *name, const char *fallback);
 
 /**
+ * @brief Parse @p s as a boolean (case-insensitive).
+ *
+ *   True:  "1", "true", "yes", "on", "y", "t" → returns 1
+ *   False: "0", "false", "no", "off", "n", "f" → returns 0
+ *   NULL/empty: returns @p fallback
+ *   Other (e.g. "2", "enabled", typos): returns -1 (sentinel)
+ *
+ * `getenv_bool` translates the -1 sentinel into a warning + fallback,
+ * so unrecognized operator values are surfaced rather than silently
+ * disabling features.
+ */
+int parse_bool(const char *s, int fallback);
+
+/**
+ * @brief Read env var @p name and parse as boolean. Wraps getenv + parse_bool.
+ */
+int getenv_bool(const char *name, int fallback);
+
+/**
+ * @brief Read env var @p name and parse as int (defensively).
+ *
+ * Like atoi but: returns @p fallback when env unset, empty, or unparseable
+ * (instead of silently returning 0 which can disable safety caps).
+ */
+int getenv_int_or(const char *name, int fallback);
+
+/**
  * @brief Trim ASCII whitespace from both ends of @p s in place.
  */
 char *trim_inplace(char *s);
@@ -67,5 +94,32 @@ char *iso8601_utc_ms(struct timespec ts, char *buf, size_t len);
  * value from hostname/pid/timestamp.
  */
 char *uuid_v4(char *buf, size_t len);
+
+/**
+ * @brief Apply ±@p frac uniform jitter to @p base_sec, using rand().
+ *
+ * Result is `base_sec * (1 + U(-frac, +frac))` rounded down. Caller is
+ * responsible for seeding rand() once at process start. @p frac is clamped
+ * to [0, 1). Returns @p base_sec unchanged when @p base_sec <= 0.
+ */
+int jitter_seconds(int base_sec, double frac);
+
+/**
+ * @brief Close every inherited fd above STDERR_FILENO.
+ *
+ * Strategy:
+ *   1. close_range(2) syscall (Linux 5.9+) — atomic, fastest
+ *   2. /proc/self/fd walk — portable on Linux
+ *   3. numeric sweep up to RLIMIT_NOFILE (capped at 4096) — last resort
+ *
+ * Used by worker child immediately after fork to drop the inherited
+ * AMQP TLS socket and any other parent-side fds that should not survive
+ * into the install.sh process tree (CRITICAL #5 + the worker-child
+ * carrier window from the round-2 review).
+ *
+ * Safe to call from a forked-but-not-execve'd child. Does NOT touch
+ * fds 0/1/2 (caller is responsible for setting up stdio).
+ */
+void close_inherited_fds(void);
 
 #endif

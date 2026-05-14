@@ -41,10 +41,68 @@
  * ============================================================ */
 
 /**
+ * @brief Return cached boot_time as ISO 8601 UTC, or NULL if unreadable.
+ *
+ * Cached on first call. /proc/stat's `btime` is recomputed every read as
+ * `wall_clock_now - uptime`, so NTP corrections jitter it by 1~2s within a
+ * single boot. Computing it once at process start eliminates that drift —
+ * the only authoritative reset signal we have is "did this string change
+ * across messages?", and false-positive flips would corrupt counter-reset
+ * detection on the consumer side.
+ *
+ * Read failure is sticky (cached as "unreadable") so we don't retry on
+ * every message. Callers emit JSON null in that case.
+ */
+static const char *cached_boot_time_iso(void)
+{
+	static char buf[32];
+	static int initialized = 0;
+	static int ok = 0;
+
+	if (!initialized) {
+		initialized = 1;
+		char *content = read_file_all("/proc/uptime");
+		if (content) {
+			double uptime = strtod(content, NULL);
+			free(content);
+			if (uptime > 0) {
+				struct timespec now;
+				clock_gettime(CLOCK_REALTIME, &now);
+				time_t boot = now.tv_sec - (time_t)uptime;
+				iso8601_utc(boot, buf, sizeof buf);
+				ok = 1;
+			}
+		}
+	}
+	return ok ? buf : NULL;
+}
+
+/**
+ * @brief Return cached agent_started_at as ISO 8601 UTC.
+ *
+ * Captured on first call (= first message of the process lifetime).
+ * Observability/debugging only — counter-reset detection must not key off
+ * this field (see docs/inventory-refresh-and-reset-detection.md §4.1).
+ */
+static const char *cached_agent_started_at_iso(void)
+{
+	static char buf[32];
+	static int initialized = 0;
+
+	if (!initialized) {
+		initialized = 1;
+		struct timespec now;
+		clock_gettime(CLOCK_REALTIME, &now);
+		iso8601_utc(now.tv_sec, buf, sizeof buf);
+	}
+	return buf;
+}
+
+/**
  * @brief Add common metadata fields to @p obj.
  *
  * Fields: message_type, machine_id, agent_version, collected_at,
- * hostname, message_id.
+ * hostname, message_id, boot_time, agent_started_at.
  */
 static void add_common_metadata(cJSON *obj,
                                 const char *message_type,
@@ -78,6 +136,13 @@ static void add_common_metadata(cJSON *obj,
 	char uuid_buf[64];
 	uuid_v4(uuid_buf, sizeof uuid_buf);
 	cJSON_AddStringToObject(obj, "message_id", uuid_buf);
+
+	const char *boot = cached_boot_time_iso();
+	if (boot) cJSON_AddStringToObject(obj, "boot_time", boot);
+	else      cJSON_AddNullToObject(obj, "boot_time");
+
+	cJSON_AddStringToObject(obj, "agent_started_at",
+	                        cached_agent_started_at_iso());
 }
 
 /* ============================================================
@@ -1288,25 +1353,6 @@ static cJSON *collect_listen_ports(void)
 	return arr;
 }
 
-static int add_boot_time(cJSON *root)
-{
-	char *content = read_file_all("/proc/uptime");
-	if (!content)
-		return 0;
-	double uptime = strtod(content, NULL);
-	free(content);
-	if (uptime <= 0)
-		return 0;
-
-	struct timespec now;
-	clock_gettime(CLOCK_REALTIME, &now);
-	time_t boot = now.tv_sec - (time_t)uptime;
-	char buf[32];
-	iso8601_utc(boot, buf, sizeof buf);
-	cJSON_AddStringToObject(root, "boot_time", buf);
-	return 1;
-}
-
 cJSON *collect_inventory_payload(const char *machine_id, const char *agent_version)
 {
 	cJSON *root = cJSON_CreateObject();
@@ -1329,8 +1375,6 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 	cJSON_AddItemToObject(root, "ip_internal",  or_empty_array(collect_internal_ips()));
 	/* ip_external may be null literal by design (cloud metadata unreachable). */
 	cJSON_AddItemToObject(root, "ip_external", collect_external_ip());
-
-	if (!add_boot_time(root)) ok = 0;
 
 	if (!ok) {
 		cJSON_Delete(root);

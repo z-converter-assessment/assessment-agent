@@ -11,6 +11,16 @@
 /* collect.c sets _POSIX_C_SOURCE / _GNU_SOURCE for the whole TU. */
 #include "../../src/collect.c"
 
+/* Worker module pieces — header-only style so static helpers are reachable.
+ * These TUs avoid the libcurl / libarchive / rabbitmq-c dependencies because
+ * the unit tests do not exercise download/extract/exec/worker code paths
+ * end-to-end; they exercise small pure helpers (host whitelist, path safety,
+ * task_id validation). The TU includes only download.c and extract.c (which
+ * link to libcurl/openssl/libarchive at archive time — guarded by the
+ * Makefile test target's link line). */
+#include "../../src/download.c"
+#include "../../src/extract.c"
+
 #include "tinytest.h"
 
 #include <fcntl.h>
@@ -79,6 +89,92 @@ static void test_getenv_default_set(void)
 }
 
 /* ============================================================
+ * util.c — parse_bool
+ * ============================================================ */
+
+static void test_parse_bool_true_tokens(void)
+{
+	ASSERT_EQ(parse_bool("1",     0), 1);
+	ASSERT_EQ(parse_bool("true",  0), 1);
+	ASSERT_EQ(parse_bool("TRUE",  0), 1);
+	ASSERT_EQ(parse_bool("True",  0), 1);
+	ASSERT_EQ(parse_bool("yes",   0), 1);
+	ASSERT_EQ(parse_bool("YES",   0), 1);
+	ASSERT_EQ(parse_bool("on",    0), 1);
+	ASSERT_EQ(parse_bool("y",     0), 1);
+	ASSERT_EQ(parse_bool("t",     0), 1);
+}
+
+static void test_parse_bool_false_tokens(void)
+{
+	ASSERT_EQ(parse_bool("0",     1), 0);
+	ASSERT_EQ(parse_bool("false", 1), 0);
+	ASSERT_EQ(parse_bool("FALSE", 1), 0);
+	ASSERT_EQ(parse_bool("no",    1), 0);
+	ASSERT_EQ(parse_bool("off",   1), 0);
+	ASSERT_EQ(parse_bool("n",     1), 0);
+	ASSERT_EQ(parse_bool("f",     1), 0);
+}
+
+static void test_parse_bool_null_empty_fallback(void)
+{
+	ASSERT_EQ(parse_bool(NULL,  42), 42);
+	ASSERT_EQ(parse_bool("",    42), 42);
+}
+
+static void test_parse_bool_unrecognized_returns_sentinel(void)
+{
+	/* Round 8: unrecognized tokens return -1 sentinel, not silent 0.
+	 * getenv_bool catches -1 and emits a warning + fallback. */
+	ASSERT_EQ(parse_bool("2",       0), -1);
+	ASSERT_EQ(parse_bool("enabled", 0), -1);
+	ASSERT_EQ(parse_bool("garbage", 0), -1);
+	ASSERT_EQ(parse_bool("True!",   0), -1);
+}
+
+/* ============================================================
+ * util.c — getenv_int_or
+ * ============================================================ */
+
+static void test_getenv_int_or_unset(void)
+{
+	unsetenv("TT_INT_VAR");
+	ASSERT_EQ(getenv_int_or("TT_INT_VAR", 99), 99);
+}
+
+static void test_getenv_int_or_empty_fallback(void)
+{
+	setenv("TT_INT_VAR", "", 1);
+	ASSERT_EQ(getenv_int_or("TT_INT_VAR", 99), 99);
+	unsetenv("TT_INT_VAR");
+}
+
+static void test_getenv_int_or_valid(void)
+{
+	setenv("TT_INT_VAR", "42", 1);
+	ASSERT_EQ(getenv_int_or("TT_INT_VAR", 99), 42);
+	setenv("TT_INT_VAR", "-7", 1);
+	ASSERT_EQ(getenv_int_or("TT_INT_VAR", 99), -7);
+	unsetenv("TT_INT_VAR");
+}
+
+static void test_getenv_int_or_garbage_fallback(void)
+{
+	setenv("TT_INT_VAR", "abc", 1);
+	ASSERT_EQ(getenv_int_or("TT_INT_VAR", 99), 99);
+	setenv("TT_INT_VAR", "123abc", 1);
+	ASSERT_EQ(getenv_int_or("TT_INT_VAR", 99), 99);
+	unsetenv("TT_INT_VAR");
+}
+
+static void test_getenv_int_or_overflow_fallback(void)
+{
+	setenv("TT_INT_VAR", "99999999999999", 1);   /* > INT_MAX */
+	ASSERT_EQ(getenv_int_or("TT_INT_VAR", 99), 99);
+	unsetenv("TT_INT_VAR");
+}
+
+/* ============================================================
  * util.c — iso8601_utc / iso8601_utc_ms
  * ============================================================ */
 
@@ -111,6 +207,53 @@ static void test_iso8601_utc_ms_zero_ms(void)
 	struct timespec ts = { .tv_sec = 946684800L, .tv_nsec = 0 };
 	iso8601_utc_ms(ts, buf, sizeof buf);
 	ASSERT_STR_EQ(buf, "2000-01-01T00:00:00.000Z");
+}
+
+/* ============================================================
+ * util.c — jitter_seconds
+ * ============================================================ */
+
+static void test_jitter_seconds_within_bounds(void)
+{
+	srand(42);
+	int base = 3600;
+	double frac = 0.15;
+	int lo = (int)(base * (1.0 - frac));   /* 3060 */
+	int hi = (int)(base * (1.0 + frac));   /* 4140 */
+	for (int i = 0; i < 1000; i++) {
+		int v = jitter_seconds(base, frac);
+		ASSERT_TRUE(v >= lo);
+		ASSERT_TRUE(v <= hi);
+	}
+}
+
+static void test_jitter_seconds_zero_or_negative_passthrough(void)
+{
+	ASSERT_EQ(jitter_seconds(0, 0.15),  0);
+	ASSERT_EQ(jitter_seconds(-5, 0.15), -5);
+}
+
+static void test_jitter_seconds_zero_frac_no_change(void)
+{
+	srand(1);
+	for (int i = 0; i < 100; i++) {
+		ASSERT_EQ(jitter_seconds(60, 0.0), 60);
+	}
+}
+
+static void test_jitter_seconds_distribution_spans_range(void)
+{
+	/* Confirm the jitter actually moves both directions, not stuck at one end. */
+	srand(7);
+	int base = 1000;
+	int saw_below = 0, saw_above = 0;
+	for (int i = 0; i < 500 && (!saw_below || !saw_above); i++) {
+		int v = jitter_seconds(base, 0.15);
+		if (v < base) saw_below = 1;
+		if (v > base) saw_above = 1;
+	}
+	ASSERT_TRUE(saw_below);
+	ASSERT_TRUE(saw_above);
 }
 
 /* ============================================================
@@ -370,6 +513,37 @@ static void test_add_kb_or_null_negative(void)
 	ASSERT_NOT_NULL(v);
 	ASSERT_EQ((long)cJSON_IsNull(v), 1L);
 	cJSON_Delete(obj);
+}
+
+/* ============================================================
+ * collect.c — boot_time / agent_started_at caches
+ * ============================================================ */
+
+static void test_cached_boot_time_iso_idempotent(void)
+{
+	const char *a = cached_boot_time_iso();
+	const char *b = cached_boot_time_iso();
+	const char *c = cached_boot_time_iso();
+	/* On Linux test runners /proc/uptime always exists → non-NULL. */
+	ASSERT_NOT_NULL(a);
+	/* Same backing buffer (literal pointer identity), so values must match. */
+	ASSERT_TRUE(a == b);
+	ASSERT_TRUE(b == c);
+	ASSERT_STR_EQ(a, b);
+	/* ISO 8601 "YYYY-MM-DDTHH:MM:SSZ" = 20 chars. */
+	ASSERT_EQ((long)strlen(a), 20L);
+}
+
+static void test_cached_agent_started_at_iso_idempotent(void)
+{
+	const char *a = cached_agent_started_at_iso();
+	struct timespec sleep = { .tv_sec = 1, .tv_nsec = 0 };
+	nanosleep(&sleep, NULL);
+	const char *b = cached_agent_started_at_iso();
+	ASSERT_NOT_NULL(a);
+	ASSERT_TRUE(a == b);
+	ASSERT_STR_EQ(a, b);
+	ASSERT_EQ((long)strlen(a), 20L);
 }
 
 /* ============================================================
@@ -687,6 +861,124 @@ static void test_is_remote_unconnected_null_empty(void)
 }
 
 /* ============================================================
+ * download.c — host whitelist + URL parsing
+ * ============================================================ */
+
+static void test_download_url_extract_host_basic(void)
+{
+	char host[256];
+	ASSERT_EQ(download_url_extract_host("https://files.example.com/foo.tar", host, sizeof host), 1);
+	ASSERT_STR_EQ(host, "files.example.com");
+}
+
+static void test_download_url_extract_host_port_stripped(void)
+{
+	char host[256];
+	ASSERT_EQ(download_url_extract_host("https://files.example.com:8443/foo.tar", host, sizeof host), 1);
+	ASSERT_STR_EQ(host, "files.example.com");
+}
+
+static void test_download_url_extract_host_userinfo_stripped(void)
+{
+	char host[256];
+	ASSERT_EQ(download_url_extract_host("https://user:pw@files.example.com/foo.tar", host, sizeof host), 1);
+	ASSERT_STR_EQ(host, "files.example.com");
+}
+
+static void test_download_url_extract_host_lowercased(void)
+{
+	char host[256];
+	ASSERT_EQ(download_url_extract_host("https://Files.Example.COM/foo.tar", host, sizeof host), 1);
+	ASSERT_STR_EQ(host, "files.example.com");
+}
+
+static void test_download_url_extract_host_rejects_http(void)
+{
+	char host[256];
+	ASSERT_EQ(download_url_extract_host("http://files.example.com/foo.tar", host, sizeof host), 0);
+}
+
+static void test_download_url_extract_host_rejects_no_scheme(void)
+{
+	char host[256];
+	ASSERT_EQ(download_url_extract_host("files.example.com/foo.tar", host, sizeof host), 0);
+}
+
+static void test_download_host_allowed_exact(void)
+{
+	ASSERT_EQ(download_host_allowed("files.example.com",
+		"files.example.com,cdn.example.com"), 1);
+	ASSERT_EQ(download_host_allowed("cdn.example.com",
+		"files.example.com,cdn.example.com"), 1);
+}
+
+static void test_download_host_allowed_case_insensitive(void)
+{
+	ASSERT_EQ(download_host_allowed("Files.Example.COM",
+		"files.example.com"), 1);
+	ASSERT_EQ(download_host_allowed("files.example.com",
+		"FILES.EXAMPLE.COM"), 1);
+}
+
+static void test_download_host_allowed_no_wildcard(void)
+{
+	/* W1 decision: no subdomain wildcards. "sub.files.example.com" must
+	 * NOT match when only "files.example.com" is listed. */
+	ASSERT_EQ(download_host_allowed("sub.files.example.com",
+		"files.example.com"), 0);
+}
+
+static void test_download_host_allowed_empty_blocks_all(void)
+{
+	ASSERT_EQ(download_host_allowed("files.example.com", ""),   0);
+	ASSERT_EQ(download_host_allowed("files.example.com", NULL), 0);
+}
+
+static void test_download_host_allowed_trims_whitespace(void)
+{
+	ASSERT_EQ(download_host_allowed("files.example.com",
+		" files.example.com , cdn.example.com "), 1);
+}
+
+static void test_download_host_allowed_rejects_unlisted(void)
+{
+	ASSERT_EQ(download_host_allowed("evil.example.org",
+		"files.example.com,cdn.example.com"), 0);
+}
+
+/* ============================================================
+ * extract.c — path safety (path traversal guard)
+ * ============================================================ */
+
+static void test_extract_path_safe_relative(void)
+{
+	ASSERT_EQ(extract_path_safe("install.sh"),       1);
+	ASSERT_EQ(extract_path_safe("dir/file"),         1);
+	ASSERT_EQ(extract_path_safe("./install.sh"),     1);
+	ASSERT_EQ(extract_path_safe("a/b/c"),            1);
+}
+
+static void test_extract_path_safe_rejects_absolute(void)
+{
+	ASSERT_EQ(extract_path_safe("/etc/passwd"),      0);
+	ASSERT_EQ(extract_path_safe("/foo"),             0);
+}
+
+static void test_extract_path_safe_rejects_dotdot(void)
+{
+	ASSERT_EQ(extract_path_safe(".."),               0);
+	ASSERT_EQ(extract_path_safe("../etc/passwd"),    0);
+	ASSERT_EQ(extract_path_safe("a/../b"),           0);
+	ASSERT_EQ(extract_path_safe("a/b/.."),           0);
+}
+
+static void test_extract_path_safe_rejects_empty_null(void)
+{
+	ASSERT_EQ(extract_path_safe(""),                 0);
+	ASSERT_EQ(extract_path_safe(NULL),               0);
+}
+
+/* ============================================================
  * runner
  * ============================================================ */
 
@@ -704,11 +996,30 @@ int main(void)
 	RUN_TEST(test_getenv_default_empty);
 	RUN_TEST(test_getenv_default_set);
 
+	/* util.c — parse_bool */
+	RUN_TEST(test_parse_bool_true_tokens);
+	RUN_TEST(test_parse_bool_false_tokens);
+	RUN_TEST(test_parse_bool_null_empty_fallback);
+	RUN_TEST(test_parse_bool_unrecognized_returns_sentinel);
+
+	/* util.c — getenv_int_or */
+	RUN_TEST(test_getenv_int_or_unset);
+	RUN_TEST(test_getenv_int_or_empty_fallback);
+	RUN_TEST(test_getenv_int_or_valid);
+	RUN_TEST(test_getenv_int_or_garbage_fallback);
+	RUN_TEST(test_getenv_int_or_overflow_fallback);
+
 	/* util.c — iso8601 */
 	RUN_TEST(test_iso8601_utc_epoch);
 	RUN_TEST(test_iso8601_utc_known);
 	RUN_TEST(test_iso8601_utc_ms_format);
 	RUN_TEST(test_iso8601_utc_ms_zero_ms);
+
+	/* util.c — jitter_seconds */
+	RUN_TEST(test_jitter_seconds_within_bounds);
+	RUN_TEST(test_jitter_seconds_zero_or_negative_passthrough);
+	RUN_TEST(test_jitter_seconds_zero_frac_no_change);
+	RUN_TEST(test_jitter_seconds_distribution_spans_range);
 
 	/* util.c — read_file_all */
 	RUN_TEST(test_read_file_all_basic);
@@ -788,6 +1099,26 @@ int main(void)
 	RUN_TEST(test_is_remote_unconnected_with_peer_v4);
 	RUN_TEST(test_is_remote_unconnected_only_port_set);
 	RUN_TEST(test_is_remote_unconnected_null_empty);
+
+	/* worker — download host whitelist + URL parsing */
+	RUN_TEST(test_download_url_extract_host_basic);
+	RUN_TEST(test_download_url_extract_host_port_stripped);
+	RUN_TEST(test_download_url_extract_host_userinfo_stripped);
+	RUN_TEST(test_download_url_extract_host_lowercased);
+	RUN_TEST(test_download_url_extract_host_rejects_http);
+	RUN_TEST(test_download_url_extract_host_rejects_no_scheme);
+	RUN_TEST(test_download_host_allowed_exact);
+	RUN_TEST(test_download_host_allowed_case_insensitive);
+	RUN_TEST(test_download_host_allowed_no_wildcard);
+	RUN_TEST(test_download_host_allowed_empty_blocks_all);
+	RUN_TEST(test_download_host_allowed_trims_whitespace);
+	RUN_TEST(test_download_host_allowed_rejects_unlisted);
+
+	/* worker — extract path safety */
+	RUN_TEST(test_extract_path_safe_relative);
+	RUN_TEST(test_extract_path_safe_rejects_absolute);
+	RUN_TEST(test_extract_path_safe_rejects_dotdot);
+	RUN_TEST(test_extract_path_safe_rejects_empty_null);
 
 	return tt_summary();
 }

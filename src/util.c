@@ -8,10 +8,13 @@
 #include "util.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -107,6 +110,54 @@ const char *getenv_default(const char *name, const char *fallback)
 {
 	const char *v = getenv(name);
 	return (v && *v) ? v : fallback;
+}
+
+int parse_bool(const char *s, int fallback)
+{
+	if (!s || !*s) return fallback;
+	if (!strcasecmp(s, "1")    || !strcasecmp(s, "true") ||
+	    !strcasecmp(s, "yes")  || !strcasecmp(s, "on")   ||
+	    !strcasecmp(s, "y")    || !strcasecmp(s, "t"))
+		return 1;
+	if (!strcasecmp(s, "0")    || !strcasecmp(s, "false") ||
+	    !strcasecmp(s, "no")   || !strcasecmp(s, "off")   ||
+	    !strcasecmp(s, "n")    || !strcasecmp(s, "f"))
+		return 0;
+	/* Unrecognized — return -1 sentinel; getenv_bool surfaces a warning. */
+	return -1;
+}
+
+int getenv_bool(const char *name, int fallback)
+{
+	const char *v = getenv(name);
+	if (!v || !*v) return fallback;
+	int parsed = parse_bool(v, -1);
+	if (parsed < 0) {
+		fprintf(stderr, "[agent] WARN: env %s=\"%s\" not a recognized boolean (use true/false/1/0/yes/no/on/off); using default %d\n",
+		        name, v, fallback);
+		return fallback;
+	}
+	return parsed;
+}
+
+int getenv_int_or(const char *name, int fallback)
+{
+	const char *v = getenv(name);
+	if (!v || !*v) return fallback;
+	char *end = NULL;
+	errno = 0;
+	long n = strtol(v, &end, 10);
+	if (errno != 0 || end == v || *end != '\0') {
+		fprintf(stderr, "[agent] WARN: env %s=\"%s\" not a valid integer; using default %d\n",
+		        name, v, fallback);
+		return fallback;
+	}
+	if (n < INT_MIN || n > INT_MAX) {
+		fprintf(stderr, "[agent] WARN: env %s=\"%s\" out of int range; using default %d\n",
+		        name, v, fallback);
+		return fallback;
+	}
+	return (int)n;
 }
 
 char *trim_inplace(char *s)
@@ -214,4 +265,70 @@ char *uuid_v4(char *buf, size_t len)
 	         hostname, (int)getpid(),
 	         (long)tv.tv_sec, (long)tv.tv_usec);
 	return buf;
+}
+
+int jitter_seconds(int base_sec, double frac)
+{
+	if (base_sec <= 0) return base_sec;
+	if (frac < 0)      frac = 0;
+	if (frac >= 1.0)   frac = 0.999;
+
+	double u = ((double)rand() / (double)RAND_MAX) * (2.0 * frac) - frac;
+	double v = (double)base_sec * (1.0 + u);
+	return (int)v;
+}
+
+/* ============================================================
+ * close_inherited_fds — fd hygiene for forked children
+ * ============================================================ */
+
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+
+static int sweep_via_proc_self_fd(void)
+{
+	DIR *d = opendir("/proc/self/fd");
+	if (!d) return -1;
+	int dirfd_to_skip = dirfd(d);
+	int saw_any = 0;
+	struct dirent *e;
+	while ((e = readdir(d)) != NULL) {
+		if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+		int fd = atoi(e->d_name);
+		if (fd <= STDERR_FILENO || fd == dirfd_to_skip) continue;
+		(void)close(fd);
+		saw_any = 1;
+	}
+	closedir(d);
+	/*
+	 * /proc may exist but readdir return zero numeric entries (hidepid=2,
+	 * unusual mount, security policy). Treat zero hits as "fall through to
+	 * numeric sweep" — empty success is indistinguishable from real success
+	 * but the numeric sweep is cheap.
+	 */
+	return saw_any ? 0 : -1;
+}
+
+static void sweep_numeric(void)
+{
+	struct rlimit rl;
+	long max_fd = 1024;
+	if (getrlimit(RLIMIT_NOFILE, &rl) == 0 &&
+	    rl.rlim_cur != RLIM_INFINITY) {
+		max_fd = (long)rl.rlim_cur;
+	}
+	if (max_fd > 4096) max_fd = 4096;   /* cap to prevent 1M-syscall storms */
+	for (long fd = STDERR_FILENO + 1; fd < max_fd; fd++)
+		(void)close((int)fd);
+}
+
+void close_inherited_fds(void)
+{
+#if defined(__linux__) && defined(SYS_close_range)
+	if (syscall(SYS_close_range, (unsigned int)3, ~0u, 0u) == 0) return;
+#endif
+	if (sweep_via_proc_self_fd() == 0) return;
+	sweep_numeric();
 }
