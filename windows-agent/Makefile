@@ -105,7 +105,10 @@ vendor-build-openssl:
 	$(MAKE) -C $(OPENSSL_DIR) install_sw
 
 vendor-build-zlib:
-	$(MAKE) -C $(ZLIB_DIR) -f win32/Makefile.gcc CC=$(CC) AR="$(AR) rc" libz.a
+	# zlib win32/Makefile.gcc 가 ARFLAGS=rcs 를 자체 정의함. AR 변수에는
+	# 명령만 전달 (옵션 X) — 그렇지 않으면 `ar rc rcs libz.a ...` 으로
+	# rcs 가 파일명으로 해석되어 실패.
+	$(MAKE) -C $(ZLIB_DIR) -f win32/Makefile.gcc CC=$(CC) AR=$(AR) libz.a
 
 vendor-build-cjson:
 	$(CMAKE) -S $(CJSON_DIR) -B $(CJSON_DIR)/build \
