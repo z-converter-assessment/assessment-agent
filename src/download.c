@@ -41,14 +41,26 @@ static void download_str_tolower(char *s)
 	for (; *s; s++) *s = (char)tolower((unsigned char)*s);
 }
 
+/* 1 = scheme is https://, 0 = http://, -1 = unsupported. */
+static int url_scheme_kind(const char *url)
+{
+	if (!url) return -1;
+	if (strncasecmp(url, "https://", 8) == 0) return 1;
+	if (strncasecmp(url, "http://",  7) == 0) return 0;
+	return -1;
+}
+
+int download_url_is_https(const char *url)
+{
+	return url_scheme_kind(url) == 1;
+}
+
 int download_url_extract_host(const char *url, char *out, size_t out_sz)
 {
 	if (!url || !out || out_sz == 0) return 0;
-	const char *prefix = "https://";
-	size_t plen = strlen(prefix);
-	if (strncasecmp(url, prefix, plen) != 0) return 0;
-
-	const char *p = url + plen;
+	int kind = url_scheme_kind(url);
+	if (kind < 0) return 0;
+	const char *p = url + (kind == 1 ? 8 : 7);
 	/* Skip userinfo if present. */
 	const char *at = strchr(p, '@');
 	const char *slash = strchr(p, '/');
@@ -244,11 +256,17 @@ download_status_t download_package(const char *url,
 	download_status_t rc = DOWNLOAD_OK;
 	long http_code = 0;
 
+	int is_https = download_url_is_https(url);
 	curl_easy_setopt(c, CURLOPT_URL, url);
-	curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR, "https");      /* HTTPS only */
+	/* HTTP allowed (사내망 ZDM 같은 케이스). MITM 위험은 sha256 streaming
+	 * 검증으로 흡수 — portal→agent task.install 메시지가 AMQPS 로 신뢰되는
+	 * 채널이라 정확한 sha256 이 와있다는 가정. */
+	curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR, "https,http");
 	curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 0L);          /* RD2: redirect off */
-	curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 1L);
-	curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 2L);
+	if (is_https) {
+		curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 1L);
+		curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 2L);
+	}
 	curl_easy_setopt(c, CURLOPT_FAILONERROR, 1L);             /* 4xx/5xx → error */
 	curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);                /* don't override SIGPIPE etc. */
 	curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 10L);
