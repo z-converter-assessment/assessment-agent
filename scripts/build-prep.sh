@@ -31,12 +31,17 @@ if command -v apt-get >/dev/null 2>&1; then
 	apt-get install -y -qq $APT_PKGS
 elif command -v dnf >/dev/null 2>&1; then
 	echo "[build-prep] detected dnf — installing: $RPM_PKGS"
+	# perl-IPC-Cmd 등은 EPEL 에 있음. 활성화 시도 후 본 설치.
+	# --skip-broken: manylinux2014 처럼 일부 패키지가 base repo 외에 있는
+	# 환경에서 가용한 것만 설치하고 진행 (perl-IPC-Cmd 가 핵심, 나머지는 옵션)
+	dnf install -y -q epel-release 2>/dev/null || true
 	# shellcheck disable=SC2086
-	dnf install -y -q $RPM_PKGS
+	dnf install -y --skip-broken $RPM_PKGS
 elif command -v yum >/dev/null 2>&1; then
 	echo "[build-prep] detected yum — installing: $RPM_PKGS"
+	yum install -y -q epel-release 2>/dev/null || true
 	# shellcheck disable=SC2086
-	yum install -y -q $RPM_PKGS
+	yum install -y --skip-broken $RPM_PKGS
 else
 	echo "[build-prep] no supported package manager found (apt-get / yum / dnf)" >&2
 	exit 1
