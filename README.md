@@ -93,6 +93,8 @@ AI 기반 Assessment 서비스의 **데이터 수집 에이전트**.
 
 > 통합 운영 가이드: 이 repo 는 **에이전트만** 담당합니다. RabbitMQ 브로커 자체 (server 프로비저닝·토폴로지 부트스트랩) 는 별도 인프라 컴포넌트에서 처리합니다.
 
+> **Docker는 *빌드* 단계 한정**입니다. 운영 서버에서 `install.sh` / `install.ps1` 가 도는 동안 도커는 등장하지 않습니다 (systemd / Windows Service 가 native 호스트 프로세스로 에이전트를 띄움). 도커는 사용자 노트북에서 amd64 Linux 바이너리를 만들 때 manylinux2014 컨테이너로만 쓰입니다.
+
 ---
 
 ## 아키텍처
