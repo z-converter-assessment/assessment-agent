@@ -51,7 +51,7 @@ OPENSSL_TARGET     ?= mingw64
 OPENSSL_CROSS      ?=
 
 CFLAGS += -I$(CJSON_DIR) \
-          -I$(RABBITMQ_C_DIR)/librabbitmq \
+          -I$(RABBITMQ_C_DIR)/include \
           -I$(RABBITMQ_C_DIR)/build/librabbitmq \
           -I$(OPENSSL_DIR)/install/include \
           -I$(ZLIB_DIR) \
