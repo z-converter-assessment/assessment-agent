@@ -110,7 +110,8 @@ vendor-build-zlib:
 vendor-build-cjson:
 	$(CMAKE) -S $(CJSON_DIR) -B $(CJSON_DIR)/build \
 	      -DCMAKE_C_COMPILER=$(CC) \
-	      -DCJSON_BUILD_SHARED_LIBS=OFF -DENABLE_CJSON_TEST=OFF
+	      -DCJSON_BUILD_SHARED_LIBS=OFF -DENABLE_CJSON_TEST=OFF \
+	      -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 	$(CMAKE) --build $(CJSON_DIR)/build --target cjson -- -j$(JOBS)
 
 vendor-build-rabbitmq:
@@ -120,7 +121,8 @@ vendor-build-rabbitmq:
 	      -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF -DBUILD_TOOLS=OFF \
 	      -DENABLE_SSL_SUPPORT=ON \
 	      -DOPENSSL_ROOT_DIR=$(CURDIR)/$(OPENSSL_DIR)/install \
-	      -DOPENSSL_USE_STATIC_LIBS=TRUE
+	      -DOPENSSL_USE_STATIC_LIBS=TRUE \
+	      -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 	$(CMAKE) --build $(RABBITMQ_C_DIR)/build --target rabbitmq-static -- -j$(JOBS)
 
 vendor-clean:

@@ -146,7 +146,8 @@ vendor-build-zlib:
 vendor-build-cjson:
 	cmake -S $(CJSON_DIR) -B $(CJSON_DIR)/build \
 	      -DCJSON_BUILD_SHARED_LIBS=OFF -DENABLE_CJSON_TEST=OFF \
-	      -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+	      -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+	      -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 	cmake --build $(CJSON_DIR)/build --target cjson
 
 vendor-build-rabbitmq:
@@ -156,7 +157,8 @@ vendor-build-rabbitmq:
 	      -DENABLE_SSL_SUPPORT=ON \
 	      -DOPENSSL_ROOT_DIR=$(CURDIR)/$(OPENSSL_DIR)/install \
 	      -DOPENSSL_USE_STATIC_LIBS=TRUE \
-	      -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+	      -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+	      -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 	cmake --build $(RABBITMQ_C_DIR)/build --target rabbitmq-static
 
 vendor-build-curl:
@@ -171,7 +173,8 @@ vendor-build-curl:
 	      -DOPENSSL_USE_STATIC_LIBS=TRUE \
 	      -DZLIB_INCLUDE_DIR=$(CURDIR)/$(ZLIB_DIR) \
 	      -DZLIB_LIBRARY=$(CURDIR)/$(ZLIB_LIB) \
-	      -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+	      -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+	      -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 	cmake --build $(CURL_DIR)/build --target libcurl_static
 
 vendor-build-libarchive:
@@ -183,7 +186,8 @@ vendor-build-libarchive:
 	      -DOPENSSL_USE_STATIC_LIBS=TRUE \
 	      -DZLIB_INCLUDE_DIR=$(CURDIR)/$(ZLIB_DIR) \
 	      -DZLIB_LIBRARY=$(CURDIR)/$(ZLIB_LIB) \
-	      -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+	      -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+	      -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 	cmake --build $(LIBARCHIVE_DIR)/build --target archive_static
 
 vendor-clean:
