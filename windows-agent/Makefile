@@ -110,7 +110,7 @@ vendor-build-zlib:
 vendor-build-cjson:
 	$(CMAKE) -S $(CJSON_DIR) -B $(CJSON_DIR)/build \
 	      -DCMAKE_C_COMPILER=$(CC) \
-	      -DCJSON_BUILD_SHARED_LIBS=OFF -DENABLE_CJSON_TEST=OFF \
+	      -DBUILD_SHARED_LIBS=OFF -DENABLE_CJSON_TEST=OFF \
 	      -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 	$(CMAKE) --build $(CJSON_DIR)/build --target cjson -- -j$(JOBS)
 
