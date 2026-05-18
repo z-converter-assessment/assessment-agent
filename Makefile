@@ -41,7 +41,10 @@ OPENSSL_CRYPTO     := $(OPENSSL_DIR)/install/lib/libcrypto.a
 ZLIB_LIB           := $(ZLIB_DIR)/libz.a
 
 ifeq ($(USE_VENDORED),1)
-  CFLAGS  += -I$(CJSON_DIR) \
+  # -fPIE for PIE executable (matches LDFLAGS -pie). Vendor static libs are
+  # already -fPIC compiled, so the resulting binary is fully position-independent.
+  CFLAGS  += -fPIE \
+             -I$(CJSON_DIR) \
              -I$(RABBITMQ_C_DIR)/include \
              -I$(RABBITMQ_C_DIR)/build/include \
              -I$(CURL_DIR)/include \
