@@ -6,11 +6,11 @@
 # v3 스키마 준수를 검증한다. (~5s)
 #
 # 사용:
-#   make && bash scripts/rabbitmq-up.sh
+#   make && <external broker reachable at $RABBITMQ_HOST>
 #   bash tests/test_schema.sh
 #
 # 큐 가정: server.inventory, server.metrics 가 모두 binding 되어 있어야 함
-# (scripts/rabbitmq-up.sh 가 토폴로지 설정).
+# (외부 broker; topology 부트스트랩은 engine 측에서 수행).
 #
 # 검증 항목:
 #   - inventory : 공통 메타데이터 + v3 신규 필드(services, listen_ports, disks/mounts major)

@@ -6,7 +6,7 @@
 # 서로 다른 hostname을 사용해 서버별 구분이 가능한지 검증한다.
 #
 # 사용:
-#   make && bash scripts/rabbitmq-up.sh
+#   make && <external broker reachable at $RABBITMQ_HOST>
 #   bash tests/run_multi.sh [N]    # 기본 N=10
 #
 # 검증 항목:

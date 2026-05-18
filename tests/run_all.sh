@@ -15,7 +15,7 @@
 #
 # 사용:
 #   make
-#   bash scripts/rabbitmq-up.sh
+#   <external broker reachable at $RABBITMQ_HOST>
 #   DOCKER_CMD="sudo docker" bash tests/run_all.sh
 
 set -eu

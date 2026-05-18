@@ -13,3 +13,13 @@ src/*.o
 
 # Vendored third-party sources (fetched by `make vendor-fetch`)
 /vendor/
+/windows-agent/vendor/
+
+# Build artifact staging area (Linux: assessment-agent-linux-x86_64 + SHA256SUMS).
+# release artifacts ARE meant to be tracked separately when an actual release
+# is cut; the staging dir itself is transient.
+/dist/
+
+# Local Claude Code settings (per-user, not shared)
+.claude/settings.local.json
+.claude/settings.json.local
