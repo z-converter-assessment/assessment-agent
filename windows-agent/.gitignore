@@ -1,0 +1,5 @@
+vendor/
+*.o
+*.exe
+*.exe.manifest
+build-deps.txt

@@ -6,7 +6,7 @@
 # 나머지 에이전트가 계속 정상 발행하는지 확인한다.
 #
 # 사용:
-#   make && bash scripts/rabbitmq-up.sh
+#   make && <external broker reachable at $RABBITMQ_HOST>
 #   bash tests/fault_agent.sh [N]    # 기본 N=3
 #
 # 검증 항목:

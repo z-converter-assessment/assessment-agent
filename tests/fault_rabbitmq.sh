@@ -6,7 +6,7 @@
 # 에이전트가 백오프 재시도를 거쳐 자력으로 재연결·재발행하는지 확인한다.
 #
 # 사용:
-#   make && bash scripts/rabbitmq-up.sh
+#   make && <external broker reachable at $RABBITMQ_HOST>
 #   DOCKER_CMD="sudo docker" bash tests/fault_rabbitmq.sh
 #
 # 검증 항목:

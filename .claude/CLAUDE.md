@@ -73,17 +73,22 @@ tests/
   fault_rabbitmq.sh   # broker restart resilience
   run_all.sh
 scripts/
-  rabbitmq-up.sh      # local dev broker (Docker)
-  rabbitmq-down.sh
+  image-prep.sh       # golden-image cleanup — clears /etc/machine-id before snapshot
 deploy/
+  install.sh          # POSIX-sh single-shot installer (idempotent)
+  SUPPORTED_OS.md     # OS matrix (RHEL/CentOS 7+, Ubuntu 18.04+, Debian 10+, SLES 12+, etc.)
+  lib/
+    detect-os.sh      # /etc/os-release matcher
+    env-setup.sh      # idempotent env populator (prompts only for empty keys)
   systemd/
     assessment-agent.service  # systemd unit with User= and TimeoutStopSec= aligned with worker drain
+    agent.env.example
+windows-agent/         # Phase 1 Windows agent (MinGW + Win32 collectors, no worker)
 vendor/                # gitignored; populated by `make vendor-fetch`
-  cJSON/               # static lib build target
-  rabbitmq-c/          # static lib build target
-  curl/                # static lib build target (worker download)
-  libarchive/          # static lib build target (worker extract)
+  cJSON/, rabbitmq-c/, curl/, libarchive/, openssl/, zlib/   # all statically linked
 ```
+
+> Repo scope: **agent only**. RabbitMQ broker provisioning (server bring-up, vhost/queue declare, user permission setup) lives outside this repo. The agent assumes an externally-managed broker reachable at `RABBITMQ_HOST`.
 
 ### Core Principles
 
@@ -222,14 +227,7 @@ The agent ships with two credentials: `agent-publisher` (collector connection) a
 
 ### Local Development Broker
 
-```bash
-sudo docker run -d --name rabbitmq \
-  -p 5672:5672 -p 15672:15672 \
-  -e RABBITMQ_DEFAULT_USER=admin -e RABBITMQ_DEFAULT_PASS=admin \
-  rabbitmq:3-management
-```
-
-Local dev uses plain AMQP and the default vhost. Production must not.
+This repo does **not** bundle a broker. To exercise the agent locally, the operator must provide an externally-managed RabbitMQ reachable at `RABBITMQ_HOST` (plain 5672 + default vhost is acceptable for dev; production must use AMQPS 5671 + `/assessment` vhost + role-scoped credentials).
 
 ---
 
