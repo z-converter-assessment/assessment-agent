@@ -7,6 +7,11 @@
 
 ## 변경 이력
 
+- **v3.3 (2026-05-18)**
+  - `inventory.mac_addresses[]` 추가 — 클라우드 이미지 클론으로 `machine_id` 가 중복되는 케이스를 엔진이 탐지하도록 보강 신호 제공. 같은 `machine_id` 로 인입되는 메시지의 `mac_addresses` 가 직전 inventory 와 다르면 "clone collision" 으로 분리 처리할 것.
+  - 필터: loopback / docker / br-* / veth* / virbr* / 비-Ethernet(type≠ARPHRD_ETHER) 제외, all-zero MAC 제외, 정렬 + dedup.
+  - 윈도우 에이전트 (Phase 1) 동시 합류 — 동일 페이로드 v3.3 emit. Windows 한정: `metrics.load_*m` 항상 null, `cpu_stat.{nice,iowait,irq,softirq,steal}` 항상 0, `listen_ports[].uid` 항상 null. 다른 모든 필드는 Linux 와 동일.
+  - 윈도우용 image-prep 가이드 추가 — Sysprep `/generalize` 또는 `scripts\image-prep.ps1` 로 MachineGuid 재발급 후 골든 이미지화 권장 (Linux 의 `truncate -s 0 /etc/machine-id` 와 동일 목적).
 - **v3.2 (2026-05-11)**
   - **Worker (task.install) 도입**. agent가 portal로부터 `task.install` 메시지를 받아 HTTPS tar 다운로드 → 압축 해제 → user-level `install.sh` 실행 → `task.result` 회신
   - 신규 exchange `assessment.tasks` (direct) + 머신별 큐 `agent.tasks.<machine_id>` + DLX `assessment.tasks.dlx` → `assessment.tasks.dead`
@@ -108,7 +113,8 @@ DLX(`assessment.dlx`)는 컨슈머 측 NAK / TTL 만료 / `x-max-length` 초과 
 | `mounts` | array | `/proc/self/mountinfo` + `statfs(2)` | 마운트별 디스크 사용량 (raw bytes). 가상 fstype 제외 + `(major:minor)`로 bind mount dedup |
 | `services` | array\|null | `systemctl list-units --type=service --state=running --no-pager --plain --no-legend` | 활성 systemd 서비스 unit. systemd 미존재(systemctl 부재·exit≠0)는 **`null` 발행** — 빈 배열(서비스 0개)과 명시적으로 구분. unit 이름은 OS별로 다르며 정규화는 엔진 책임 |
 | `listen_ports` | array | `/proc/net/tcp{,6}` (state=`0A` LISTEN) + `/proc/net/udp{,6}` (no peer) + `/proc/<pid>/fd/*` 소켓 inode 매칭 | TCP listen + UDP 비-connected 소켓. `pid`/`comm`은 권한·프로세스 종료로 미해상 시 `null` |
-| `ip_internal` | array | `getifaddrs(3)` | 내부 IP 주소 목록 (loopback 제외) |
+| `ip_internal` | array | `getifaddrs(3)` (Linux) / `GetAdaptersAddresses` (Windows) | 내부 IP 주소 목록 (loopback 제외) |
+| `mac_addresses` | array | `/sys/class/net/<iface>/address` (Linux) / `IP_ADAPTER_ADDRESSES.PhysicalAddress` (Windows) | 정렬 + dedup된 lowercase MAC 목록. **`machine_id` 와 함께 클론 충돌 감지** 용도. loopback / docker / br-* / veth* / virbr* / 비-Ethernet / all-zero 제외. 빈 배열 가능 |
 | `ip_external` | array\|null | 클라우드 메타데이터 API | 외부 IP. 메타데이터 미접근 시 `null` |
 
 > v3.1부터 `boot_time`은 inventory 본문이 아니라 **공통 메타데이터**에 실린다 (모든 메시지에 동일하게).
@@ -179,8 +185,9 @@ DLX(`assessment.dlx`)는 컨슈머 측 NAK / TTL 만료 / `x-max-length` 초과 
     { "proto": "udp",  "addr": "0.0.0.0", "port": 53,   "uid": 101, "pid": 612,  "comm": "systemd-resolve" },
     { "proto": "udp",  "addr": "0.0.0.0", "port": 123,  "uid": 0,   "pid": 555,  "comm": "ntpd" }
   ],
-  "ip_internal": ["10.0.1.15", "172.16.0.3"],
-  "ip_external": ["54.123.45.67"]
+  "ip_internal":   ["10.0.1.15", "172.16.0.3"],
+  "mac_addresses": ["02:42:ac:11:00:03", "fa:16:3e:7a:1b:5c"],
+  "ip_external":   ["54.123.45.67"]
 }
 ```
 

@@ -962,6 +962,100 @@ static cJSON *collect_internal_ips(void)
 }
 
 /**
+ * @brief Collect MAC addresses of physical (Ethernet) interfaces.
+ *
+ * Source: /sys/class/net/<iface>/address (sysfs — universally available on
+ * supported kernels). Used by the engine together with `machine_id` to detect
+ * image-clone collisions (same machine_id but different MAC set).
+ *
+ * Filter policy (matches docs/payload-schema.md "필터링 정책"):
+ *   - skip lo
+ *   - skip docker bridge / veth / virbr (engine doesn't need them, and they
+ *     are unstable across reboots — would generate false clone alerts)
+ *   - skip non-Ethernet (type != ARPHRD_ETHER = 1) — tunnels, infiniband, etc.
+ *   - skip all-zero MAC (uninitialized / hidden)
+ *   - sort + dedup for stable comparison on the engine side
+ */
+static int mac_str_cmp(const void *a, const void *b)
+{
+	return strcmp(*(const char * const *)a, *(const char * const *)b);
+}
+
+static cJSON *collect_mac_addresses(void)
+{
+	cJSON *arr = cJSON_CreateArray();
+	DIR *d = opendir("/sys/class/net");
+	if (!d)
+		return arr;
+
+	enum { MAC_CAP = 64 };
+	char *macs[MAC_CAP];
+	int count = 0;
+
+	struct dirent *e;
+	while ((e = readdir(d)) != NULL) {
+		if (e->d_name[0] == '.')                       continue;
+		if (strcmp(e->d_name, "lo") == 0)              continue;
+		if (strncmp(e->d_name, "docker", 6) == 0)      continue;
+		if (strncmp(e->d_name, "br-", 3) == 0)         continue;
+		if (strncmp(e->d_name, "veth", 4) == 0)        continue;
+		if (strncmp(e->d_name, "virbr", 5) == 0)       continue;
+
+		char type_path[256];
+		snprintf(type_path, sizeof type_path,
+		         "/sys/class/net/%s/type", e->d_name);
+		char *type_str = read_file_all(type_path);
+		if (!type_str)
+			continue;
+		int iftype = atoi(type_str);
+		free(type_str);
+		if (iftype != 1)   /* ARPHRD_ETHER only */
+			continue;
+
+		char addr_path[256];
+		snprintf(addr_path, sizeof addr_path,
+		         "/sys/class/net/%s/address", e->d_name);
+		char *addr = read_file_all(addr_path);
+		if (!addr)
+			continue;
+		trim_inplace(addr);
+
+		/* Normalize to lowercase + reject all-zero (uninitialized). */
+		int nonzero = 0;
+		for (char *p = addr; *p; p++) {
+			*p = (char)tolower((unsigned char)*p);
+			if (*p != '0' && *p != ':')
+				nonzero = 1;
+		}
+		if (!nonzero || strlen(addr) != 17) {
+			free(addr);
+			continue;
+		}
+
+		int dup = 0;
+		for (int i = 0; i < count; i++) {
+			if (strcmp(macs[i], addr) == 0) {
+				dup = 1;
+				break;
+			}
+		}
+		if (!dup && count < MAC_CAP) {
+			macs[count++] = addr;   /* take ownership */
+		} else {
+			free(addr);
+		}
+	}
+	closedir(d);
+
+	qsort(macs, count, sizeof(char *), mac_str_cmp);
+	for (int i = 0; i < count; i++) {
+		cJSON_AddItemToArray(arr, cJSON_CreateString(macs[i]));
+		free(macs[i]);
+	}
+	return arr;
+}
+
+/**
  * @brief Resolve external IP via env override → cloud metadata.
  *
  * @return cJSON array (empty allowed) or null literal if both fail.
@@ -1372,7 +1466,8 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 	/* services may be null literal by design (non-systemd host). */
 	cJSON_AddItemToObject(root, "services",     collect_services());
 	cJSON_AddItemToObject(root, "listen_ports", or_empty_array(collect_listen_ports()));
-	cJSON_AddItemToObject(root, "ip_internal",  or_empty_array(collect_internal_ips()));
+	cJSON_AddItemToObject(root, "ip_internal",   or_empty_array(collect_internal_ips()));
+	cJSON_AddItemToObject(root, "mac_addresses", or_empty_array(collect_mac_addresses()));
 	/* ip_external may be null literal by design (cloud metadata unreachable). */
 	cJSON_AddItemToObject(root, "ip_external", collect_external_ip());
 
