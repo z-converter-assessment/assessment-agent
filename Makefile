@@ -98,6 +98,19 @@ test-unit: $(TEST_BIN)
 #   make vendor-build         # configure + compile static libs (cmake required)
 #   make USE_VENDORED=1       # build the agent against vendored static libs
 #
+# Build host prerequisites (manylinux2014 base lacks several of these):
+#   gcc 10.x, make, cmake, git
+#   Perl + IPC::Cmd module + Data::Dumper + Test::Simple
+#     (OpenSSL 3.0+ Configure REQUIRES these — on a fresh manylinux2014
+#      container, install via: yum install -y perl-IPC-Cmd perl-Data-Dumper
+#                                              perl-Test-Simple perl-Pod-Html
+#                                              perl-Module-Load-Conditional)
+#
+# Note: build the release artifact on **native amd64 Linux**. ARM Macs
+# running the manylinux2014 image under Rosetta/QEMU work but are ~10x
+# slower and produce emulated binaries that should not be trusted as a
+# release until reproduced on native amd64 (CI / build host).
+#
 # Build order matters: OpenSSL + zlib first (curl/libarchive/rabbitmq-c link
 # against them). cmake projects are pointed at the vendored OpenSSL via
 # OPENSSL_ROOT_DIR + OPENSSL_USE_STATIC_LIBS so they don't pick up the host
