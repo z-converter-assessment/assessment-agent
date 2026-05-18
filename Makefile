@@ -43,7 +43,7 @@ ZLIB_LIB           := $(ZLIB_DIR)/libz.a
 ifeq ($(USE_VENDORED),1)
   CFLAGS  += -I$(CJSON_DIR) \
              -I$(RABBITMQ_C_DIR)/include \
-             -I$(RABBITMQ_C_DIR)/build/librabbitmq \
+             -I$(RABBITMQ_C_DIR)/build/include \
              -I$(CURL_DIR)/include \
              -I$(LIBARCHIVE_DIR)/libarchive \
              -I$(OPENSSL_DIR)/install/include \
