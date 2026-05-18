@@ -10,7 +10,7 @@
 #ifndef ASSESSMENT_AGENT_COLLECT_H
 #define ASSESSMENT_AGENT_COLLECT_H
 
-#include <cjson/cJSON.h>
+#include <cJSON.h>
 
 /**
  * @brief Resolve the immutable server identifier.

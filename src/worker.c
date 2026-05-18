@@ -32,7 +32,7 @@
 #include "exec.h"
 #include "util.h"
 
-#include <cjson/cJSON.h>
+#include <cJSON.h>
 
 #include <ctype.h>
 #include <dirent.h>

@@ -30,7 +30,7 @@
 #include "util.h"
 #include "worker.h"
 
-#include <cjson/cJSON.h>
+#include <cJSON.h>
 
 #include <signal.h>
 #include <stdio.h>
