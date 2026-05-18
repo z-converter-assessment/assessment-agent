@@ -118,8 +118,12 @@ vendor-build-cjson:
 	$(CMAKE) --build $(CJSON_DIR)/build --target cjson -- -j$(JOBS)
 
 vendor-build-rabbitmq:
+	# GCC 14+ (MSYS2 mingw64 최신) 가 -Wincompatible-pointer-types 를 error 로
+	# promote — rabbitmq-c v0.15.0 amqp_socket.c:309 의 ioctlsocket(int*) ↔
+	# Windows winsock2.h 의 u_long* 미스매치를 거부. upstream fix 전까지 demote.
 	$(CMAKE) -S $(RABBITMQ_C_DIR) -B $(RABBITMQ_C_DIR)/build \
 	      -DCMAKE_C_COMPILER=$(CC) \
+	      -DCMAKE_C_FLAGS="-Wno-error=incompatible-pointer-types" \
 	      -DBUILD_SHARED_LIBS=OFF -DBUILD_STATIC_LIBS=ON \
 	      -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF -DBUILD_TOOLS=OFF \
 	      -DENABLE_SSL_SUPPORT=ON \
