@@ -27,7 +27,7 @@ AI 기반 Assessment 서비스의 **데이터 수집 에이전트**.
 - **언어**: C
 - **AMQP 클라이언트**: [rabbitmq-c](https://github.com/alanxz/rabbitmq-c) (librabbitmq) + OpenSSL
 - **JSON 직렬화**: [cJSON](https://github.com/DaveGamble/cJSON)
-- **메시지 브로커**: RabbitMQ 3 (Docker 개발용 / 운영 시 내부망 브로커, AMQPS 5671)
+- **메시지 브로커**: RabbitMQ 3 (외부에서 운영, 내부망 AMQPS 5671). **본 repo는 브로커 자체를 프로비저닝하지 않음** — 에이전트가 접속할 브로커는 별도 운영 단계에서 준비
 - **데이터 수집**: `/proc`, `/sys`, syscall 기반. 외부 명령은 `/proc`만으로 어려운 항목(`lsblk`, `lvs`, `ethtool` 등)에 한해 사용
 - **네트워크 전제**: 내부망. Agent → Broker AMQPS-only
 
@@ -47,28 +47,51 @@ AI 기반 Assessment 서비스의 **데이터 수집 에이전트**.
 
 ```
 .
-├── src/
-│   ├── main.c          # 엔트리포인트, 환경변수 파싱, 수집·발행 루프
-│   ├── collect.c/.h    # /proc, /sys, syscall 기반 수집기
-│   ├── publish.c/.h    # rabbitmq-c 연결 (TLS 포함) 및 basic_publish
-│   └── util.c/.h       # 환경변수 로더, 문자열 헬퍼
-├── include/            # 헤더 파일
+├── src/                    # Linux C 소스
+│   ├── main.c              # 엔트리포인트, 환경변수 파싱, 수집·발행 루프 + 워커 디스패치
+│   ├── collect.c/.h        # /proc, /sys, syscall 기반 수집기 (mac_addresses[] 포함)
+│   ├── publish.c/.h        # rabbitmq-c 연결 (TLS 포함) + worker용 long-lived conn
+│   ├── worker.c/.h         # task.install 컨슈머 상태기계
+│   ├── download.c/.h       # libcurl HTTPS + sha256 스트리밍
+│   ├── extract.c/.h        # libarchive tar (entry-type 화이트리스트)
+│   ├── exec.c/.h           # fork + execve install.sh (clearenv + setrlimit + setsid)
+│   └── util.c/.h           # 환경변수 로더, 문자열·시간·UUID 헬퍼
+├── include/                # 헤더
 ├── docs/
-│   └── payload-schema.md   # 메시지 스키마 (engine과의 contract)
+│   ├── payload-schema.md   # 메시지 스키마 (engine·windows-agent 공용 계약)
+│   ├── worker-task-design.md
+│   └── inventory-refresh-and-reset-detection.md
+├── deploy/                 # 배포 (server-side: install.sh 한 방)
+│   ├── install.sh          # 메인 설치 진입점 (POSIX sh)
+│   ├── SUPPORTED_OS.md     # 지원 OS 매트릭스
+│   ├── lib/
+│   │   ├── detect-os.sh    # /etc/os-release 매칭
+│   │   └── env-setup.sh    # 멱등 env 채우기 (빈 키만 prompt)
+│   └── systemd/
+│       ├── assessment-agent.service
+│       └── agent.env.example
+├── scripts/
+│   └── image-prep.sh       # 골든 이미지 sealing 전 machine-id 리셋
 ├── tests/
 │   ├── lib.sh
 │   ├── test_schema.sh      # 스키마 검증 (smoke test)
 │   ├── run_multi.sh        # N개 에이전트 병렬 발행
 │   ├── fault_agent.sh      # 에이전트 강제 종료 복원력
-│   ├── fault_rabbitmq.sh   # 브로커 재시작 복원력
+│   ├── fault_rabbitmq.sh   # 브로커 재시작 복원력 (외부 브로커 가정)
 │   └── run_all.sh
-├── scripts/
-│   ├── rabbitmq-up.sh
-│   └── rabbitmq-down.sh
+├── windows-agent/          # Windows 에이전트 (Phase 1 — 수집만)
+│   ├── Makefile            # MinGW-w64 + 정적 vendor 빌드
+│   ├── src/, include/      # Win32 API 기반 수집기 + SCM dispatcher
+│   ├── deploy/             # install.ps1, env-setup.ps1, agent.env.example
+│   └── scripts/image-prep.ps1
+├── dist/                   # release 산출물 (gitignored)
+├── vendor/                 # 정적 라이브러리 소스 (gitignored)
 ├── Makefile
 ├── .env.example
 └── README.md
 ```
+
+> 통합 운영 가이드: 이 repo 는 **에이전트만** 담당합니다. RabbitMQ 브로커 자체 (server 프로비저닝·토폴로지 부트스트랩) 는 별도 인프라 컴포넌트에서 처리합니다.
 
 ---
 
@@ -182,32 +205,60 @@ make
 # 결과: ./assessment-agent 바이너리 생성
 ```
 
-### Vendored 정적 빌드 (선택)
+### Vendored 정적 빌드 (release 경로)
 
-운영 호스트에 `librabbitmq-dev` / `libcjson-dev`를 깔지 않고 단일 바이너리로 배포하려는 경우.
+운영 호스트에 어떤 dev 패키지도 깔지 않고 단일 바이너리로 배포하는 경로. **`make verify` 가 manylinux2014 ABI 컴플라이언스 (glibc 2.17 / 화이트리스트된 동적 의존성 6개 / 금지 syscall 0) 를 강제**합니다.
 
 ```bash
-make vendor-fetch    # cJSON, rabbitmq-c 소스를 vendor/ 아래로 git clone (1회)
-make vendor-build    # cmake로 정적 라이브러리 빌드
-make USE_VENDORED=1  # 정적 라이브러리 링크하여 에이전트 빌드
+# manylinux2014 컨테이너 안에서 빌드 (CentOS 7 / glibc 2.17 baseline)
+docker run --rm -v $(pwd):/src -w /src \
+    quay.io/pypa/manylinux2014_x86_64 \
+    bash -lc 'make vendor-fetch && make vendor-build && make USE_VENDORED=1 release'
+
+# 결과: dist/assessment-agent-linux-x86_64 + dist/SHA256SUMS
 ```
 
-`vendor/`는 `.gitignore`에 있어 커밋되지 않습니다. 정리는 `make vendor-clean`. OpenSSL은 동적 링크이므로 운영 호스트에 `libssl` 런타임이 필요합니다.
+`make release` 는 자동으로 `make verify` 를 호출하므로, GLIBC_2.18+ 심볼이 하나라도 들어가면 빌드가 실패합니다.
+
+정적 vendor 라이브러리 (Makefile에 버전 핀):
+- cJSON `v1.7.18`, rabbitmq-c `v0.15.0`, libcurl `8.10.1`, libarchive `v3.7.7`, OpenSSL `3.0.15`, zlib `v1.3.1`
+
+`vendor/` 와 `dist/` 모두 `.gitignore` 됩니다. 정리는 `make vendor-clean`.
+
+### 동적 의존성 화이트리스트 (`make verify` 가 강제)
+
+런타임에 동적 링크 허용되는 라이브러리는 다음 6개 + linux-vdso + ld-linux 만:
+- `libc`, `libpthread`, `libdl`, `libm`, `libresolv`, `librt`
+
+OpenSSL/zlib/libcurl/cJSON/rabbitmq-c/libarchive 는 정적 링크되어 ldd 출력에 나오지 않아야 합니다.
 
 ---
 
 ## 실행
 
-### 로컬 개발 RabbitMQ 구동
+### 운영 배포 (server 측, 한 방)
+
+빌드 머신에서 만든 `dist/assessment-agent-linux-x86_64` 를 git pull 로 서버로 가져온 후:
 
 ```bash
-sudo docker run -d --name rabbitmq \
-  -p 5672:5672 -p 15672:15672 \
-  -e RABBITMQ_DEFAULT_USER=admin -e RABBITMQ_DEFAULT_PASS=admin \
-  rabbitmq:3-management
+sudo ./deploy/install.sh
 ```
 
-> 로컬 dev는 평문 5672 + default vhost. 운영기는 AMQPS 5671 + `/assessment` vhost + 역할별 user를 사용합니다.
+`install.sh` 가 자동으로:
+1. OS 매칭 (지원 매트릭스 = `deploy/SUPPORTED_OS.md`)
+2. SHA256 검증 (`dist/SHA256SUMS`)
+3. `assessment-agent` user/group 생성
+4. 바이너리 + systemd unit 배치
+5. `deploy/lib/env-setup.sh` 호출 — `agent.env` 빈 키만 대화형 prompt (시크릿은 `agent.env.local` 에 0600)
+6. `systemctl enable --now`
+
+재실행 가능 (idempotent) — 이미 채워진 env 키는 다시 묻지 않습니다.
+
+골든 VM 이미지 생성 시: `sudo IMAGE_PREP=1 ./deploy/install.sh` 로 service 만 enable (start 안 함) → `sudo ./scripts/image-prep.sh` 로 `/etc/machine-id` 클리어 → 스냅샷.
+
+### 로컬 개발 (외부 브로커 필요)
+
+이 repo 는 브로커를 프로비저닝하지 않습니다. 로컬에서 에이전트를 돌려보려면 다른 곳에서 RabbitMQ 인스턴스를 띄우고 `RABBITMQ_HOST`/`PORT`/`USER`/`PASS` 환경변수로 가리키세요.
 
 ### 에이전트 실행
 
