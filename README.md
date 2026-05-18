@@ -209,14 +209,30 @@ make
 
 운영 호스트에 어떤 dev 패키지도 깔지 않고 단일 바이너리로 배포하는 경로. **`make verify` 가 manylinux2014 ABI 컴플라이언스 (glibc 2.17 / 화이트리스트된 동적 의존성 6개 / 금지 syscall 0) 를 강제**합니다.
 
-```bash
-# manylinux2014 컨테이너 안에서 빌드 (CentOS 7 / glibc 2.17 baseline)
-docker run --rm -v $(pwd):/src -w /src \
-    quay.io/pypa/manylinux2014_x86_64 \
-    bash -lc 'make vendor-fetch && make vendor-build && make USE_VENDORED=1 release'
+#### 방법 1: 컨테이너 빌드 (권장 — host에 추가 설치 0)
 
-# 결과: dist/assessment-agent-linux-x86_64 + dist/SHA256SUMS
+```bash
+./scripts/build-linux.sh
 ```
+
+이 스크립트가 자동으로:
+1. Docker daemon 점검
+2. `manylinux2014_x86_64` 컨테이너 안에서 `scripts/build-prep.sh` 호출 → yum 으로 perl-IPC-Cmd 등 설치
+3. `make vendor-fetch && make vendor-build && make USE_VENDORED=1 release`
+4. `dist/` 와 `vendor/` 를 호스트 사용자로 chown
+
+호스트는 Docker 만 있으면 됩니다 (macOS / Linux 무관). 결과: `dist/assessment-agent-linux-x86_64` + `dist/SHA256SUMS`.
+
+> Apple Silicon (ARM) 에서는 amd64 이미지가 emulation 으로 돌아 ~10x 느립니다. **release 산출물은 native amd64 build host (CI / EC2 / VM)** 에서 만드세요.
+
+#### 방법 2: native amd64 Linux 빌드
+
+```bash
+sudo bash scripts/build-prep.sh   # apt 또는 yum/dnf 자동 감지, 의존성 설치
+make vendor-fetch && make vendor-build && make USE_VENDORED=1 release
+```
+
+`build-prep.sh` 지원 OS: Ubuntu / Debian (apt), RHEL / CentOS / Rocky / AlmaLinux / Oracle / Amazon Linux (yum 또는 dnf).
 
 `make release` 는 자동으로 `make verify` 를 호출하므로, GLIBC_2.18+ 심볼이 하나라도 들어가면 빌드가 실패합니다.
 
