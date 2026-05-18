@@ -19,29 +19,44 @@ if [ "$(id -u)" -ne 0 ]; then
 	exit 1
 fi
 
-# Package lists — kept tight (only what vendor-build actually needs)
-APT_PKGS='build-essential cmake git pkg-config perl libipc-cmd-perl ca-certificates'
+# Package lists — kept tight (only what vendor-build actually needs).
+# Some packages (e.g. perl-Pod-Html, perl-Module-Load-Conditional) ship as
+# core perl modules on certain distros (no separate package) and as
+# stand-alone packages on others. Use a try-skip loop so missing names
+# don't abort the whole install — the OpenSSL Configure step would error
+# loudly anyway if a TRULY required module is missing.
+APT_PKGS='build-essential cmake git pkg-config perl ca-certificates'
 RPM_PKGS='gcc make cmake git pkgconfig perl perl-IPC-Cmd perl-Data-Dumper perl-Test-Simple perl-Pod-Html perl-Module-Load-Conditional ca-certificates'
 
+try_install_one() {
+	mgr=$1
+	pkg=$2
+	if $mgr install -y -q "$pkg" >/dev/null 2>&1; then
+		echo "  + $pkg"
+	else
+		echo "  - $pkg (skipped — not available in configured repos)"
+	fi
+}
+
 if command -v apt-get >/dev/null 2>&1; then
-	echo "[build-prep] detected apt — installing: $APT_PKGS"
+	echo "[build-prep] detected apt — installing per-package (skip missing)"
 	export DEBIAN_FRONTEND=noninteractive
 	apt-get update -qq
-	# shellcheck disable=SC2086
-	apt-get install -y -qq $APT_PKGS
+	for pkg in $APT_PKGS; do
+		try_install_one apt-get "$pkg"
+	done
 elif command -v dnf >/dev/null 2>&1; then
-	echo "[build-prep] detected dnf — installing: $RPM_PKGS"
-	# perl-IPC-Cmd 등은 EPEL 에 있음. 활성화 시도 후 본 설치.
-	# --skip-broken: manylinux2014 처럼 일부 패키지가 base repo 외에 있는
-	# 환경에서 가용한 것만 설치하고 진행 (perl-IPC-Cmd 가 핵심, 나머지는 옵션)
-	dnf install -y -q epel-release 2>/dev/null || true
-	# shellcheck disable=SC2086
-	dnf install -y --skip-broken $RPM_PKGS
+	echo "[build-prep] detected dnf — installing per-package (skip missing)"
+	dnf install -y -q epel-release >/dev/null 2>&1 || true
+	for pkg in $RPM_PKGS; do
+		try_install_one dnf "$pkg"
+	done
 elif command -v yum >/dev/null 2>&1; then
-	echo "[build-prep] detected yum — installing: $RPM_PKGS"
-	yum install -y -q epel-release 2>/dev/null || true
-	# shellcheck disable=SC2086
-	yum install -y --skip-broken $RPM_PKGS
+	echo "[build-prep] detected yum — installing per-package (skip missing)"
+	yum install -y -q epel-release >/dev/null 2>&1 || true
+	for pkg in $RPM_PKGS; do
+		try_install_one yum "$pkg"
+	done
 else
 	echo "[build-prep] no supported package manager found (apt-get / yum / dnf)" >&2
 	exit 1
