@@ -235,7 +235,8 @@ static long monotonic_ms_since(ULONGLONG t0)
 	return (long)(GetTickCount64() - t0);
 }
 
-exec_status_t exec_install(exec_install_type_t  type,
+exec_status_t exec_install(void                *job_handle_in,
+                           exec_install_type_t  type,
                            const char          *work_dir,
                            const char          *target_file,
                            const char         **argv_extra,
@@ -261,9 +262,30 @@ exec_status_t exec_install(exec_install_type_t  type,
 
 	if (active_proc_limit <= 0) active_proc_limit = 32;
 
-	/* 1. Job Object */
-	HANDLE job = create_job(mem_limit_mb, active_proc_limit);
-	if (!job) return EXEC_ERR_INTERNAL;
+	/* 1. Job Object — caller (worker.c) 가 미리 만들어 전달했으면 그걸 사용 (외부에서
+	 *    TerminateJobObject 로 강제 종료 가능). 없으면 자체 생성 + 자체 close. */
+	HANDLE job = (HANDLE)job_handle_in;
+	int    owns_job = 0;
+	if (!job) {
+		job = create_job(mem_limit_mb, active_proc_limit);
+		if (!job) return EXEC_ERR_INTERNAL;
+		owns_job = 1;
+	} else {
+		/* caller-provided job: limit 정책 적용 (idempotent). */
+		JOBOBJECT_EXTENDED_LIMIT_INFORMATION info;
+		memset(&info, 0, sizeof info);
+		info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+		if (mem_limit_mb > 0) {
+			info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+			info.ProcessMemoryLimit = (SIZE_T)mem_limit_mb * 1024ULL * 1024ULL;
+		}
+		if (active_proc_limit > 0) {
+			info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+			info.BasicLimitInformation.ActiveProcessLimit = (DWORD)active_proc_limit;
+		}
+		(void)SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+		                              &info, sizeof info);
+	}
 
 	/* 2. Pipes (inheritable) + stdin = NUL */
 	SECURITY_ATTRIBUTES sa;
@@ -280,7 +302,7 @@ exec_status_t exec_install(exec_install_type_t  type,
 		if (out_w) CloseHandle(out_w);
 		if (err_r) CloseHandle(err_r);
 		if (err_w) CloseHandle(err_w);
-		CloseHandle(job);
+		if (owns_job) CloseHandle(job);
 		return EXEC_ERR_INTERNAL;
 	}
 	/* 부모 측 핸들은 자식이 inherit 안 하도록 마킹. */
@@ -292,7 +314,7 @@ exec_status_t exec_install(exec_install_type_t  type,
 	if (nul == INVALID_HANDLE_VALUE) {
 		CloseHandle(out_r); CloseHandle(out_w);
 		CloseHandle(err_r); CloseHandle(err_w);
-		CloseHandle(job);
+		if (owns_job) CloseHandle(job);
 		return EXEC_ERR_INTERNAL;
 	}
 
@@ -302,7 +324,7 @@ exec_status_t exec_install(exec_install_type_t  type,
 		CloseHandle(nul);
 		CloseHandle(out_r); CloseHandle(out_w);
 		CloseHandle(err_r); CloseHandle(err_w);
-		CloseHandle(job);
+		if (owns_job) CloseHandle(job);
 		return EXEC_ERR_INTERNAL;
 	}
 	char *env_block = build_env_block(task_id, machine_id);
@@ -310,7 +332,7 @@ exec_status_t exec_install(exec_install_type_t  type,
 		CloseHandle(nul);
 		CloseHandle(out_r); CloseHandle(out_w);
 		CloseHandle(err_r); CloseHandle(err_w);
-		CloseHandle(job);
+		if (owns_job) CloseHandle(job);
 		return EXEC_ERR_INTERNAL;
 	}
 
@@ -340,7 +362,7 @@ exec_status_t exec_install(exec_install_type_t  type,
 	if (!ok) {
 		CloseHandle(out_r);
 		CloseHandle(err_r);
-		CloseHandle(job);
+		if (owns_job) CloseHandle(job);
 		return EXEC_ERR_INTERNAL;
 	}
 
@@ -351,7 +373,7 @@ exec_status_t exec_install(exec_install_type_t  type,
 		CloseHandle(pi.hProcess);
 		CloseHandle(out_r);
 		CloseHandle(err_r);
-		CloseHandle(job);
+		if (owns_job) CloseHandle(job);
 		return EXEC_ERR_INTERNAL;
 	}
 	ResumeThread(pi.hThread);
@@ -406,7 +428,7 @@ exec_status_t exec_install(exec_install_type_t  type,
 
 			CloseHandle(pi.hThread);
 			CloseHandle(pi.hProcess);
-			CloseHandle(job);
+			if (owns_job) CloseHandle(job);
 
 			/* msi: 0 / 3010(reboot required) 둘 다 success */
 			if (type == EXEC_INSTALL_TYPE_MSI) {

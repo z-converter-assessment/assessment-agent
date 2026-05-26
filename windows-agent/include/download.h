@@ -29,15 +29,27 @@ typedef enum {
 } download_status_t;
 
 /**
- * @brief Download @p url → @p out_path, verifying sha256 + size + host.
+ * @brief Cancellation check callback. libcurl progress 콜백에서 주기적으로 호출.
+ *        비-0 반환 시 libcurl 이 transfer 즉시 중단 → DOWNLOAD_ERR_DOWNLOAD_FAILED 반환.
+ *        NULL 전달 시 cancellation 불가 (다운로드 끝까지 진행).
  */
-download_status_t download_package(const char *url,
-                                   const char *expected_sha256_hex,
-                                   int64_t     expected_size_bytes,
-                                   const char *allowed_hosts_csv,
-                                   const char *tmp_dir,
-                                   int         disk_reserve_mb,
-                                   const char *out_path);
+typedef int (*download_cancel_fn)(void *user);
+
+/**
+ * @brief Download @p url → @p out_path, verifying sha256 + size + host.
+ *
+ * @param cancel_cb   주기적 cancellation 체크 콜백 (NULL 가능).
+ * @param cancel_user @p cancel_cb 에 전달되는 user pointer.
+ */
+download_status_t download_package(const char        *url,
+                                   const char        *expected_sha256_hex,
+                                   int64_t            expected_size_bytes,
+                                   const char        *allowed_hosts_csv,
+                                   const char        *tmp_dir,
+                                   int                disk_reserve_mb,
+                                   const char        *out_path,
+                                   download_cancel_fn cancel_cb,
+                                   void              *cancel_user);
 
 int download_host_allowed(const char *host, const char *allowed_hosts_csv);
 int download_url_extract_host(const char *url, char *out, size_t out_sz);

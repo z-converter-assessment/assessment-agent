@@ -182,13 +182,31 @@ static int hex_eq_ci(const char *a, const char *b)
 	return *a == 0 && *b == 0;
 }
 
-download_status_t download_package(const char *url,
-                                   const char *expected_sha256_hex,
-                                   int64_t     expected_size_bytes,
-                                   const char *allowed_hosts_csv,
-                                   const char *tmp_dir,
-                                   int         disk_reserve_mb,
-                                   const char *out_path)
+/* libcurl progress callback — cancel check 만 함. transfer 진행 정보는 무시. */
+struct cancel_ctx {
+	download_cancel_fn cb;
+	void              *user;
+};
+
+static int xferinfo_cb(void *clientp,
+                       curl_off_t dltotal, curl_off_t dlnow,
+                       curl_off_t ultotal, curl_off_t ulnow)
+{
+	(void)dltotal; (void)dlnow; (void)ultotal; (void)ulnow;
+	struct cancel_ctx *c = (struct cancel_ctx *)clientp;
+	if (c && c->cb && c->cb(c->user)) return 1;  /* 비-0 = abort */
+	return 0;
+}
+
+download_status_t download_package(const char        *url,
+                                   const char        *expected_sha256_hex,
+                                   int64_t            expected_size_bytes,
+                                   const char        *allowed_hosts_csv,
+                                   const char        *tmp_dir,
+                                   int                disk_reserve_mb,
+                                   const char        *out_path,
+                                   download_cancel_fn cancel_cb,
+                                   void              *cancel_user)
 {
 	if (!url || !expected_sha256_hex || !out_path) return DOWNLOAD_ERR_INTERNAL;
 	if (!size_bytes_in_range(expected_size_bytes)) return DOWNLOAD_ERR_DOWNLOAD_FAILED;
@@ -240,6 +258,14 @@ download_status_t download_package(const char *url,
 	curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, 60L);
 	curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
 	curl_easy_setopt(c, CURLOPT_WRITEDATA, &s);
+
+	/* Cancellation hook — drain 시 stop_requested() / 기타 신호로 abort. */
+	struct cancel_ctx cancel = { .cb = cancel_cb, .user = cancel_user };
+	if (cancel_cb) {
+		curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
+		curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, xferinfo_cb);
+		curl_easy_setopt(c, CURLOPT_XFERINFODATA, &cancel);
+	}
 
 	CURLcode cc = curl_easy_perform(c);
 	curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &http_code);

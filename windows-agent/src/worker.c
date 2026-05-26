@@ -26,6 +26,7 @@
 #include "worker.h"
 #include "download.h"
 #include "exec.h"
+#include "service.h"   /* stop_requested — download cancel hook */
 #include "util.h"
 #include "cJSON.h"
 
@@ -65,6 +66,7 @@ typedef struct {
 	char         *target_file;
 	char         *result_path;     /* 결과 파일 — thread 가 작성 */
 	char         *running_marker_path;  /* /running\<task_id>.json — thread 정상 종료 시 제거 */
+	HANDLE        job;             /* Job Object handle — caller (worker) 가 소유. exec_install 에 전달 */
 	const char   *allowed_hosts_csv;  /* config 참조 — context lifetime */
 	const char   *tmp_dir;
 	int           disk_reserve_mb;
@@ -81,6 +83,7 @@ struct worker_ctx_s {
 
 	/* In-flight install state (state == BUSY 일 때만 유효). */
 	HANDLE          install_thread;
+	HANDLE          install_job;          /* exec_install 에 전달한 Job — drain 시 TerminateJobObject 로 강제 종료 */
 	char            inflight_task_id[128];
 	uint64_t        inflight_delivery_tag;
 
@@ -89,8 +92,9 @@ struct worker_ctx_s {
 	char            done_dir[512];
 	char            running_dir[512];
 
-	/* AMQP reconnect backoff (현재 미사용 — 다음 tick 에 단순 재시도). */
-	int             reconnect_backoff_sec;
+	/* AMQP reconnect backoff with monotonic clock (Linux clock_gettime 대응). */
+	int             reconnect_backoff_sec;       /* current window (s), 1→2→4→...→60 */
+	ULONGLONG       last_reconnect_attempt_ms;   /* GetTickCount64() of last attempt; 0 = never */
 };
 
 #define WORKER_RECONNECT_BACKOFF_MAX 60
@@ -521,6 +525,14 @@ static const char *reason_for_status(download_status_t ds, exec_status_t xs)
  * worker_tick (부모) 가 그 파일 읽어 publish 처리.
  * ============================================================ */
 
+/* libcurl cancellation wrapper — Service Stop 시 download 진행 중인 thread 가 즉시 abort.
+ * drain 시 PUBLISH-stuck 4-phase 의 wedge 회피. */
+static int worker_download_cancel_cb(void *user)
+{
+	(void)user;
+	return stop_requested();
+}
+
 static unsigned __stdcall install_thread_main(void *arg)
 {
 	install_thread_arg_t *a = (install_thread_arg_t *)arg;
@@ -533,13 +545,15 @@ static unsigned __stdcall install_thread_main(void *arg)
 
 	download_status_t ds = download_package(a->url, a->sha256, a->size_bytes,
 	                                        a->allowed_hosts_csv, a->tmp_dir,
-	                                        a->disk_reserve_mb, a->target_file);
+	                                        a->disk_reserve_mb, a->target_file,
+	                                        worker_download_cancel_cb, NULL);
 
 	exec_status_t  xs = EXEC_OK;
 	exec_result_t  er = { .exit_code = -1 };
 
 	if (ds == DOWNLOAD_OK) {
-		xs = exec_install(a->install_type, a->work_dir, a->target_file, NULL,
+		xs = exec_install((void *)a->job, a->install_type,
+		                  a->work_dir, a->target_file, NULL,
 		                  a->timeout_sec, a->mem_limit_mb, a->fsize_limit_mb,
 		                  a->active_proc_limit, a->task_id, a->machine_id, &er);
 	}
@@ -670,10 +684,15 @@ void worker_shutdown(worker_ctx_t *ctx)
 	if (!ctx) return;
 	if (ctx->install_thread) {
 		/* drain 패턴 가정 — thread 가 이미 종료된 상태에서 호출돼야 함.
-		 * 만약 살아있으면 wait 잠깐 후 forceful close. */
+		 * 만약 살아있으면 Job kill 후 짧게 wait. */
+		if (ctx->install_job) TerminateJobObject(ctx->install_job, 1);
 		WaitForSingleObject(ctx->install_thread, 5000);
 		CloseHandle(ctx->install_thread);
 		ctx->install_thread = NULL;
+	}
+	if (ctx->install_job) {
+		CloseHandle(ctx->install_job);
+		ctx->install_job = NULL;
 	}
 	if (ctx->conn) publish_conn_close(ctx->conn);
 	free(ctx);
@@ -685,6 +704,17 @@ void worker_shutdown(worker_ctx_t *ctx)
 static int ensure_connection(worker_ctx_t *ctx)
 {
 	if (ctx->conn && !ctx->conn_dead) return 0;
+
+	/* Backoff: 직전 attempt 이후 backoff_sec 가 안 지났으면 skip — broker 다운 시
+	 * 매 tick (1m) 무의미한 connect 시도 회피. Monotonic clock (GetTickCount64). */
+	ULONGLONG now_ms = GetTickCount64();
+	if (ctx->reconnect_backoff_sec > 0 && ctx->last_reconnect_attempt_ms > 0) {
+		ULONGLONG since_ms = now_ms - ctx->last_reconnect_attempt_ms;
+		if (since_ms < (ULONGLONG)ctx->reconnect_backoff_sec * 1000ULL)
+			return -1;
+	}
+	ctx->last_reconnect_attempt_ms = now_ms;
+
 	if (ctx->conn) { publish_conn_close(ctx->conn); ctx->conn = NULL; }
 
 	ctx->conn = publish_conn_open(&ctx->cfg.amqp);
@@ -821,8 +851,26 @@ static int spawn_install(worker_ctx_t *ctx, cJSON *task)
 		return -1;
 	}
 
+	/* Job Object 사전 생성 — worker 가 핸들 소유. drain escalation 시
+	 * worker_force_child_term(ctx, 1) 이 TerminateJobObject(ctx->install_job, 1) 로
+	 * 자식 process tree 즉시 강제 종료할 수 있게 됨. 실패 시 spawn abort. */
+	HANDLE job = CreateJobObjectA(NULL, NULL);
+	if (!job) {
+		fprintf(stderr, "[worker] CreateJobObjectA failed for %s - aborting spawn\n", a->task_id);
+		clear_running_marker(ctx, a->task_id);
+		free(a->task_id); free(a->url); free(a->sha256);
+		free(a->work_dir); free(a->target_file); free(a->result_path);
+		free(a->running_marker_path);
+		free(a);
+		return -1;
+	}
+	ctx->install_job = job;
+	a->job           = job;
+
 	uintptr_t th = _beginthreadex(NULL, 0, install_thread_main, a, 0, NULL);
 	if (th == 0) {
+		CloseHandle(job);
+		ctx->install_job = NULL;
 		clear_running_marker(ctx, a->task_id);  /* thread 시작 실패 — marker 회수 */
 		free(a->task_id); free(a->url); free(a->sha256);
 		free(a->work_dir); free(a->target_file); free(a->result_path);
@@ -918,6 +966,11 @@ int worker_tick(worker_ctx_t *ctx)
 			if (wr == WAIT_OBJECT_0) {
 				CloseHandle(ctx->install_thread);
 				ctx->install_thread = NULL;
+				/* Job 도 정리 — KILL_ON_JOB_CLOSE 로 잔여 process 자동 cleanup. */
+				if (ctx->install_job) {
+					CloseHandle(ctx->install_job);
+					ctx->install_job = NULL;
+				}
 				if (publish_result_and_ack(ctx) == 0)
 					ctx->state = WSTATE_IDLE;
 				/* else: inflight 유지 — 다음 tick 에서 thread==NULL 분기로 재진입 */
@@ -1015,13 +1068,17 @@ void worker_begin_drain(worker_ctx_t *ctx)
 
 void worker_force_child_term(worker_ctx_t *ctx, int hard)
 {
-	if (!ctx || !ctx->install_thread) return;
-	(void)hard;
-	/* exec.c 의 Job Object 가 자식 process tree 를 들고 있음. 다만 worker 가
-	 * Job 핸들에 접근 못 함 — TerminateThread 는 위험하므로 (Critical Section
-	 * 누수 등) 호출 자제하고 timeout 도달 시 exec.c 내부 TerminateJobObject 에
-	 * 의존. 여기서는 thread 종료 대기만. */
-	WaitForSingleObject(ctx->install_thread, 5000);
+	if (!ctx) return;
+	(void)hard;  /* Windows 에 graceful term 개념 없음 — soft/hard 모두 즉시 kill. */
+
+	/* Job Object 단위로 강제 종료 — 자식 process tree (download / install / msiexec)
+	 * 전체가 즉시 종료됨 (KILL_ON_JOB_CLOSE 와 별개로 즉시 효과). 그 결과 install
+	 * thread 의 exec_install 도 WaitForSingleObject 에서 깨어나 EXEC_ERR_SCRIPT_TIMEOUT
+	 * 으로 반환 → result 파일 작성 후 thread 종료 → worker_tick 의 reap path 진입. */
+	if (ctx->install_job) {
+		fprintf(stderr, "[worker] worker_force_child_term: TerminateJobObject (hard kill)\n");
+		TerminateJobObject(ctx->install_job, 1);
+	}
 }
 
 int worker_idle(const worker_ctx_t *ctx)

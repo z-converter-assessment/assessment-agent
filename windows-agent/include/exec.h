@@ -54,21 +54,29 @@ typedef struct {
 /**
  * @brief Execute install target with EC1-equivalent sandbox + Job Object containment.
  *
+ * Job Object 핸들은 **caller 가 미리 만들어 전달** — worker_force_child_term 이
+ * drain escalation 시 TerminateJobObject 로 자식 process tree 즉시 강제 종료할
+ * 수 있도록 함. exec_install 은 받은 job 에 process attach + ExtendedLimitInformation
+ * 설정만 책임. CloseHandle(job) 은 caller (worker.c) 의 책임.
+ *
+ * job_handle == NULL 이면 exec_install 이 자체 Job 생성 + 정리 (test / standalone 호출용
+ * backward-compat). 이 경우 외부 강제 종료는 불가.
+ *
+ * @param job_handle        외부에서 미리 만든 Job Object 핸들 (또는 NULL).
  * @param type              EXEC_INSTALL_TYPE_DIRECT_EXEC | EXEC_INSTALL_TYPE_MSI
  * @param work_dir          Sandbox dir. 존재 가정. 자식 CWD.
  * @param target_file       direct_exec: 실행할 EXE 절대 경로. msi: .msi 절대 경로.
- *                          (worker 가 download_package() 로 받아둔 경로)
  * @param argv_extra        추가 인자 (NULL-terminated). NULL 가능.
- *                          direct_exec 에 그대로 append. msi 는 무시 (msiexec 표준 인자 고정).
  * @param timeout_sec       Wall-clock timeout. <= 0 이면 비활성.
  * @param mem_limit_mb      Job Object ProcessMemoryLimit (MB). <= 0 이면 미적용.
- * @param fsize_limit_mb    참고용 (Windows 에서 직접 강제 어려움 — 향후 disk quota 등으로 보완).
+ * @param fsize_limit_mb    참고용 (Windows 직접 강제 어려움).
  * @param active_proc_limit Job Object ActiveProcessLimit. <= 0 이면 내부 default (32) 적용.
  * @param task_id           TASK_ID env 로 전달.
  * @param machine_id        MACHINE_ID env 로 전달.
  * @param out               호출 후 채워짐. INTERNAL 실패 시 호출자가 부분 값 의존 금지.
  */
-exec_status_t exec_install(exec_install_type_t  type,
+exec_status_t exec_install(void                *job_handle,
+                           exec_install_type_t  type,
                            const char          *work_dir,
                            const char          *target_file,
                            const char         **argv_extra,
