@@ -26,6 +26,17 @@
 char *resolve_machine_id(void);
 
 /**
+ * @brief composite_id = sha256_hex(machine_id + "\n" + mac1 + "\n" + ...).
+ *
+ * Process-lifetime 1회 계산 후 캐시. 반환된 buffer 는 static 이라 caller 가
+ * free 하지 않음. machine_id 가 NULL/empty 면 MAC 만 hash.
+ *
+ * agent 가 자기 task.install 큐 이름 (`agent.tasks.<composite_id>`) 빌드 +
+ * payload `composite_id` 필드 채울 때 같은 값 사용.
+ */
+const char *cached_composite_id(const char *machine_id);
+
+/**
  * @brief Produce an `inventory` payload conforming to docs/payload-schema.md §1.
  *
  * Common metadata (`message_type`, `machine_id`, `agent_version`,

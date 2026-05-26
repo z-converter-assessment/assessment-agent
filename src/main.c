@@ -328,8 +328,11 @@ int main(void)
 		publish_config_t wcfg = make_worker_publish_config();
 
 		const char *queue_prefix = getenv_default("WORKER_TASK_QUEUE_PREFIX", "agent.tasks");
+		/* 큐 이름은 composite_id 기반 — payload contract v4. portal 측 routing key
+		 * `task.install.<composite_id>` 와 정확히 일치해야 task 매치. */
+		const char *cid = cached_composite_id(machine_id);
 		char queue_name[256];
-		snprintf(queue_name, sizeof queue_name, "%s.%s", queue_prefix, machine_id);
+		snprintf(queue_name, sizeof queue_name, "%s.%s", queue_prefix, cid);
 
 		worker_config_t wc = {
 			.amqp                = wcfg,

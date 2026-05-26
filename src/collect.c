@@ -99,8 +99,8 @@ static const char *cached_agent_started_at_iso(void)
 	return buf;
 }
 
-/* Forward decl — 실제 정의는 collect_mac_addresses() 이후. */
-static const char *cached_composite_id(const char *machine_id);
+/* cached_composite_id forward decl 은 collect.h 에 public 으로 노출됨
+ * (main.c 가 worker 큐 이름 빌드에 사용). */
 
 /**
  * @brief Add common metadata fields to @p obj.
@@ -1074,7 +1074,7 @@ static cJSON *collect_mac_addresses(void)
  *
  * 프로세스 lifetime 내 1회 계산 후 캐시.
  */
-static const char *cached_composite_id(const char *machine_id)
+const char *cached_composite_id(const char *machine_id)
 {
 	static char hex_buf[65];
 	static int  cached = 0;

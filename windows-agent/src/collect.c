@@ -68,8 +68,8 @@ static void cache_process_times(void)
 	g_times_cached = 1;
 }
 
-/* Forward decl — 실제 정의는 fill_network_info() 이후. */
-static const char *cached_composite_id(const char *machine_id);
+/* cached_composite_id 는 collect.h 에 public 으로 노출 — main.c 가 worker 큐 이름
+ * 빌드에 사용. 실제 정의는 fill_network_info() 이후. */
 
 /* ============================================================
  *  Common metadata (every message)
@@ -570,7 +570,7 @@ static void fill_network_info(cJSON *inv)
  *
  *  프로세스 lifetime 내 1회 계산 후 캐시.
  * ============================================================ */
-static const char *cached_composite_id(const char *machine_id)
+const char *cached_composite_id(const char *machine_id)
 {
 	static char hex_buf[65];
 	static int  cached = 0;
