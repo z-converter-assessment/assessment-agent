@@ -347,6 +347,9 @@ int agent_run(void)
 
 		while (!worker_idle(worker)) {
 			worker_tick(worker);
+			/* SCM 에 "아직 stopping 중" 알림 — dwCheckPoint 증분 + wait_hint 2.5s 갱신.
+			 * 호출 안 하면 service_ctrl_handler 의 30s wait_hint 만료 후 SCM stuck 판정. */
+			service_stop_pending_update(2500);
 			long elapsed = (long)((GetTickCount64() - t0) / 1000ULL);
 
 			if (!term_sent && elapsed >= grace_sec) {
