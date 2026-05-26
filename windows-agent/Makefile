@@ -22,7 +22,8 @@ CMAKE   ?= cmake
 JOBS    ?= 4
 
 CFLAGS  ?= -Wall -Wextra -Wpedantic -O2 -std=c11 \
-           -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -DUNICODE -D_UNICODE
+           -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -DUNICODE -D_UNICODE \
+           -DCURL_STATICLIB
 LDFLAGS ?= -static -static-libgcc -Wl,--no-insert-timestamp
 
 AGENT_VERSION ?= 1.0.0
