@@ -32,6 +32,7 @@
 #include "util.h"
 #include "cJSON.h"
 #include <openssl/evp.h>
+#include <curl/curl.h>
 
 #include <ctype.h>
 #include <stdint.h>
@@ -104,8 +105,14 @@ static void add_common_metadata(cJSON *root, const char *msg_type,
 	else                        cJSON_AddNullToObject(root, "agent_started_at");
 }
 
+/* Forward decls — 정의는 cloud metadata 영역 (cached_composite_id 다음). */
+static char *http_get_short(const char *url, const char *header, int put_request);
+static char *try_cloud_instance_id(void);
+
 /* ============================================================
  *  machine_id — Registry HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid
+ *               + cloud IMDS instance-id fallback (Sysprep 안 한 image /
+ *                 비표준 환경 안전망 — Linux /etc/machine-id 결손 케이스와 대칭).
  * ============================================================ */
 char *resolve_machine_id(void)
 {
@@ -113,14 +120,18 @@ char *resolve_machine_id(void)
 	if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
 	    "SOFTWARE\\Microsoft\\Cryptography",
 	    0, KEY_READ | KEY_WOW64_64KEY, &hKey) != ERROR_SUCCESS) {
-		return NULL;
+		fprintf(stderr, "[agent] MachineGuid registry open failed - trying cloud IMDS fallback\n");
+		return try_cloud_instance_id();
 	}
 	char buf[128] = {0};
 	DWORD sz = sizeof buf;
 	DWORD type = 0;
 	LONG r = RegQueryValueExA(hKey, "MachineGuid", NULL, &type, (LPBYTE)buf, &sz);
 	RegCloseKey(hKey);
-	if (r != ERROR_SUCCESS || type != REG_SZ) return NULL;
+	if (r != ERROR_SUCCESS || type != REG_SZ) {
+		fprintf(stderr, "[agent] MachineGuid query failed - trying cloud IMDS fallback\n");
+		return try_cloud_instance_id();
+	}
 
 	/* Trim any stray trailing NUL / CR / LF and lowercase to match
 	 * the /etc/machine-id (32-char hex) shape the engine expects to
@@ -130,6 +141,11 @@ char *resolve_machine_id(void)
 		buf[--l] = '\0';
 	for (size_t i = 0; i < l; i++)
 		buf[i] = (char)tolower((unsigned char)buf[i]);
+
+	if (l == 0) {
+		fprintf(stderr, "[agent] MachineGuid empty - trying cloud IMDS fallback\n");
+		return try_cloud_instance_id();
+	}
 
 	char *out = malloc(l + 1);
 	if (!out) return NULL;
@@ -649,6 +665,177 @@ static const char *cached_composite_id(const char *machine_id)
 }
 
 /* ============================================================
+ *  Cloud metadata HTTP fetch (libcurl, 1s timeout, 256B hard cap)
+ *
+ *  external IP / instance-id 응답은 모두 매우 짧음 — 응답 크기를 256B 로 cap 해
+ *  악의/오동작 metadata 서버로부터의 메모리 폭주 방지. AGENT_EXTERNAL_IP env
+ *  override 가 있으면 cloud 호출 자체 skip.
+ * ============================================================ */
+
+struct http_sink {
+	char  *buf;
+	size_t len;
+	size_t cap;
+};
+
+#define HTTP_GET_MAX_BYTES 256
+
+static size_t http_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
+{
+	struct http_sink *s = (struct http_sink *)userdata;
+	size_t n = size * nmemb;
+	if (s->len + n > HTTP_GET_MAX_BYTES) n = HTTP_GET_MAX_BYTES - s->len;
+	if (n == 0) return size * nmemb;  /* swallow remaining bytes silently */
+	if (s->len + n + 1 > s->cap) {
+		size_t new_cap = s->len + n + 64;
+		char *nb = (char *)realloc(s->buf, new_cap);
+		if (!nb) return 0;
+		s->buf = nb;
+		s->cap = new_cap;
+	}
+	memcpy(s->buf + s->len, ptr, n);
+	s->len += n;
+	return size * nmemb;
+}
+
+static char *http_get_short(const char *url, const char *header, int put_request)
+{
+	CURL *c = curl_easy_init();
+	if (!c) return NULL;
+	struct curl_slist *headers = NULL;
+	if (header) headers = curl_slist_append(headers, header);
+	struct http_sink s = { NULL, 0, 0 };
+
+	curl_easy_setopt(c, CURLOPT_URL, url);
+	curl_easy_setopt(c, CURLOPT_TIMEOUT, 1L);
+	curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 1L);
+	curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+	curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 0L);
+	curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR, "http");
+	curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, http_write_cb);
+	curl_easy_setopt(c, CURLOPT_WRITEDATA, &s);
+	if (headers) curl_easy_setopt(c, CURLOPT_HTTPHEADER, headers);
+	if (put_request) curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "PUT");
+
+	CURLcode cc = curl_easy_perform(c);
+	long code = 0;
+	curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+	if (headers) curl_slist_free_all(headers);
+	curl_easy_cleanup(c);
+
+	if (cc != CURLE_OK || code != 200 || s.len == 0) {
+		free(s.buf);
+		return NULL;
+	}
+	char *out = (char *)realloc(s.buf, s.len + 1);
+	if (!out) { free(s.buf); return NULL; }
+	out[s.len] = '\0';
+	/* trim trailing whitespace */
+	size_t l = strlen(out);
+	while (l > 0 && (out[l-1] == '\n' || out[l-1] == '\r' || out[l-1] == ' ' || out[l-1] == '\t')) out[--l] = '\0';
+	if (l == 0) { free(out); return NULL; }
+	return out;
+}
+
+/*
+ * Cloud external IP — AGENT_EXTERNAL_IP override → AWS IMDSv2 → Azure → GCP 순.
+ * 전 실패 시 null 리터럴 (server.error 발행 안 함, optional 정책).
+ */
+static cJSON *collect_external_ip(void)
+{
+	const char *override = getenv("AGENT_EXTERNAL_IP");
+	if (override && *override) {
+		cJSON *arr = cJSON_CreateArray();
+		char *copy = _strdup(override);
+		if (!copy) return arr;
+		char *save = NULL;
+		for (char *tok = strtok_s(copy, ",", &save); tok; tok = strtok_s(NULL, ",", &save)) {
+			while (*tok == ' ' || *tok == '\t') tok++;
+			size_t l = strlen(tok);
+			while (l > 0 && (tok[l-1] == ' ' || tok[l-1] == '\t' || tok[l-1] == '\r' || tok[l-1] == '\n')) tok[--l] = '\0';
+			if (*tok) cJSON_AddItemToArray(arr, cJSON_CreateString(tok));
+		}
+		free(copy);
+		return arr;
+	}
+
+	char *ip = NULL;
+
+	/* AWS IMDSv2 — token PUT 후 GET. */
+	char *token = http_get_short(
+		"http://169.254.169.254/latest/api/token",
+		"X-aws-ec2-metadata-token-ttl-seconds: 60",
+		1 /* PUT */);
+	if (token && *token) {
+		char hdr[256];
+		snprintf(hdr, sizeof hdr, "X-aws-ec2-metadata-token: %s", token);
+		ip = http_get_short("http://169.254.169.254/latest/meta-data/public-ipv4", hdr, 0);
+	}
+	free(token);
+
+	if (!ip) {
+		ip = http_get_short(
+			"http://169.254.169.254/metadata/instance/network/interface/0/"
+			"ipv4/ipAddress/0/publicIpAddress?api-version=2021-02-01&format=text",
+			"Metadata: true", 0);
+	}
+	if (!ip) {
+		ip = http_get_short(
+			"http://metadata.google.internal/computeMetadata/v1/instance/"
+			"network-interfaces/0/access-configs/0/external-ip",
+			"Metadata-Flavor: Google", 0);
+	}
+
+	if (!ip || !*ip) {
+		free(ip);
+		return cJSON_CreateNull();
+	}
+	cJSON *arr = cJSON_CreateArray();
+	cJSON_AddItemToArray(arr, cJSON_CreateString(ip));
+	free(ip);
+	return arr;
+}
+
+/*
+ * Cloud IMDS instance-id fallback — Registry MachineGuid 결손/공백 시 호출됨.
+ * AWS IMDSv2 / Azure vmId / GCP instance id 순. 전 실패 시 NULL.
+ *
+ * 형식 차이가 약간 있어도 (AWS = i-xxxxxxxxx, Azure = UUID, GCP = 정수형 string)
+ * engine 의 String(64) 제약은 모두 통과 — composite_id 의 해시 source 로만 들어가
+ * 형식 일관성은 불필요.
+ */
+static char *try_cloud_instance_id(void)
+{
+	char *id = NULL;
+
+	/* AWS IMDSv2 */
+	char *token = http_get_short(
+		"http://169.254.169.254/latest/api/token",
+		"X-aws-ec2-metadata-token-ttl-seconds: 60",
+		1 /* PUT */);
+	if (token && *token) {
+		char hdr[256];
+		snprintf(hdr, sizeof hdr, "X-aws-ec2-metadata-token: %s", token);
+		id = http_get_short("http://169.254.169.254/latest/meta-data/instance-id", hdr, 0);
+	}
+	free(token);
+
+	if (!id) {
+		id = http_get_short(
+			"http://169.254.169.254/metadata/instance/compute/vmId?api-version=2021-02-01&format=text",
+			"Metadata: true", 0);
+	}
+	if (!id) {
+		id = http_get_short(
+			"http://metadata.google.internal/computeMetadata/v1/instance/id",
+			"Metadata-Flavor: Google", 0);
+	}
+
+	if (id) fprintf(stderr, "[agent] cloud IMDS instance-id fallback succeeded\n");
+	return id;
+}
+
+/* ============================================================
  *  Services (EnumServicesStatusExW — running only)
  * ============================================================ */
 static cJSON *enumerate_running_services(void)
@@ -870,7 +1057,7 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 	cJSON_AddItemToObject(m, "listen_ports", enumerate_listen_ports());
 
 	fill_network_info(m);  /* adds ip_internal[] and mac_addresses[] */
-	cJSON_AddNullToObject(m, "ip_external");
+	cJSON_AddItemToObject(m, "ip_external", collect_external_ip());
 
 	return m;
 }

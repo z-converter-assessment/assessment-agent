@@ -89,6 +89,14 @@ if ($SkipSha256) {
 New-Item -ItemType Directory -Path $progDir -Force | Out-Null
 New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
 
+# Worker state dirs (task.install consumer). v1 binary 는 worker 비활성이지만,
+# v2 도입 시 install.ps1 을 다시 돌리지 않아도 되도록 미리 생성. Linux 측의
+# /var/lib/agent-worker/{results,done,running}/ 와 동일 역할.
+$workerDir = Join-Path $dataDir 'worker'
+foreach ($sub in 'results','done','running') {
+    New-Item -ItemType Directory -Path (Join-Path $workerDir $sub) -Force | Out-Null
+}
+
 # --- 6. Stop existing service (upgrade path)
 $svc = Get-Service -Name 'assessment-agent' -ErrorAction SilentlyContinue
 if ($svc -and $svc.Status -ne 'Stopped') {

@@ -37,6 +37,19 @@ int stop_requested(void)
 	return InterlockedCompareExchange(&g_stop, 0, 0) != 0;
 }
 
+void service_stop_pending_update(unsigned long wait_hint_ms)
+{
+	if (!g_status_handle) return;  /* console mode — SCM 없음 */
+	/* report_status 는 internal; STOP_PENDING 으로 reaffirm + checkpoint 증분. */
+	static DWORD pending_checkpoint = 1;
+	g_status.dwCurrentState  = SERVICE_STOP_PENDING;
+	g_status.dwWin32ExitCode = NO_ERROR;
+	g_status.dwWaitHint      = (DWORD)wait_hint_ms;
+	g_status.dwControlsAccepted = 0;   /* STOP 신호 추가 수신 안 받음 (이미 stop 중) */
+	g_status.dwCheckPoint    = pending_checkpoint++;
+	SetServiceStatus(g_status_handle, &g_status);
+}
+
 static void report_status(DWORD state, DWORD exit_code, DWORD wait_hint)
 {
 	static DWORD checkpoint = 1;

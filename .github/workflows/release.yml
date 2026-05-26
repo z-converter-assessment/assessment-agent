@@ -5,17 +5,11 @@ name: Release Build
 #   - PR → 검증 빌드 (artifact 임시)
 #   - tag v* push → 검증 빌드 + GitHub Release 자동 생성 + artifact 첨부
 #   - workflow_dispatch → 수동 실행 (디버깅 / ad-hoc 빌드)
-#
-# Windows 빌드는 현재 이 워크플로우에서 빠져 있음. windows-agent/ Makefile
-# (MinGW + cmake + GCC 14+) 환경의 vendor 빌드 호환 문제를 별도 PR 에서 해결한
-# 후 다시 추가 예정. 그 동안 Windows .exe 는 운영자가 Windows 머신에서
-# `.\windows-agent\scripts\build-windows.ps1` 로 직접 빌드.
 on:
   push:
     branches:
       - main
       - develop
-      - 'feature/**'
     tags:
       - 'v*'
   pull_request:
@@ -23,6 +17,11 @@ on:
       - main
       - develop
   workflow_dispatch:
+
+# 같은 PR / 브랜치 내 새 push 발생 시 이전 run 자동 취소 — 중복 빌드 / 캐시 경합 회피.
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 # release 잡이 GitHub Release 생성 / 첨부할 수 있도록 contents:write 필요.
 permissions:
@@ -73,15 +72,78 @@ jobs:
           retention-days: 90
 
   # ============================================================
-  # Release 잡 — tag v* push 시에만 실행. Linux artifact 다운로드 → GitHub
+  # Windows 빌드 — windows-latest runner + MSYS2 mingw64 toolchain.
+  # msys2/setup-msys2 action 이 build-prep.ps1 의 MSYS2 silent install 단계를
+  # 대체하므로 build-windows.ps1 우회 — make 직접 호출.
+  # ============================================================
+  build-windows:
+    name: Windows (MSYS2 / mingw64)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: msys2 {0}
+        working-directory: windows-agent
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 + mingw64 toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            git
+            make
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-pkgconf
+            perl
+
+      - name: Cache vendor (Windows)
+        uses: actions/cache@v4
+        with:
+          path: windows-agent/vendor
+          key: vendor-windows-${{ hashFiles('windows-agent/Makefile') }}
+          restore-keys: |
+            vendor-windows-
+
+      - name: Vendor fetch
+        run: make vendor-fetch
+
+      - name: Vendor build (static)
+        run: make vendor-build
+
+      - name: Build + release
+        run: make release
+
+      - name: Verify artifacts
+        run: |
+          test -f dist/assessment-agent.exe
+          test -f dist/SHA256SUMS
+          (cd dist && sha256sum -c SHA256SUMS)
+          ls -la dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: assessment-agent-windows-x86_64
+          path: |
+            windows-agent/dist/assessment-agent.exe
+            windows-agent/dist/SHA256SUMS
+          retention-days: 90
+
+  # ============================================================
+  # Release 잡 — tag v* push 시에만 실행. 두 artifact 다운로드 → GitHub
   # Release 페이지에 첨부. body 는 자동 생성 (PR / commit history 기반).
-  # Windows .exe 는 별도 PR / 별도 workflow 에서 추가 예정.
   # ============================================================
   release:
     name: Publish GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
     needs:
       - build-linux
+      - build-windows
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -94,7 +156,12 @@ jobs:
         run: |
           mkdir -p release
           cp artifacts/assessment-agent-linux-x86_64/assessment-agent-linux-x86_64 release/
-          cp artifacts/assessment-agent-linux-x86_64/SHA256SUMS release/
+          cp artifacts/assessment-agent-windows-x86_64/assessment-agent.exe release/
+          # Aggregate SHA256SUMS (Linux + Windows in one file)
+          {
+            cat artifacts/assessment-agent-linux-x86_64/SHA256SUMS
+            cat artifacts/assessment-agent-windows-x86_64/SHA256SUMS
+          } > release/SHA256SUMS
           ls -la release/
           cat release/SHA256SUMS
 
@@ -105,4 +172,5 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             release/assessment-agent-linux-x86_64
+            release/assessment-agent.exe
             release/SHA256SUMS

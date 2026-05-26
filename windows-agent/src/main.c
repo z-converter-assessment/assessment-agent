@@ -20,6 +20,7 @@
 #include "publish.h"
 #include "service.h"
 #include "util.h"
+#include "worker.h"
 #include "cJSON.h"
 
 #include <stdio.h>
@@ -62,6 +63,50 @@ static publish_config_t make_publish_config(void)
 }
 
 /* ============================================================
+ *  worker_config_t builder (env-driven)
+ *
+ *  RABBITMQ_WORKER_USER / _PASS 가 비어있으면 worker 비활성 (queue_name 을
+ *  비워서 worker_init 가 NULL 반환하도록 유도).
+ * ============================================================ */
+static worker_config_t make_worker_config(const publish_config_t *pcfg,
+                                          const char *machine_id,
+                                          char *queue_name_buf,
+                                          size_t qbuf_sz)
+{
+	worker_config_t wcfg;
+	memset(&wcfg, 0, sizeof wcfg);
+
+	const char *wuser = getenv("RABBITMQ_WORKER_USER");
+	const char *wpass = getenv("RABBITMQ_WORKER_PASS");
+	if (!wuser || !*wuser || !wpass || !*wpass) {
+		return wcfg;  /* worker disabled */
+	}
+
+	wcfg.amqp           = *pcfg;
+	wcfg.amqp.user      = wuser;
+	wcfg.amqp.password  = wpass;
+	wcfg.amqp.exchange  = getenv_default("WORKER_TASK_EXCHANGE", "assessment.tasks");
+
+	snprintf(queue_name_buf, qbuf_sz, "%s.%s",
+	         getenv_default("WORKER_TASK_QUEUE_PREFIX", "agent.tasks"),
+	         machine_id ? machine_id : "");
+	wcfg.queue_name         = queue_name_buf;
+	wcfg.result_routing_key = getenv_default("WORKER_TASK_RESULT_KEY", "task.result");
+	wcfg.machine_id         = machine_id;
+	wcfg.agent_version      = AGENT_VERSION;
+	wcfg.state_dir          = getenv_default("WORKER_STATE_DIR",
+	                                         "C:\\ProgramData\\assessment-agent\\worker");
+	wcfg.tmp_dir            = getenv_default("WORKER_TMP_DIR", "C:\\Windows\\Temp");
+	wcfg.allowed_hosts_csv  = getenv_default("WORKER_DOWNLOAD_ALLOWED_HOSTS", "");
+	wcfg.done_retention_sec = getenv_int_or ("WORKER_DONE_RETENTION_SEC", 604800);
+	wcfg.disk_reserve_mb    = getenv_int_or ("WORKER_DISK_RESERVE_MB",    50);
+	wcfg.mem_limit_mb       = getenv_int_or ("WORKER_INSTALL_MEM_LIMIT_MB",   2048);
+	wcfg.fsize_limit_mb     = getenv_int_or ("WORKER_INSTALL_FSIZE_LIMIT_MB", 5120);
+	wcfg.active_proc_limit  = getenv_int_or ("WORKER_INSTALL_ACTIVE_PROC_LIMIT", 32);
+	return wcfg;
+}
+
+/* ============================================================
  *  Helpers
  * ============================================================ */
 static int serialize_and_publish(const publish_config_t *cfg,
@@ -92,11 +137,17 @@ static void emit_error(const publish_config_t *cfg, const char *machine_id,
 		        code ? code : "?");
 }
 
-/* Sleep in 1-second slices so SCM stop response is bounded. */
-static void interruptible_sleep(int seconds)
+/* Sleep in 1-second slices — SCM stop response 가 1초 단위 + worker AMQP
+ * heartbeat 가 매 slice 마다 pump. heartbeat 안 돌면 broker 가 connection 끊으므로
+ * (60초 default) sleep 도중 keepalive 호출 필수.
+ *
+ * worker == NULL 이면 keepalive skip (worker 비활성 모드). */
+static void interruptible_sleep(int seconds, worker_ctx_t *worker)
 {
-	for (int i = 0; i < seconds && !stop_requested(); i++)
+	for (int i = 0; i < seconds && !stop_requested(); i++) {
 		Sleep(1000);
+		if (worker) worker_keepalive(worker);
+	}
 }
 
 static time_t next_inventory_deadline(time_t now, int refresh_sec)
@@ -145,7 +196,10 @@ static int publish_with_retry(const publish_config_t *cfg, const char *rk,
 			backoff = (unsigned int)max_backoff;
 		fprintf(stderr, "[agent] publish failed, retry %d in %us\n",
 		        retry_count, backoff);
-		interruptible_sleep((int)backoff);
+		/* publish_with_retry 는 worker 핸들 없이 호출되는 케이스 (initial inventory) 가
+		 * 있어 keepalive 인자는 NULL. backoff 가 60s 이하라 broker 가 connection 끊지
+		 * 않음 — heartbeat 는 worker tick 의 keepalive 가 처리. */
+		interruptible_sleep((int)backoff, NULL);
 		if (stop_requested()) { free(body); return -1; }
 		backoff *= 2;
 	}
@@ -220,6 +274,22 @@ int agent_run(void)
 	fprintf(stderr, "[agent] loop mode: interval=%ds, inventory_refresh=%ds\n",
 	        interval, inv_refresh);
 
+	/* worker — task.install consumer. 자격증명 미설정 / 초기화 실패 시 NULL → 비활성. */
+	char wqueue_buf[128] = {0};
+	worker_ctx_t *worker = NULL;
+	{
+		worker_config_t wcfg = make_worker_config(&cfg, machine_id,
+		                                          wqueue_buf, sizeof wqueue_buf);
+		if (wcfg.queue_name && *wcfg.queue_name) {
+			worker = worker_init(&wcfg);
+			fprintf(stderr, "[agent] worker %s (queue=%s)\n",
+			        worker ? "enabled" : "init failed — publish-only",
+			        wcfg.queue_name);
+		} else {
+			fprintf(stderr, "[agent] worker disabled (RABBITMQ_WORKER_USER/PASS 미설정)\n");
+		}
+	}
+
 	time_t inv_next = (inv_refresh > 0)
 		? next_inventory_deadline(time(NULL), inv_refresh) : 0;
 
@@ -245,8 +315,65 @@ int agent_run(void)
 			inv_next = next_inventory_deadline(time(NULL), inv_refresh);
 		}
 
+		/* worker tick — task.install polling + child reap + result publish. */
+		if (worker) worker_tick(worker);
+
 		if (stop_requested()) break;
-		interruptible_sleep(interval);
+		interruptible_sleep(interval, worker);   /* sleep 도중 AMQP heartbeat pump */
+	}
+
+	/* --- Drain — Linux 4-phase 패턴 포팅 (CRITICAL #9 / Round 5 H3) ---
+	 *
+	 * Phase 1 (grace)        : AGENT_DRAIN_GRACE_SEC 동안 install 정상 종료 대기
+	 * Phase 2 (term)         : worker_force_child_term soft → AGENT_DRAIN_TERM_SEC 대기
+	 * Phase 3 (kill)         : worker_force_child_term hard (Windows = exec.c Job Object)
+	 * Phase 4 (publish-stuck): child 가 reap 된 후 result publish 가 계속 실패 시
+	 *                          AGENT_DRAIN_PUBLISH_SEC 후 give up — result 파일은 next
+	 *                          startup replay_pending_results 가 처리. dead broker 가
+	 *                          drain 을 영구 wedge 하는 케이스 방지.
+	 */
+	if (worker) {
+		worker_begin_drain(worker);
+		int grace_sec   = getenv_int_or("AGENT_DRAIN_GRACE_SEC",   600);
+		int term_sec    = getenv_int_or("AGENT_DRAIN_TERM_SEC",    30);
+		int publish_sec = getenv_int_or("AGENT_DRAIN_PUBLISH_SEC", 180);
+		fprintf(stderr, "[agent] draining worker (grace=%ds, term=%ds, publish-stuck=%ds)\n",
+		        grace_sec, term_sec, publish_sec);
+
+		ULONGLONG t0 = GetTickCount64();
+		ULONGLONG reap_done_at = 0;
+		int term_sent = 0;
+		int kill_sent = 0;
+
+		while (!worker_idle(worker)) {
+			worker_tick(worker);
+			/* SCM 에 "아직 stopping 중" 알림 — dwCheckPoint 증분 + wait_hint 2.5s 갱신.
+			 * 호출 안 하면 service_ctrl_handler 의 30s wait_hint 만료 후 SCM stuck 판정. */
+			service_stop_pending_update(2500);
+			long elapsed = (long)((GetTickCount64() - t0) / 1000ULL);
+
+			if (!term_sent && elapsed >= grace_sec) {
+				fprintf(stderr, "[agent] drain phase 2: soft term\n");
+				worker_force_child_term(worker, 0);
+				term_sent = 1;
+			} else if (term_sent && !kill_sent && elapsed >= grace_sec + term_sec) {
+				fprintf(stderr, "[agent] drain phase 3: hard kill\n");
+				worker_force_child_term(worker, 1);
+				kill_sent = 1;
+			}
+
+			/* Phase 4: child reap 후 result publish stuck deadline. */
+			if (reap_done_at == 0 && !worker_has_live_child(worker))
+				reap_done_at = GetTickCount64();
+			if (reap_done_at != 0 &&
+			    (long)((GetTickCount64() - reap_done_at) / 1000ULL) >= publish_sec) {
+				fprintf(stderr, "[agent] drain: result publish stuck for %ds - giving up; "
+				                "result file will replay on next startup\n", publish_sec);
+				break;
+			}
+			Sleep(1000);
+		}
+		worker_shutdown(worker);
 	}
 
 	fprintf(stderr, "[agent] stopping (machine_id=%s)\n", machine_id);
