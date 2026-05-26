@@ -87,9 +87,12 @@ static worker_config_t make_worker_config(const publish_config_t *pcfg,
 	wcfg.amqp.password  = wpass;
 	wcfg.amqp.exchange  = getenv_default("WORKER_TASK_EXCHANGE", "assessment.tasks");
 
+	/* 큐 이름은 composite_id 기반 — payload contract v4. portal 측 routing key
+	 * `task.install.<composite_id>` 와 정확히 일치해야 task 매치. */
+	const char *cid = cached_composite_id(machine_id);
 	snprintf(queue_name_buf, qbuf_sz, "%s.%s",
 	         getenv_default("WORKER_TASK_QUEUE_PREFIX", "agent.tasks"),
-	         machine_id ? machine_id : "");
+	         cid);
 	wcfg.queue_name         = queue_name_buf;
 	wcfg.result_routing_key = getenv_default("WORKER_TASK_RESULT_KEY", "task.result");
 	wcfg.machine_id         = machine_id;
