@@ -137,11 +137,17 @@ static void emit_error(const publish_config_t *cfg, const char *machine_id,
 		        code ? code : "?");
 }
 
-/* Sleep in 1-second slices so SCM stop response is bounded. */
-static void interruptible_sleep(int seconds)
+/* Sleep in 1-second slices — SCM stop response 가 1초 단위 + worker AMQP
+ * heartbeat 가 매 slice 마다 pump. heartbeat 안 돌면 broker 가 connection 끊으므로
+ * (60초 default) sleep 도중 keepalive 호출 필수.
+ *
+ * worker == NULL 이면 keepalive skip (worker 비활성 모드). */
+static void interruptible_sleep(int seconds, worker_ctx_t *worker)
 {
-	for (int i = 0; i < seconds && !stop_requested(); i++)
+	for (int i = 0; i < seconds && !stop_requested(); i++) {
 		Sleep(1000);
+		if (worker) worker_keepalive(worker);
+	}
 }
 
 static time_t next_inventory_deadline(time_t now, int refresh_sec)
@@ -190,7 +196,10 @@ static int publish_with_retry(const publish_config_t *cfg, const char *rk,
 			backoff = (unsigned int)max_backoff;
 		fprintf(stderr, "[agent] publish failed, retry %d in %us\n",
 		        retry_count, backoff);
-		interruptible_sleep((int)backoff);
+		/* publish_with_retry 는 worker 핸들 없이 호출되는 케이스 (initial inventory) 가
+		 * 있어 keepalive 인자는 NULL. backoff 가 60s 이하라 broker 가 connection 끊지
+		 * 않음 — heartbeat 는 worker tick 의 keepalive 가 처리. */
+		interruptible_sleep((int)backoff, NULL);
 		if (stop_requested()) { free(body); return -1; }
 		backoff *= 2;
 	}
@@ -310,25 +319,56 @@ int agent_run(void)
 		if (worker) worker_tick(worker);
 
 		if (stop_requested()) break;
-		interruptible_sleep(interval);
+		interruptible_sleep(interval, worker);   /* sleep 도중 AMQP heartbeat pump */
 	}
 
-	/* --- Drain — Service Stop 신호 수신 후 진행 중 install 마무리 대기. --- */
+	/* --- Drain — Linux 4-phase 패턴 포팅 (CRITICAL #9 / Round 5 H3) ---
+	 *
+	 * Phase 1 (grace)        : AGENT_DRAIN_GRACE_SEC 동안 install 정상 종료 대기
+	 * Phase 2 (term)         : worker_force_child_term soft → AGENT_DRAIN_TERM_SEC 대기
+	 * Phase 3 (kill)         : worker_force_child_term hard (Windows = exec.c Job Object)
+	 * Phase 4 (publish-stuck): child 가 reap 된 후 result publish 가 계속 실패 시
+	 *                          AGENT_DRAIN_PUBLISH_SEC 후 give up — result 파일은 next
+	 *                          startup replay_pending_results 가 처리. dead broker 가
+	 *                          drain 을 영구 wedge 하는 케이스 방지.
+	 */
 	if (worker) {
 		worker_begin_drain(worker);
-		int drain_grace = getenv_int_or("AGENT_DRAIN_GRACE_SEC", 600);
-		for (int i = 0; i < drain_grace && !worker_idle(worker); i++) {
+		int grace_sec   = getenv_int_or("AGENT_DRAIN_GRACE_SEC",   600);
+		int term_sec    = getenv_int_or("AGENT_DRAIN_TERM_SEC",    30);
+		int publish_sec = getenv_int_or("AGENT_DRAIN_PUBLISH_SEC", 180);
+		fprintf(stderr, "[agent] draining worker (grace=%ds, term=%ds, publish-stuck=%ds)\n",
+		        grace_sec, term_sec, publish_sec);
+
+		ULONGLONG t0 = GetTickCount64();
+		ULONGLONG reap_done_at = 0;
+		int term_sent = 0;
+		int kill_sent = 0;
+
+		while (!worker_idle(worker)) {
 			worker_tick(worker);
-			Sleep(1000);
-		}
-		if (!worker_idle(worker)) {
-			fprintf(stderr, "[agent] drain timeout — forcing child termination\n");
-			worker_force_child_term(worker, 1 /* hard */);
-			/* 강제 종료 후 짧게 한 번 더 reap 시도 */
-			for (int i = 0; i < 10 && !worker_idle(worker); i++) {
-				worker_tick(worker);
-				Sleep(500);
+			long elapsed = (long)((GetTickCount64() - t0) / 1000ULL);
+
+			if (!term_sent && elapsed >= grace_sec) {
+				fprintf(stderr, "[agent] drain phase 2: soft term\n");
+				worker_force_child_term(worker, 0);
+				term_sent = 1;
+			} else if (term_sent && !kill_sent && elapsed >= grace_sec + term_sec) {
+				fprintf(stderr, "[agent] drain phase 3: hard kill\n");
+				worker_force_child_term(worker, 1);
+				kill_sent = 1;
 			}
+
+			/* Phase 4: child reap 후 result publish stuck deadline. */
+			if (reap_done_at == 0 && !worker_has_live_child(worker))
+				reap_done_at = GetTickCount64();
+			if (reap_done_at != 0 &&
+			    (long)((GetTickCount64() - reap_done_at) / 1000ULL) >= publish_sec) {
+				fprintf(stderr, "[agent] drain: result publish stuck for %ds - giving up; "
+				                "result file will replay on next startup\n", publish_sec);
+				break;
+			}
+			Sleep(1000);
 		}
 		worker_shutdown(worker);
 	}
