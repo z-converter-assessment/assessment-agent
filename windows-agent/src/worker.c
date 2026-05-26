@@ -64,6 +64,7 @@ typedef struct {
 	char         *work_dir;
 	char         *target_file;
 	char         *result_path;     /* 결과 파일 — thread 가 작성 */
+	char         *running_marker_path;  /* /running\<task_id>.json — thread 정상 종료 시 제거 */
 	const char   *allowed_hosts_csv;  /* config 참조 — context lifetime */
 	const char   *tmp_dir;
 	int           disk_reserve_mb;
@@ -280,6 +281,222 @@ static char *build_result_json(const worker_ctx_t *ctx,
 	return s;
 }
 
+/* ============================================================
+ * Startup cleanup + recovery (Linux D3 / CRITICAL #10 패턴 포팅)
+ * ============================================================ */
+
+/*
+ * 파일명이 `<task_id>.json` 형식인지 검증하고 task_id 부분 추출.
+ * write_file_atomic 의 `*.tmp` 잔여물 / 수기 파일 등은 skip.
+ */
+static int replay_filename_to_task_id(const char *fname, char *out, size_t out_sz)
+{
+	size_t n = strlen(fname);
+	const char *suffix = ".json";
+	size_t slen = strlen(suffix);
+	if (n <= slen) return 0;
+	if (_stricmp(fname + n - slen, suffix) != 0) return 0;
+	size_t base = n - slen;
+	if (base >= out_sz) return 0;
+	memcpy(out, fname, base);
+	out[base] = '\0';
+	return task_id_valid(out);
+}
+
+/*
+ * /done\<task_id>.json 중 retention 지난 파일 삭제. 디스크 점유 방지.
+ */
+static void purge_expired_done(const struct worker_ctx_s *ctx)
+{
+	char pattern[1024];
+	if ((size_t)snprintf(pattern, sizeof pattern, "%s\\*.json", ctx->done_dir) >= sizeof pattern) return;
+	WIN32_FIND_DATAA fd;
+	HANDLE h = FindFirstFileA(pattern, &fd);
+	if (h == INVALID_HANDLE_VALUE) return;
+
+	FILETIME now_ft;
+	GetSystemTimeAsFileTime(&now_ft);
+	ULARGE_INTEGER now;
+	now.LowPart  = now_ft.dwLowDateTime;
+	now.HighPart = now_ft.dwHighDateTime;
+
+	ULONGLONG retention_100ns = (ULONGLONG)ctx->cfg.done_retention_sec * 10000000ULL;
+
+	do {
+		if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+		ULARGE_INTEGER mt;
+		mt.LowPart  = fd.ftLastWriteTime.dwLowDateTime;
+		mt.HighPart = fd.ftLastWriteTime.dwHighDateTime;
+		if (now.QuadPart > mt.QuadPart &&
+		    (now.QuadPart - mt.QuadPart) > retention_100ns) {
+			char path[1024];
+			if ((size_t)snprintf(path, sizeof path, "%s\\%s", ctx->done_dir, fd.cFileName) < sizeof path)
+				DeleteFileA(path);
+		}
+	} while (FindNextFileA(h, &fd));
+	FindClose(h);
+}
+
+/*
+ * %TEMP%\agent-task-* 잔여 workspace 삭제. 부모 crash 후 남은 폴더.
+ */
+static void purge_stale_workspaces(const struct worker_ctx_s *ctx)
+{
+	char pattern[1024];
+	if ((size_t)snprintf(pattern, sizeof pattern, "%s\\agent-task-*", ctx->cfg.tmp_dir) >= sizeof pattern) return;
+	WIN32_FIND_DATAA fd;
+	HANDLE h = FindFirstFileA(pattern, &fd);
+	if (h == INVALID_HANDLE_VALUE) return;
+	do {
+		if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+		char path[1024];
+		if ((size_t)snprintf(path, sizeof path, "%s\\%s", ctx->cfg.tmp_dir, fd.cFileName) < sizeof path)
+			rmrf_recursive(path);
+	} while (FindNextFileA(h, &fd));
+	FindClose(h);
+}
+
+/*
+ * /running\<task_id>.json marker 헬퍼.
+ * spawn_install 직전 작성 + install thread 정상 종료 시 제거.
+ * worker_init 의 recover_stale_running 가 잔존 marker 를 mid-install 크래시로 처리.
+ */
+static int running_marker_present(const struct worker_ctx_s *ctx, const char *task_id)
+{
+	char path[1024];
+	if ((size_t)snprintf(path, sizeof path, "%s\\%s.json", ctx->running_dir, task_id) >= sizeof path)
+		return 0;
+	return file_exists(path);
+}
+
+static int write_running_marker(const struct worker_ctx_s *ctx, const char *task_id)
+{
+	char path[1024];
+	if ((size_t)snprintf(path, sizeof path, "%s\\%s.json", ctx->running_dir, task_id) >= sizeof path)
+		return -1;
+
+	char body[256];
+	snprintf(body, sizeof body,
+	         "{\"task_id\":\"%s\",\"started_at\":\"%s\"}\n",
+	         task_id, iso8601_now());
+	return write_file_atomic(path, body);
+}
+
+static void clear_running_marker(const struct worker_ctx_s *ctx, const char *task_id)
+{
+	char path[1024];
+	if ((size_t)snprintf(path, sizeof path, "%s\\%s.json", ctx->running_dir, task_id) >= sizeof path) return;
+	DeleteFileA(path);
+}
+
+/*
+ * Startup /results scan — 부모 crash 후 미발행 result 파일들을 broker 에 재발행.
+ * 원본 delivery_tag 는 채널 close 로 무효이지만, redelivered task 가 /done 마커를 통해
+ * already_done 으로 처리되도록 publish 후 /done 으로 이동.
+ */
+static void replay_pending_results(struct worker_ctx_s *ctx)
+{
+	if (!ctx->conn || ctx->conn_dead) return;
+	char pattern[1024];
+	if ((size_t)snprintf(pattern, sizeof pattern, "%s\\*.json", ctx->results_dir) >= sizeof pattern) return;
+	WIN32_FIND_DATAA fd;
+	HANDLE h = FindFirstFileA(pattern, &fd);
+	if (h == INVALID_HANDLE_VALUE) return;
+	do {
+		if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+		char task_id[64];
+		if (!replay_filename_to_task_id(fd.cFileName, task_id, sizeof task_id)) {
+			fprintf(stderr, "[worker] replay: skipping unrecognized file '%s'\n", fd.cFileName);
+			continue;
+		}
+		char path[1024];
+		if ((size_t)snprintf(path, sizeof path, "%s\\%s", ctx->results_dir, fd.cFileName) >= sizeof path) continue;
+		char *body = NULL;
+		size_t body_len = 0;
+		if (read_file_all(path, &body, &body_len) != 0 || !body) continue;
+		int rc = publish_conn_publish(ctx->conn,
+		                              ctx->cfg.amqp.exchange ? ctx->cfg.amqp.exchange : "assessment.tasks",
+		                              ctx->cfg.result_routing_key ? ctx->cfg.result_routing_key : "task.result",
+		                              body, body_len);
+		free(body);
+		if (rc != 0) {
+			fprintf(stderr, "[worker] replay publish failed for %s — left for next startup\n", fd.cFileName);
+			continue;
+		}
+		char dp[1024];
+		snprintf(dp, sizeof dp, "%s\\%s.json", ctx->done_dir, task_id);
+		MoveFileExA(path, dp, MOVEFILE_REPLACE_EXISTING);
+	} while (FindNextFileA(h, &fd));
+	FindClose(h);
+}
+
+/*
+ * Forward decl — recover_stale_running 가 사용. build_result_json 은 아래쪽에 정의.
+ */
+static char *build_result_json(const struct worker_ctx_s *ctx,
+                               const char *task_id, const char *status,
+                               const char *failure_reason,
+                               int has_exit_code, int exit_code, long duration_ms,
+                               const char *stdout_tail, const char *stderr_tail);
+
+/*
+ * Startup /running scan — marker 존재 = 이전 인스턴스가 mid-install 크래시.
+ * /done 또는 /results 에 이미 결과가 있으면 그 결과를 신뢰하고 marker 만 제거.
+ * 둘 다 없으면 synth failure 를 /done 에 쓰고 best-effort publish (connection
+ * 다운된 케이스에서는 broker redelivery + I1 로 복구).
+ */
+static void recover_stale_running(struct worker_ctx_s *ctx)
+{
+	char pattern[1024];
+	if ((size_t)snprintf(pattern, sizeof pattern, "%s\\*.json", ctx->running_dir) >= sizeof pattern) return;
+	WIN32_FIND_DATAA fd;
+	HANDLE h = FindFirstFileA(pattern, &fd);
+	if (h == INVALID_HANDLE_VALUE) return;
+	do {
+		if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+		char task_id[64];
+		if (!replay_filename_to_task_id(fd.cFileName, task_id, sizeof task_id)) continue;
+
+		char done_path[1024], results_path[1024], src_path[1024];
+		int have_done    = 0, have_results = 0;
+		if ((size_t)snprintf(done_path,    sizeof done_path,    "%s\\%s.json", ctx->done_dir,    task_id) < sizeof done_path)
+			have_done = file_exists(done_path);
+		if ((size_t)snprintf(results_path, sizeof results_path, "%s\\%s.json", ctx->results_dir, task_id) < sizeof results_path)
+			have_results = file_exists(results_path);
+
+		int safe_to_unlink = 1;
+
+		if (!have_done && !have_results) {
+			char *body = build_result_json(ctx, task_id, "failure", "internal_error",
+			                               0, 0, 0, "",
+			                               "agent terminated mid-install; recovered on restart\n");
+			if (!body) {
+				safe_to_unlink = 0;
+			} else {
+				/* /done 먼저 쓰고 publish (write 실패 시 /running 유지 — 다음 startup 재시도) */
+				if (write_file_atomic(done_path, body) != 0) {
+					fprintf(stderr, "[worker] recover: /done write failed for %s — leaving /running for next startup\n", task_id);
+					safe_to_unlink = 0;
+				} else if (ctx->conn && !ctx->conn_dead) {
+					(void)publish_conn_publish(ctx->conn,
+					                           ctx->cfg.amqp.exchange ? ctx->cfg.amqp.exchange : "assessment.tasks",
+					                           ctx->cfg.result_routing_key ? ctx->cfg.result_routing_key : "task.result",
+					                           body, strlen(body));
+				}
+				free(body);
+			}
+		} else {
+			fprintf(stderr, "[worker] recover: task %s has prior result on disk — skipping synth (done=%d results=%d)\n",
+			        task_id, have_done, have_results);
+		}
+
+		if (safe_to_unlink &&
+		    (size_t)snprintf(src_path, sizeof src_path, "%s\\%s", ctx->running_dir, fd.cFileName) < sizeof src_path)
+			DeleteFileA(src_path);
+	} while (FindNextFileA(h, &fd));
+	FindClose(h);
+}
+
 /* failure_reason mapping from download / exec status. */
 static const char *reason_for_status(download_status_t ds, exec_status_t xs)
 {
@@ -381,9 +598,15 @@ static unsigned __stdcall install_thread_main(void *arg)
 	 * target_file 만 work_dir 안에 있음). */
 	rmrf_recursive(a->work_dir);
 
+	/* CRITICAL #10: result 파일 작성이 끝났으니 /running marker 제거.
+	 * 이 시점 이후 부모가 crash 해도 startup replay_pending_results 가 /results 파일을
+	 * 처리하고, 이 task 는 /done 으로 이동되어 redelivery 시 I1 가드에 막힘. */
+	if (a->running_marker_path) DeleteFileA(a->running_marker_path);
+
 	/* free thread args */
 	free(a->task_id);    free(a->url);         free(a->sha256);
 	free(a->work_dir);   free(a->target_file); free(a->result_path);
+	free(a->running_marker_path);
 	free(a);
 	return 0;
 }
@@ -415,10 +638,30 @@ worker_ctx_t *worker_init(const worker_config_t *cfg)
 		return NULL;
 	}
 
-	/* AMQP 연결은 lazy — 첫 tick 에서 시도. tick 실패 시 backoff 재시도. */
-	ctx->conn = NULL;
-	ctx->conn_dead = 1;
+	/* AMQP 시도 — 성공/실패 모두 OK (실패 시 다음 tick 재시도, replay 만 deferred). */
+	ctx->conn = publish_conn_open(&ctx->cfg.amqp);
+	ctx->conn_dead = (ctx->conn == NULL);
 	ctx->reconnect_backoff_sec = 0;
+	if (ctx->conn) {
+		fprintf(stderr, "[worker] AMQP connected (queue=%s)\n", ctx->cfg.queue_name);
+	} else {
+		fprintf(stderr, "[worker] AMQP initial connect failed - will retry on next tick\n");
+	}
+
+	/* Startup procedures — Linux 패턴 포팅.
+	 *   1. recover_stale_running: 이전 인스턴스 mid-install 크래시 처리 (/running marker 잔존)
+	 *   2. replay_pending_results: 미발행 result 파일 publish + /done 이동 (connect 필요)
+	 *   3. purge_expired_done: retention 지난 /done 마커 삭제 (connect 무관)
+	 *   4. purge_stale_workspaces: 잔존 %TEMP%\agent-task-* 정리
+	 *
+	 * 순서 주의: recover 가 /done 을 쓰므로 replay 보다 먼저. replay 는 /done 이동을
+	 * 위해 recover 가 만든 /done 마커와 충돌 없게 task_id 가 다르다는 가정 (다른
+	 * 시점 task 들이라 OK). purge_expired_done 은 두 작업 다 끝난 뒤. */
+	recover_stale_running(ctx);
+	replay_pending_results(ctx);
+	purge_expired_done(ctx);
+	purge_stale_workspaces(ctx);
+
 	return ctx;
 }
 
@@ -463,11 +706,30 @@ static int ensure_connection(worker_ctx_t *ctx)
 static int spawn_install(worker_ctx_t *ctx, cJSON *task)
 {
 	const cJSON *jid       = cJSON_GetObjectItemCaseSensitive(task, "task_id");
+	const cJSON *jmachine  = cJSON_GetObjectItemCaseSensitive(task, "machine_id");
 	const cJSON *jdownload = cJSON_GetObjectItemCaseSensitive(task, "download");
 	const cJSON *jinstall  = cJSON_GetObjectItemCaseSensitive(task, "install");
 
 	const char *task_id = cJSON_IsString(jid) ? jid->valuestring : NULL;
 	if (!task_id_valid(task_id)) return -1;
+
+	/* machine_id mismatch — portal 라우팅 오류 안전망. 합성 result + 즉시 ack.
+	 * (Linux child_run_task 의 mismatch 가드 포팅) */
+	if (cJSON_IsString(jmachine) && ctx->cfg.machine_id &&
+	    strcmp(jmachine->valuestring, ctx->cfg.machine_id) != 0) {
+		char *res = build_result_json(ctx, task_id, "failure", "internal_error",
+		                              0, 0, 0, "",
+		                              "machine_id mismatch - task routed in error\n");
+		if (res) {
+			char rp[1024];
+			snprintf(rp, sizeof rp, "%s\\%s.json", ctx->results_dir, task_id);
+			write_file_atomic(rp, res);
+			free(res);
+		}
+		strncpy_s(ctx->inflight_task_id, sizeof ctx->inflight_task_id,
+		          task_id, _TRUNCATE);
+		return 1;  /* result ready, no thread */
+	}
 
 	const char *install_type_s = "shell";   /* backward-compat default */
 	int timeout_sec = 600;
@@ -528,27 +790,43 @@ static int spawn_install(worker_ctx_t *ctx, cJSON *task)
 	a->machine_id        = ctx->cfg.machine_id;
 	a->agent_version     = ctx->cfg.agent_version;
 
-	char work[1024], target[1024], res[1024];
+	char work[1024], target[1024], res[1024], run[1024];
 	snprintf(work,   sizeof work,   "%s\\agent-task-%s", ctx->cfg.tmp_dir, task_id);
 	const char *ext = (install_type == EXEC_INSTALL_TYPE_MSI) ? "msi" : "exe";
 	snprintf(target, sizeof target, "%s\\package.%s", work, ext);
 	snprintf(res,    sizeof res,    "%s\\%s.json", ctx->results_dir, task_id);
-	a->work_dir    = _strdup(work);
-	a->target_file = _strdup(target);
-	a->result_path = _strdup(res);
+	snprintf(run,    sizeof run,    "%s\\%s.json", ctx->running_dir, task_id);
+	a->work_dir            = _strdup(work);
+	a->target_file         = _strdup(target);
+	a->result_path         = _strdup(res);
+	a->running_marker_path = _strdup(run);
 
 	if (!a->task_id || !a->url || !a->sha256 ||
-	    !a->work_dir || !a->target_file || !a->result_path) {
+	    !a->work_dir || !a->target_file || !a->result_path || !a->running_marker_path) {
 		free(a->task_id); free(a->url); free(a->sha256);
 		free(a->work_dir); free(a->target_file); free(a->result_path);
+		free(a->running_marker_path);
+		free(a);
+		return -1;
+	}
+
+	/* CRITICAL #10: /running marker 작성 실패 시 thread 시작 금지. 없이 시작하면
+	 * redelivery 시 I1 가드가 작동 안 해서 double-execute 가능. */
+	if (write_running_marker(ctx, a->task_id) != 0) {
+		fprintf(stderr, "[worker] write_running_marker failed for %s - aborting spawn\n", a->task_id);
+		free(a->task_id); free(a->url); free(a->sha256);
+		free(a->work_dir); free(a->target_file); free(a->result_path);
+		free(a->running_marker_path);
 		free(a);
 		return -1;
 	}
 
 	uintptr_t th = _beginthreadex(NULL, 0, install_thread_main, a, 0, NULL);
 	if (th == 0) {
+		clear_running_marker(ctx, a->task_id);  /* thread 시작 실패 — marker 회수 */
 		free(a->task_id); free(a->url); free(a->sha256);
 		free(a->work_dir); free(a->target_file); free(a->result_path);
+		free(a->running_marker_path);
 		free(a);
 		return -1;
 	}
@@ -558,42 +836,71 @@ static int spawn_install(worker_ctx_t *ctx, cJSON *task)
 	return 0;
 }
 
-static void publish_result_and_ack(worker_ctx_t *ctx)
+/*
+ * Publish + ack 시도. 성공 시 0 반환 + inflight 비움 + result 파일 → /done 이동.
+ * 실패 시 -1 반환 + inflight 유지 (다음 tick 또는 다음 startup replay 가 처리).
+ * 영구 실패 (파일 missing + synth 도 실패) 도 inflight 비움 + drop.
+ */
+static int publish_result_and_ack(worker_ctx_t *ctx)
 {
 	char rp[1024];
 	snprintf(rp, sizeof rp, "%s\\%s.json", ctx->results_dir, ctx->inflight_task_id);
 
 	char *body = NULL;
 	size_t body_len = 0;
+	int from_synth = 0;
 	if (read_file_all(rp, &body, &body_len) != 0) {
-		fprintf(stderr, "[worker] result file missing %s — synthesizing internal_error\n", rp);
+		fprintf(stderr, "[worker] result file missing %s - synthesizing internal_error\n", rp);
 		char *synth = build_result_json(ctx, ctx->inflight_task_id, "failure",
 		                                "internal_error", 0, 0, 0, "",
 		                                "result file missing\n");
-		if (synth) { body = synth; body_len = strlen(synth); }
+		if (synth) { body = synth; body_len = strlen(synth); from_synth = 1; }
 	}
 
-	if (body && ctx->conn && !ctx->conn_dead) {
-		int rc = publish_conn_publish(ctx->conn,
-			ctx->cfg.amqp.exchange ? ctx->cfg.amqp.exchange : "assessment.tasks",
-			ctx->cfg.result_routing_key ? ctx->cfg.result_routing_key : "task.result",
-			body, body_len);
-		if (rc != 0) {
-			fprintf(stderr, "[worker] result publish failed — connection marked dead\n");
-			ctx->conn_dead = 1;
-		} else if (ctx->inflight_delivery_tag != 0 &&
-		           publish_conn_ack(ctx->conn, ctx->inflight_delivery_tag) != 0) {
-			ctx->conn_dead = 1;
-		} else {
-			/* 성공: result 파일 → done\ 으로 이동 */
-			char dp[1024];
-			snprintf(dp, sizeof dp, "%s\\%s.json", ctx->done_dir, ctx->inflight_task_id);
-			MoveFileExA(rp, dp, MOVEFILE_REPLACE_EXISTING);
-		}
+	if (!body) {
+		/* 결과 파일도 없고 synth OOM — drop (보고 못 함). inflight 비움. */
+		ctx->inflight_task_id[0] = '\0';
+		ctx->inflight_delivery_tag = 0;
+		return -1;
 	}
+
+	/* conn dead — 다음 tick / startup replay 에 미룸. inflight 유지. */
+	if (!ctx->conn || ctx->conn_dead) {
+		free(body);
+		return -1;
+	}
+
+	int pub_rc = publish_conn_publish(ctx->conn,
+		ctx->cfg.amqp.exchange ? ctx->cfg.amqp.exchange : "assessment.tasks",
+		ctx->cfg.result_routing_key ? ctx->cfg.result_routing_key : "task.result",
+		body, body_len);
 	free(body);
+
+	if (pub_rc != 0) {
+		fprintf(stderr, "[worker] result publish failed - connection marked dead, will retry next tick\n");
+		ctx->conn_dead = 1;
+		return -1;  /* inflight 유지 — 다음 tick 재시도 */
+	}
+
+	if (ctx->inflight_delivery_tag != 0 &&
+	    publish_conn_ack(ctx->conn, ctx->inflight_delivery_tag) != 0) {
+		fprintf(stderr, "[worker] basic.ack failed - connection marked dead\n");
+		ctx->conn_dead = 1;
+		/* publish 는 성공했지만 ack 실패 — 다음 tick 에 ack 만 다시 시도. inflight 유지.
+		 * 단 result 가 broker 에 이미 들어갔으니 redelivery 시 done 마커 + I1 로 가드. */
+		return -1;
+	}
+
+	/* 전 성공: result 파일을 /done\ 으로 이동 (atomic, fail-safe — Linux와 동일). */
+	if (!from_synth) {
+		char dp[1024];
+		snprintf(dp, sizeof dp, "%s\\%s.json", ctx->done_dir, ctx->inflight_task_id);
+		MoveFileExA(rp, dp, MOVEFILE_REPLACE_EXISTING);
+	}
+
 	ctx->inflight_task_id[0] = '\0';
 	ctx->inflight_delivery_tag = 0;
+	return 0;
 }
 
 int worker_tick(worker_ctx_t *ctx)
@@ -603,20 +910,22 @@ int worker_tick(worker_ctx_t *ctx)
 	/* AMQP 연결 보장. 실패 시 다음 tick 으로. */
 	if (ensure_connection(ctx) != 0) return 0;
 
-	/* BUSY: install thread 종료 폴링. */
+	/* BUSY: install thread 종료 폴링 + result publish. publish 실패 시 BUSY 유지하여
+	 * 다음 tick 재시도 (conn 살아나거나 다음 startup replay). */
 	if (ctx->state == WSTATE_BUSY) {
 		if (ctx->install_thread) {
 			DWORD wr = WaitForSingleObject(ctx->install_thread, 0);
 			if (wr == WAIT_OBJECT_0) {
 				CloseHandle(ctx->install_thread);
 				ctx->install_thread = NULL;
-				publish_result_and_ack(ctx);
-				ctx->state = WSTATE_IDLE;
+				if (publish_result_and_ack(ctx) == 0)
+					ctx->state = WSTATE_IDLE;
+				/* else: inflight 유지 — 다음 tick 에서 thread==NULL 분기로 재진입 */
 			}
 		} else {
-			/* unsupported_install_type 합성 케이스 — thread 없이 result 만 작성됨. */
-			publish_result_and_ack(ctx);
-			ctx->state = WSTATE_IDLE;
+			/* thread 없음 (unsupported_install_type / mismatch / publish 재시도 케이스) */
+			if (publish_result_and_ack(ctx) == 0)
+				ctx->state = WSTATE_IDLE;
 		}
 	}
 
