@@ -99,8 +99,11 @@ vendor-fetch:
 vendor-build: vendor-fetch vendor-build-openssl vendor-build-zlib vendor-build-cjson vendor-build-rabbitmq
 
 vendor-build-openssl:
+	# `--libdir=lib` 명시 — OpenSSL 3.x 가 host triplet 에 따라 `lib64` 또는
+	# `lib/<host>` 로 install 하면 Makefile 의 $(OPENSSL_SSL) 고정 경로
+	# (`install/lib/libssl.a`) 와 어긋난다.
 	cd $(OPENSSL_DIR) && ./Configure $(OPENSSL_TARGET) no-shared no-dso no-engine no-tests $(OPENSSL_CROSS) \
-	    --prefix=$(CURDIR)/$(OPENSSL_DIR)/install
+	    --libdir=lib --prefix=$(CURDIR)/$(OPENSSL_DIR)/install
 	$(MAKE) -C $(OPENSSL_DIR) -j$(JOBS)
 	$(MAKE) -C $(OPENSSL_DIR) install_sw
 
@@ -131,6 +134,11 @@ vendor-build-rabbitmq:
 	      -DOPENSSL_USE_STATIC_LIBS=TRUE \
 	      -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 	$(CMAKE) --build $(RABBITMQ_C_DIR)/build --target rabbitmq-static -- -j$(JOBS)
+	# Windows mingw cmake 가 정적 라이브러리에 `lib` prefix 를 자동 추가하면서
+	# SOVERSION 까지 붙여 `liblibrabbitmq.<N>.a` 형태로 출력한다. Linux 와 동일
+	# 경로 (`librabbitmq.a`) 로 별칭을 만들어 $(RABBITMQ_C_LIB) 경로를 통일.
+	cp $(RABBITMQ_C_DIR)/build/librabbitmq/liblibrabbitmq.*.a \
+	   $(RABBITMQ_C_DIR)/build/librabbitmq/librabbitmq.a
 
 vendor-clean:
 	rm -rf $(VENDOR_DIR)
