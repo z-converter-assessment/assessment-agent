@@ -148,8 +148,10 @@ vendor-build-rabbitmq:
 
 vendor-build-curl:
 	# libcurl static, OpenSSL backend, IDN/LDAP/FTP 등 비사용 옵션 비활성.
-	# verify 단계의 DLL 화이트리스트는 이미 wldap32/normaliz 를 포함하지 않으므로
-	# CURL_DISABLE_LDAP=ON / 추가 IDN 옵션 OFF 로 의존을 최소화한다.
+	# MSYS2 mingw64 환경엔 libpsl / libssh2 / libidn2 / brotli / zstd / nghttp2 등이
+	# 설치돼 있어 cmake auto-detection 이 자동 ON 처리 → libcurl.a 가 그 의존성에
+	# 미해결 심볼을 남긴다. Linux manylinux2014 와 동일한 최소 의존 빌드를 강제하기
+	# 위해 모든 선택적 의존을 명시적으로 OFF.
 	$(CMAKE) -S $(CURL_DIR) -B $(CURL_DIR)/build \
 	      -DCMAKE_C_COMPILER=$(CC) \
 	      -DBUILD_SHARED_LIBS=OFF -DCURL_STATICLIB=ON \
@@ -158,6 +160,10 @@ vendor-build-curl:
 	      -DCURL_DISABLE_FILE=ON -DCURL_DISABLE_DICT=ON -DCURL_DISABLE_TELNET=ON \
 	      -DCURL_DISABLE_TFTP=ON -DCURL_DISABLE_RTSP=ON -DCURL_DISABLE_POP3=ON \
 	      -DCURL_DISABLE_IMAP=ON -DCURL_DISABLE_SMTP=ON -DCURL_DISABLE_GOPHER=ON \
+	      -DCURL_USE_LIBPSL=OFF  -DCURL_USE_LIBSSH2=OFF -DCURL_USE_LIBSSH=OFF \
+	      -DCURL_USE_LIBIDN2=OFF -DCURL_USE_GSASL=OFF   -DCURL_USE_GSSAPI=OFF \
+	      -DCURL_BROTLI=OFF       -DCURL_ZSTD=OFF        -DUSE_NGHTTP2=OFF \
+	      -DUSE_NGTCP2=OFF        -DUSE_QUICHE=OFF       -DUSE_LIBRTMP=OFF \
 	      -DOPENSSL_ROOT_DIR=$(CURDIR)/$(OPENSSL_DIR)/install \
 	      -DOPENSSL_USE_STATIC_LIBS=TRUE \
 	      -DZLIB_INCLUDE_DIR=$(CURDIR)/$(ZLIB_DIR) \
