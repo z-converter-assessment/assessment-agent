@@ -1,0 +1,24 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.DS_Store
+
+# C build artifacts
+src/*.o
+/assessment-agent
+/tests/unit/run_unit
+
+# Vendored third-party sources (fetched by `make vendor-fetch`)
+/vendor/
+/windows-agent/vendor/
+
+# dist/ 는 release artifact (assessment-agent-linux-x86_64 + SHA256SUMS) —
+# git 으로 운영 서버에 전달되므로 *추적함*. 빌드 중 임시 결과만 ignore 하고
+# 싶다면 별도 path (예: build-staging/) 사용.
+
+# Local Claude Code settings (per-user, not shared)
+.claude/settings.local.json
+.claude/settings.json.local
