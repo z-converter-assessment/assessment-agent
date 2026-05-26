@@ -120,17 +120,27 @@ AI 기반 Assessment 서비스의 **데이터 수집 에이전트**.
 
 Exchange: `assessment` (direct, durable). Delivery mode: persistent (2).
 
-| 타입 | Routing Key | 발송 시점 | 설명 |
-|------|-------------|-----------|------|
-| `inventory` | `server.inventory` | 기동 시 + 정적 정보 변경 감지 시 | OS, 커널, CPU 모델, 메모리·스왑 총량, 디스크 구성, 마운트, IP |
-| `metrics` | `server.metrics` | 주기적 (기본 60초) | `cpu_stat`(raw tick), `mem_*_kb`, `swap_*_kb`, `load_{1,5,15}m`, `disk_io[]`, `mounts[]`, `net_io[]` (모두 raw) |
-| `error` | `server.error` | 수집/발행 실패 시 (선택적 도구 부재는 발행 안 함) | `error_code`, `error_message`, `failed_component`, 재시도 요약 |
+| 타입 | Routing Key | 방향 | 설명 |
+|------|-------------|------|------|
+| `inventory`    | `server.inventory`              | agent → engine  | OS, 커널, CPU 모델, 메모리·스왑 총량, 디스크, 마운트, IP, MAC |
+| `metrics`      | `server.metrics`                | agent → engine  | `cpu_stat`(raw tick), `mem_*_kb`, `swap_*_kb`, `load_{1,5,15}m`, `disk_io[]`, `mounts[]`, `net_io[]` (모두 raw) |
+| `error`        | `server.error`                  | agent → engine  | `error_code`, `error_message`, `failed_component`, 재시도 요약 |
+| `task.install` | `task.install.<composite_id>`   | portal → agent  | `install.type ∈ {shell, direct_exec, msi}` + `download.url/sha256/size_bytes`. agent OS 가 처리 불가능한 type 은 `unsupported_install_type` 으로 즉시 reject |
+| `task.result`  | `task.result`                   | agent → portal  | `status`, `failure_reason`(enum), `exit_code`, `stdout_tail`, `stderr_tail`, `duration_ms` |
 
 DLX(`assessment.dlx`)는 컨슈머 측 NAK / TTL 만료 / 큐 길이 초과 시 자동 라우팅 (`server.*.dead`).
 
-공통 메타데이터: `message_type`, `machine_id`, `agent_version`, `collected_at`(ISO 8601 UTC), `hostname`, `message_id`(UUID v4). **`machine_id`가 모든 메시지의 서버 식별자**.
+공통 메타데이터: `message_type`, `machine_id`, `composite_id`(sha256), `os_family`(`linux`/`windows`), `agent_version`, `collected_at`(ISO 8601 UTC), `hostname`, `message_id`(UUID v4), `boot_time`, `agent_started_at`. **`composite_id` = `sha256(machine_id + "\n" + sorted MACs)` 가 호스트 식별 주키** (이미지 클론으로 `machine_id` 중복되는 환경 대응).
 
 상세 스키마 및 JSON 예시: [`docs/payload-schema.md`](docs/payload-schema.md)
+
+### install.type 매핑
+
+| install.type   | Linux worker         | Windows worker (v2)                       |
+|----------------|----------------------|-------------------------------------------|
+| `shell`        | tar 추출 후 install.sh 실행 | reject → `unsupported_install_type` |
+| `direct_exec`  | reject → `unsupported_install_type` | 다운로드 파일을 `CreateProcessW` 로 직접 실행 |
+| `msi`          | reject → `unsupported_install_type` | `msiexec /i {path} /quiet /norestart` (exit 0 / 3010 = success) |
 
 ### 수집 소스 (요약)
 
