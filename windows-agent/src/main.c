@@ -20,6 +20,7 @@
 #include "publish.h"
 #include "service.h"
 #include "util.h"
+#include "worker.h"
 #include "cJSON.h"
 
 #include <stdio.h>
@@ -59,6 +60,50 @@ static publish_config_t make_publish_config(void)
 	if (cfg.port <= 0)
 		cfg.port = cfg.tls_enabled ? 5671 : 5672;
 	return cfg;
+}
+
+/* ============================================================
+ *  worker_config_t builder (env-driven)
+ *
+ *  RABBITMQ_WORKER_USER / _PASS 가 비어있으면 worker 비활성 (queue_name 을
+ *  비워서 worker_init 가 NULL 반환하도록 유도).
+ * ============================================================ */
+static worker_config_t make_worker_config(const publish_config_t *pcfg,
+                                          const char *machine_id,
+                                          char *queue_name_buf,
+                                          size_t qbuf_sz)
+{
+	worker_config_t wcfg;
+	memset(&wcfg, 0, sizeof wcfg);
+
+	const char *wuser = getenv("RABBITMQ_WORKER_USER");
+	const char *wpass = getenv("RABBITMQ_WORKER_PASS");
+	if (!wuser || !*wuser || !wpass || !*wpass) {
+		return wcfg;  /* worker disabled */
+	}
+
+	wcfg.amqp           = *pcfg;
+	wcfg.amqp.user      = wuser;
+	wcfg.amqp.password  = wpass;
+	wcfg.amqp.exchange  = getenv_default("WORKER_TASK_EXCHANGE", "assessment.tasks");
+
+	snprintf(queue_name_buf, qbuf_sz, "%s.%s",
+	         getenv_default("WORKER_TASK_QUEUE_PREFIX", "agent.tasks"),
+	         machine_id ? machine_id : "");
+	wcfg.queue_name         = queue_name_buf;
+	wcfg.result_routing_key = getenv_default("WORKER_TASK_RESULT_KEY", "task.result");
+	wcfg.machine_id         = machine_id;
+	wcfg.agent_version      = AGENT_VERSION;
+	wcfg.state_dir          = getenv_default("WORKER_STATE_DIR",
+	                                         "C:\\ProgramData\\assessment-agent\\worker");
+	wcfg.tmp_dir            = getenv_default("WORKER_TMP_DIR", "C:\\Windows\\Temp");
+	wcfg.allowed_hosts_csv  = getenv_default("WORKER_DOWNLOAD_ALLOWED_HOSTS", "");
+	wcfg.done_retention_sec = getenv_int_or ("WORKER_DONE_RETENTION_SEC", 604800);
+	wcfg.disk_reserve_mb    = getenv_int_or ("WORKER_DISK_RESERVE_MB",    50);
+	wcfg.mem_limit_mb       = getenv_int_or ("WORKER_INSTALL_MEM_LIMIT_MB",   2048);
+	wcfg.fsize_limit_mb     = getenv_int_or ("WORKER_INSTALL_FSIZE_LIMIT_MB", 5120);
+	wcfg.active_proc_limit  = getenv_int_or ("WORKER_INSTALL_ACTIVE_PROC_LIMIT", 32);
+	return wcfg;
 }
 
 /* ============================================================
@@ -220,6 +265,22 @@ int agent_run(void)
 	fprintf(stderr, "[agent] loop mode: interval=%ds, inventory_refresh=%ds\n",
 	        interval, inv_refresh);
 
+	/* worker — task.install consumer. 자격증명 미설정 / 초기화 실패 시 NULL → 비활성. */
+	char wqueue_buf[128] = {0};
+	worker_ctx_t *worker = NULL;
+	{
+		worker_config_t wcfg = make_worker_config(&cfg, machine_id,
+		                                          wqueue_buf, sizeof wqueue_buf);
+		if (wcfg.queue_name && *wcfg.queue_name) {
+			worker = worker_init(&wcfg);
+			fprintf(stderr, "[agent] worker %s (queue=%s)\n",
+			        worker ? "enabled" : "init failed — publish-only",
+			        wcfg.queue_name);
+		} else {
+			fprintf(stderr, "[agent] worker disabled (RABBITMQ_WORKER_USER/PASS 미설정)\n");
+		}
+	}
+
 	time_t inv_next = (inv_refresh > 0)
 		? next_inventory_deadline(time(NULL), inv_refresh) : 0;
 
@@ -245,8 +306,31 @@ int agent_run(void)
 			inv_next = next_inventory_deadline(time(NULL), inv_refresh);
 		}
 
+		/* worker tick — task.install polling + child reap + result publish. */
+		if (worker) worker_tick(worker);
+
 		if (stop_requested()) break;
 		interruptible_sleep(interval);
+	}
+
+	/* --- Drain — Service Stop 신호 수신 후 진행 중 install 마무리 대기. --- */
+	if (worker) {
+		worker_begin_drain(worker);
+		int drain_grace = getenv_int_or("AGENT_DRAIN_GRACE_SEC", 600);
+		for (int i = 0; i < drain_grace && !worker_idle(worker); i++) {
+			worker_tick(worker);
+			Sleep(1000);
+		}
+		if (!worker_idle(worker)) {
+			fprintf(stderr, "[agent] drain timeout — forcing child termination\n");
+			worker_force_child_term(worker, 1 /* hard */);
+			/* 강제 종료 후 짧게 한 번 더 reap 시도 */
+			for (int i = 0; i < 10 && !worker_idle(worker); i++) {
+				worker_tick(worker);
+				Sleep(500);
+			}
+		}
+		worker_shutdown(worker);
 	}
 
 	fprintf(stderr, "[agent] stopping (machine_id=%s)\n", machine_id);

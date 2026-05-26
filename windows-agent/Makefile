@@ -33,16 +33,19 @@ AGENT_VERSION ?= 1.0.0
 VENDOR_DIR         := vendor
 CJSON_VERSION      := v1.7.18
 RABBITMQ_C_VERSION := v0.15.0
+CURL_VERSION       := curl-8_10_1
 OPENSSL_VERSION    := openssl-3.0.15
 ZLIB_VERSION       := v1.3.1
 
 CJSON_DIR          := $(VENDOR_DIR)/cJSON
 RABBITMQ_C_DIR     := $(VENDOR_DIR)/rabbitmq-c
+CURL_DIR           := $(VENDOR_DIR)/curl
 OPENSSL_DIR        := $(VENDOR_DIR)/openssl
 ZLIB_DIR           := $(VENDOR_DIR)/zlib
 
 CJSON_LIB          := $(CJSON_DIR)/build/libcjson.a
 RABBITMQ_C_LIB     := $(RABBITMQ_C_DIR)/build/librabbitmq/librabbitmq.a
+CURL_LIB           := $(CURL_DIR)/build/lib/libcurl.a
 OPENSSL_SSL        := $(OPENSSL_DIR)/install/lib/libssl.a
 OPENSSL_CRYPTO     := $(OPENSSL_DIR)/install/lib/libcrypto.a
 ZLIB_LIB           := $(ZLIB_DIR)/libz.a
@@ -53,6 +56,7 @@ OPENSSL_CROSS      ?=
 CFLAGS += -I$(CJSON_DIR) \
           -I$(RABBITMQ_C_DIR)/include \
           -I$(RABBITMQ_C_DIR)/build/include \
+          -I$(CURL_DIR)/include \
           -I$(OPENSSL_DIR)/install/include \
           -I$(ZLIB_DIR) \
           -Iinclude \
@@ -67,7 +71,7 @@ CFLAGS += -I$(CJSON_DIR) \
 #   secur32  : SSPI (used transitively by some Schannel paths)
 #   bcrypt   : BCryptGenRandom (UUID v4 generation)
 #   ole32 / oleaut32 : COM init (used by some Windows API surfaces)
-LDLIBS := $(RABBITMQ_C_LIB) $(CJSON_LIB) $(OPENSSL_SSL) $(OPENSSL_CRYPTO) $(ZLIB_LIB) \
+LDLIBS := $(RABBITMQ_C_LIB) $(CJSON_LIB) $(CURL_LIB) $(OPENSSL_SSL) $(OPENSSL_CRYPTO) $(ZLIB_LIB) \
           -lws2_32 -liphlpapi -ladvapi32 -lkernel32 -luser32 \
           -lcrypt32 -lsecur32 -lbcrypt -lole32 -loleaut32
 
@@ -90,13 +94,14 @@ vendor-fetch:
 	@mkdir -p $(VENDOR_DIR)
 	@test -d $(CJSON_DIR)      || git clone --depth 1 --branch $(CJSON_VERSION)      https://github.com/DaveGamble/cJSON.git  $(CJSON_DIR)
 	@test -d $(RABBITMQ_C_DIR) || git clone --depth 1 --branch $(RABBITMQ_C_VERSION) https://github.com/alanxz/rabbitmq-c.git $(RABBITMQ_C_DIR)
+	@test -d $(CURL_DIR)       || git clone --depth 1 --branch $(CURL_VERSION)       https://github.com/curl/curl.git         $(CURL_DIR)
 	@test -d $(OPENSSL_DIR)    || git clone --depth 1 --branch $(OPENSSL_VERSION)    https://github.com/openssl/openssl.git   $(OPENSSL_DIR)
 	@test -d $(ZLIB_DIR)       || git clone --depth 1 --branch $(ZLIB_VERSION)       https://github.com/madler/zlib.git       $(ZLIB_DIR)
 
 # ----------------------------------------------------------------------
 # Vendor build — MinGW64 static
 # ----------------------------------------------------------------------
-vendor-build: vendor-fetch vendor-build-openssl vendor-build-zlib vendor-build-cjson vendor-build-rabbitmq
+vendor-build: vendor-fetch vendor-build-openssl vendor-build-zlib vendor-build-cjson vendor-build-rabbitmq vendor-build-curl
 
 vendor-build-openssl:
 	# `--libdir=lib` 명시 — OpenSSL 3.x 가 host triplet 에 따라 `lib64` 또는
@@ -140,6 +145,31 @@ vendor-build-rabbitmq:
 	cp $(RABBITMQ_C_DIR)/build/librabbitmq/liblibrabbitmq.*.a \
 	   $(RABBITMQ_C_DIR)/build/librabbitmq/librabbitmq.a
 
+vendor-build-curl:
+	# libcurl static, OpenSSL backend, IDN/LDAP/FTP 등 비사용 옵션 비활성.
+	# verify 단계의 DLL 화이트리스트는 이미 wldap32/normaliz 를 포함하지 않으므로
+	# CURL_DISABLE_LDAP=ON / 추가 IDN 옵션 OFF 로 의존을 최소화한다.
+	$(CMAKE) -S $(CURL_DIR) -B $(CURL_DIR)/build \
+	      -DCMAKE_C_COMPILER=$(CC) \
+	      -DBUILD_SHARED_LIBS=OFF -DCURL_STATICLIB=ON \
+	      -DBUILD_CURL_EXE=OFF -DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF \
+	      -DCURL_USE_OPENSSL=ON -DCURL_DISABLE_LDAP=ON -DCURL_DISABLE_FTP=ON \
+	      -DCURL_DISABLE_FILE=ON -DCURL_DISABLE_DICT=ON -DCURL_DISABLE_TELNET=ON \
+	      -DCURL_DISABLE_TFTP=ON -DCURL_DISABLE_RTSP=ON -DCURL_DISABLE_POP3=ON \
+	      -DCURL_DISABLE_IMAP=ON -DCURL_DISABLE_SMTP=ON -DCURL_DISABLE_GOPHER=ON \
+	      -DOPENSSL_ROOT_DIR=$(CURDIR)/$(OPENSSL_DIR)/install \
+	      -DOPENSSL_USE_STATIC_LIBS=TRUE \
+	      -DZLIB_INCLUDE_DIR=$(CURDIR)/$(ZLIB_DIR) \
+	      -DZLIB_LIBRARY=$(CURDIR)/$(ZLIB_LIB) \
+	      -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+	$(CMAKE) --build $(CURL_DIR)/build --target libcurl_static -- -j$(JOBS)
+	# Windows mingw cmake 출력 이름은 `libcurl.a` 가 아닐 수 있어 — `libcurl_static`
+	# target 의 실제 파일을 $(CURL_LIB) 경로(`build/lib/libcurl.a`) 로 별칭.
+	@if [ ! -f $(CURL_DIR)/build/lib/libcurl.a ]; then \
+		cp $$(ls $(CURL_DIR)/build/lib/lib*curl*.a | head -n1) \
+		   $(CURL_DIR)/build/lib/libcurl.a ; \
+	fi
+
 vendor-clean:
 	rm -rf $(VENDOR_DIR)
 
@@ -172,4 +202,4 @@ release: $(BIN) verify
 	@cat $(DIST_DIR)/SHA256SUMS
 
 .PHONY: all clean vendor-fetch vendor-build vendor-build-openssl vendor-build-zlib \
-        vendor-build-cjson vendor-build-rabbitmq vendor-clean verify release
+        vendor-build-cjson vendor-build-rabbitmq vendor-build-curl vendor-clean verify release
