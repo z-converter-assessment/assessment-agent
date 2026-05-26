@@ -14,6 +14,7 @@
 #include "util.h"
 
 #include <cJSON.h>
+#include <openssl/evp.h>
 
 #include <ctype.h>
 #include <dirent.h>
@@ -98,11 +99,14 @@ static const char *cached_agent_started_at_iso(void)
 	return buf;
 }
 
+/* Forward decl — 실제 정의는 collect_mac_addresses() 이후. */
+static const char *cached_composite_id(const char *machine_id);
+
 /**
  * @brief Add common metadata fields to @p obj.
  *
- * Fields: message_type, machine_id, agent_version, collected_at,
- * hostname, message_id, boot_time, agent_started_at.
+ * Fields: message_type, machine_id, composite_id, os_family, agent_version,
+ * collected_at, hostname, message_id, boot_time, agent_started_at.
  */
 static void add_common_metadata(cJSON *obj,
                                 const char *message_type,
@@ -112,6 +116,8 @@ static void add_common_metadata(cJSON *obj,
 	cJSON_AddStringToObject(obj, "message_type", message_type);
 	cJSON_AddStringToObject(obj, "machine_id",
 	                        machine_id && *machine_id ? machine_id : "");
+	cJSON_AddStringToObject(obj, "composite_id", cached_composite_id(machine_id));
+	cJSON_AddStringToObject(obj, "os_family", "linux");
 	cJSON_AddStringToObject(obj, "agent_version",
 	                        agent_version && *agent_version ? agent_version
 	                                                        : AGENT_VERSION_FALLBACK);
@@ -1053,6 +1059,75 @@ static cJSON *collect_mac_addresses(void)
 		free(macs[i]);
 	}
 	return arr;
+}
+
+/**
+ * @brief composite_id = sha256_hex(machine_id + "\n" + mac1 + "\n" + mac2 + ...).
+ *
+ * VM 이미지 클론으로 machine_id가 중복되는 환경에서 호스트 식별성을 보강하기 위한
+ * 보조 식별자. MAC 목록은 collect_mac_addresses() 결과 (lowercase / sorted / dedup /
+ * filtered)를 그대로 재사용 — 양 OS agent가 같은 알고리즘으로 같은 값을 산출하기 위함.
+ *
+ * 모든 NIC이 가상이거나 MAC이 비어있으면 결과는 sha256(machine_id + "\n")으로
+ * 식별성이 떨어진다 — composite_id로도 못 가르는 엣지 케이스는 한계로 인정한 사안.
+ * engine 측이 composite_id 충돌을 별도 신호로 감지해야 한다.
+ *
+ * 프로세스 lifetime 내 1회 계산 후 캐시.
+ */
+static const char *cached_composite_id(const char *machine_id)
+{
+	static char hex_buf[65];
+	static int  cached = 0;
+	if (cached)
+		return hex_buf;
+
+	hex_buf[0] = '\0';
+	cached = 1;   /* fail-once: EVP 실패 시 매 메시지마다 재시도 회피 */
+
+	cJSON *macs = collect_mac_addresses();
+	EVP_MD_CTX *md = EVP_MD_CTX_new();
+	if (!md) {
+		cJSON_Delete(macs);
+		fprintf(stderr, "[agent] composite_id: EVP_MD_CTX_new failed\n");
+		return hex_buf;
+	}
+
+	int ok = (EVP_DigestInit_ex(md, EVP_sha256(), NULL) == 1);
+	if (ok) {
+		const char *mid = (machine_id && *machine_id) ? machine_id : "";
+		ok = ok && (EVP_DigestUpdate(md, mid, strlen(mid)) == 1);
+		ok = ok && (EVP_DigestUpdate(md, "\n", 1) == 1);
+		int n = macs ? cJSON_GetArraySize(macs) : 0;
+		for (int i = 0; ok && i < n; i++) {
+			const cJSON *e = cJSON_GetArrayItem(macs, i);
+			if (!cJSON_IsString(e)) continue;
+			ok = (EVP_DigestUpdate(md, e->valuestring,
+			                      strlen(e->valuestring)) == 1);
+			if (ok && i + 1 < n)
+				ok = (EVP_DigestUpdate(md, "\n", 1) == 1);
+		}
+	}
+
+	unsigned char raw[EVP_MAX_MD_SIZE];
+	unsigned int rawlen = 0;
+	ok = ok && (EVP_DigestFinal_ex(md, raw, &rawlen) == 1);
+
+	EVP_MD_CTX_free(md);
+	cJSON_Delete(macs);
+
+	if (!ok || rawlen != 32) {
+		fprintf(stderr, "[agent] composite_id: EVP digest failed\n");
+		hex_buf[0] = '\0';
+		return hex_buf;
+	}
+
+	static const char hex_chars[] = "0123456789abcdef";
+	for (unsigned int i = 0; i < 32; i++) {
+		hex_buf[i * 2]     = hex_chars[(raw[i] >> 4) & 0xF];
+		hex_buf[i * 2 + 1] = hex_chars[raw[i] & 0xF];
+	}
+	hex_buf[64] = '\0';
+	return hex_buf;
 }
 
 /**

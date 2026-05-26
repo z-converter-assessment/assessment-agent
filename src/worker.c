@@ -365,13 +365,16 @@ static void child_run_task(worker_ctx_t *ctx, cJSON *task)
 		if (cJSON_IsNumber(jb)) size_bytes = (int64_t)jb->valuedouble;
 	}
 
+	const char *install_type = "shell"; /* default — install.type 누락 시 backward-compat */
 	const char *script  = "install.sh";
 	int timeout_sec     = 600;
 	const char **iargs  = NULL;
 	if (cJSON_IsObject(jinstall)) {
-		const cJSON *js = cJSON_GetObjectItemCaseSensitive(jinstall, "script");
-		const cJSON *jt = cJSON_GetObjectItemCaseSensitive(jinstall, "timeout_sec");
-		const cJSON *ja = cJSON_GetObjectItemCaseSensitive(jinstall, "args");
+		const cJSON *jty = cJSON_GetObjectItemCaseSensitive(jinstall, "type");
+		const cJSON *js  = cJSON_GetObjectItemCaseSensitive(jinstall, "script");
+		const cJSON *jt  = cJSON_GetObjectItemCaseSensitive(jinstall, "timeout_sec");
+		const cJSON *ja  = cJSON_GetObjectItemCaseSensitive(jinstall, "args");
+		if (cJSON_IsString(jty) && *jty->valuestring) install_type = jty->valuestring;
 		if (cJSON_IsString(js)) script      = js->valuestring;
 		if (cJSON_IsNumber(jt)) timeout_sec = (int)jt->valuedouble;
 		if (cJSON_IsArray(ja)) {
@@ -384,6 +387,18 @@ static void child_run_task(worker_ctx_t *ctx, cJSON *task)
 				}
 			}
 		}
+	}
+
+	/* Linux agent는 install.type="shell" 만 처리. direct_exec / msi 등 자기 OS
+	 * 아닌 type 수신 시 즉시 result 발행 + ack (DLQ 회피). */
+	if (strcmp(install_type, "shell") != 0) {
+		char *res = build_result_json(ctx, task_id, "failure",
+		                              "unsupported_install_type",
+		                              0, 0, 0, "",
+		                              "install.type not handled by this OS\n");
+		if (res) { child_write_result_file(ctx, task_id, res); free(res); }
+		free(iargs);
+		_exit(0);
 	}
 
 	/* Workspace directory. */

@@ -31,6 +31,7 @@
 #include "collect.h"
 #include "util.h"
 #include "cJSON.h"
+#include <openssl/evp.h>
 
 #include <ctype.h>
 #include <stdint.h>
@@ -66,6 +67,9 @@ static void cache_process_times(void)
 	g_times_cached = 1;
 }
 
+/* Forward decl — 실제 정의는 fill_network_info() 이후. */
+static const char *cached_composite_id(const char *machine_id);
+
 /* ============================================================
  *  Common metadata (every message)
  * ============================================================ */
@@ -76,6 +80,8 @@ static void add_common_metadata(cJSON *root, const char *msg_type,
 
 	cJSON_AddStringToObject(root, "message_type", msg_type);
 	cJSON_AddStringToObject(root, "machine_id",   machine_id ? machine_id : "");
+	cJSON_AddStringToObject(root, "composite_id", cached_composite_id(machine_id));
+	cJSON_AddStringToObject(root, "os_family",    "windows");
 	cJSON_AddStringToObject(root, "agent_version", agent_version ? agent_version : "0.0.0");
 
 	time_t now; time(&now);
@@ -532,6 +538,114 @@ static void fill_network_info(cJSON *inv)
 		free(mac_list[i]);
 	}
 	free(aa);
+}
+
+/* ============================================================
+ *  composite_id = sha256_hex(machine_id + "\n" + mac1 + "\n" + ...)
+ *
+ *  이미지 클론으로 machine_id가 중복되는 환경에서 호스트 식별성을 보강하는 보조
+ *  식별자. MAC 수집 정책은 fill_network_info()와 동일 (IfOperStatusUp, loopback /
+ *  tunnel 제외, PhysicalAddressLength==6, lowercase, dedup, sort). 양 OS agent가
+ *  같은 정규형으로 같은 값을 산출.
+ *
+ *  모든 NIC이 가상이거나 MAC이 비어있으면 sha256(machine_id + "\n")로 떨어지며
+ *  식별성이 약해진다 — composite_id로도 못 가르는 엣지 케이스는 한계로 수용.
+ *  엔진이 별도 신호로 충돌 감지해야 한다.
+ *
+ *  프로세스 lifetime 내 1회 계산 후 캐시.
+ * ============================================================ */
+static const char *cached_composite_id(const char *machine_id)
+{
+	static char hex_buf[65];
+	static int  cached = 0;
+	if (cached)
+		return hex_buf;
+
+	hex_buf[0] = '\0';
+	cached = 1;   /* fail-once: EVP / GetAdaptersAddresses 실패 시 재시도 회피 */
+
+	enum { MAC_CAP = 64 };
+	char *mac_list[MAC_CAP];
+	int mac_count = 0;
+
+	ULONG buf_len = 16 * 1024;
+	IP_ADAPTER_ADDRESSES *aa = malloc(buf_len);
+	ULONG ret = ERROR_NOT_ENOUGH_MEMORY;
+	if (aa) {
+		ret = GetAdaptersAddresses(AF_UNSPEC,
+			GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+			NULL, aa, &buf_len);
+		if (ret == ERROR_BUFFER_OVERFLOW) {
+			free(aa);
+			aa = malloc(buf_len);
+			if (aa) {
+				ret = GetAdaptersAddresses(AF_UNSPEC,
+					GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+					NULL, aa, &buf_len);
+			}
+		}
+	}
+	if (aa && ret == NO_ERROR) {
+		for (IP_ADAPTER_ADDRESSES *p = aa; p; p = p->Next) {
+			if (p->OperStatus != IfOperStatusUp)        continue;
+			if (p->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+			if (p->IfType == IF_TYPE_TUNNEL)            continue;
+			if (p->PhysicalAddressLength != 6)          continue;
+			if (mac_count >= MAC_CAP)                   break;
+
+			char mac[18];
+			snprintf(mac, sizeof mac, "%02x:%02x:%02x:%02x:%02x:%02x",
+				p->PhysicalAddress[0], p->PhysicalAddress[1], p->PhysicalAddress[2],
+				p->PhysicalAddress[3], p->PhysicalAddress[4], p->PhysicalAddress[5]);
+
+			int dup = 0;
+			for (int i = 0; i < mac_count; i++)
+				if (strcmp(mac_list[i], mac) == 0) { dup = 1; break; }
+			if (!dup) {
+				mac_list[mac_count] = malloc(sizeof mac);
+				if (mac_list[mac_count]) {
+					memcpy(mac_list[mac_count], mac, sizeof mac);
+					mac_count++;
+				}
+			}
+		}
+	}
+	free(aa);
+	qsort(mac_list, mac_count, sizeof(char *), mac_cmp);
+
+	EVP_MD_CTX *md = EVP_MD_CTX_new();
+	int ok = (md != NULL) && (EVP_DigestInit_ex(md, EVP_sha256(), NULL) == 1);
+	if (ok) {
+		const char *mid = (machine_id && *machine_id) ? machine_id : "";
+		ok = (EVP_DigestUpdate(md, mid, strlen(mid)) == 1);
+		if (ok) ok = (EVP_DigestUpdate(md, "\n", 1) == 1);
+		for (int i = 0; ok && i < mac_count; i++) {
+			ok = (EVP_DigestUpdate(md, mac_list[i], strlen(mac_list[i])) == 1);
+			if (ok && i + 1 < mac_count)
+				ok = (EVP_DigestUpdate(md, "\n", 1) == 1);
+		}
+	}
+
+	unsigned char raw[EVP_MAX_MD_SIZE];
+	unsigned int rawlen = 0;
+	if (ok) ok = (EVP_DigestFinal_ex(md, raw, &rawlen) == 1);
+	if (md) EVP_MD_CTX_free(md);
+
+	for (int i = 0; i < mac_count; i++) free(mac_list[i]);
+
+	if (!ok || rawlen != 32) {
+		fprintf(stderr, "[agent] composite_id: EVP digest failed\n");
+		hex_buf[0] = '\0';
+		return hex_buf;
+	}
+
+	static const char hex_chars[] = "0123456789abcdef";
+	for (unsigned int i = 0; i < 32; i++) {
+		hex_buf[i * 2]     = hex_chars[(raw[i] >> 4) & 0xF];
+		hex_buf[i * 2 + 1] = hex_chars[raw[i] & 0xF];
+	}
+	hex_buf[64] = '\0';
+	return hex_buf;
 }
 
 /* ============================================================
