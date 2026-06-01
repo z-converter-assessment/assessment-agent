@@ -156,6 +156,21 @@ jobs:
     needs: build-linux
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # GHA 가 RabbitMQ 컨테이너를 띄우고 healthcheck (`rabbitmq-diagnostics ping`)
+    # 통과까지 기다린 뒤 step 진행. 직접 `docker run` 보다 안정적 — 컨테이너가
+    # init 중 die 하면 GHA 가 fail-fast 로 job 자체를 실패시켜 원인을 보여줌.
+    services:
+      rabbitmq:
+        image: rabbitmq:3-management
+        ports:
+          - 5672:5672
+          - 15672:15672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 30
+          --health-start-period 30s
     steps:
       - name: Checkout (dev path 검증용)
         uses: actions/checkout@v4
@@ -200,22 +215,23 @@ jobs:
           ! test -f /usr/local/bin/assessment-agent
           test -f /etc/assessment-agent/agent.env
 
-      # ---------- Phase B: broker + full install flow ----------
-      - name: B1. Start RabbitMQ container
+      # ---------- Phase B: broker (services container) + full install flow ----------
+      - name: B1. Wait for RabbitMQ management API
         run: |
-          docker run -d --name rmq -p 5672:5672 rabbitmq:3
           for i in $(seq 1 60); do
-            if docker exec rmq rabbitmq-diagnostics -q ping >/dev/null 2>&1; then break; fi
-            sleep 1
+            if curl -sf -u guest:guest http://127.0.0.1:15672/api/overview >/dev/null; then break; fi
+            sleep 2
           done
-          docker exec rmq rabbitmq-diagnostics -q ping
+          curl -sf -u guest:guest http://127.0.0.1:15672/api/overview | head -c 200; echo
       - name: B2. Bootstrap exchange + queue (engine topology surrogate)
         run: |
-          docker exec rmq rabbitmqadmin declare exchange name=assessment type=direct durable=true
-          docker exec rmq rabbitmqadmin declare queue    name=server.metrics durable=true
-          docker exec rmq rabbitmqadmin declare binding  source=assessment destination=server.metrics routing_key=server.metrics
-          docker exec rmq rabbitmqadmin declare queue    name=server.inventory durable=true
-          docker exec rmq rabbitmqadmin declare binding  source=assessment destination=server.inventory routing_key=server.inventory
+          curl -sf -u guest:guest -o rabbitmqadmin http://127.0.0.1:15672/cli/rabbitmqadmin
+          chmod +x rabbitmqadmin
+          ./rabbitmqadmin declare exchange name=assessment type=direct durable=true
+          ./rabbitmqadmin declare queue    name=server.metrics  durable=true
+          ./rabbitmqadmin declare binding  source=assessment destination=server.metrics  routing_key=server.metrics
+          ./rabbitmqadmin declare queue    name=server.inventory durable=true
+          ./rabbitmqadmin declare binding  source=assessment destination=server.inventory routing_key=server.inventory
       - name: B3. Seed agent.env (broker connectable, plain TCP)
         run: |
           sudo mkdir -p /etc/assessment-agent
@@ -245,16 +261,16 @@ jobs:
       - name: B6. Publish reaches queue (metrics + inventory)
         run: |
           for i in $(seq 1 20); do
-            depth=$(docker exec rmq rabbitmqctl list_queues -p / name messages --no-table-headers 2>/dev/null \
-                    | awk '/^server\.metrics/ {print $2}')
-            [ -n "$depth" ] && [ "$depth" -gt 0 ] && break
+            depth=$(curl -sf -u guest:guest http://127.0.0.1:15672/api/queues/%2F/server.metrics \
+                    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("messages",0))' 2>/dev/null || echo 0)
+            [ "$depth" -gt 0 ] && break
             sleep 2
           done
-          docker exec rmq rabbitmqctl list_queues -p / name messages
+          curl -sf -u guest:guest http://127.0.0.1:15672/api/queues/%2F | \
+              python3 -c 'import json,sys; [print(q["name"], q["messages"]) for q in json.load(sys.stdin)]'
           [ "$depth" -gt 0 ] || { echo "no metrics published in 40s"; exit 1; }
           # peek a message — must contain message_type=metrics
-          docker exec rmq rabbitmqadmin get queue=server.metrics ackmode=ack_requeue_false count=1 \
-            | tee /tmp/metric.json
+          ./rabbitmqadmin get queue=server.metrics ackmode=ack_requeue_false count=1 | tee /tmp/metric.json
           grep -q '"message_type"' /tmp/metric.json || { echo "payload missing message_type"; exit 1; }
           grep -q '"machine_id"'   /tmp/metric.json || { echo "payload missing machine_id"; exit 1; }
       - name: B7. ACL — agent.env.local (0600 root:assessment-agent)
@@ -361,41 +377,56 @@ jobs:
           if (-not (Test-Path 'C:\ProgramData\assessment-agent')) { throw "A5: state dir wiped" }
 
       # ---------- Phase B: broker + full install flow ----------
-      - name: B1. Install RabbitMQ via Chocolatey
+      - name: B1. Install RabbitMQ via Chocolatey + force restart
         run: |
           choco install rabbitmq --no-progress -y
-          # chocolatey starts the service; just wait until it answers.
+          # choco starts the service but in 4.x the listener registration races
+          # the install completion. Force a clean restart + poll until erlang
+          # node answers `rabbitmq-diagnostics ping`.
+          Restart-Service -Name RabbitMQ -Force
+          $sbin = (Get-ChildItem 'C:\Program Files\RabbitMQ Server\*\sbin' -Directory | Select-Object -First 1).FullName
+          if (-not $sbin) { throw "B1: RabbitMQ sbin not found" }
+          echo "SBIN=$sbin" >> $env:GITHUB_ENV
           $deadline = (Get-Date).AddMinutes(5)
           while ((Get-Date) -lt $deadline) {
-            $svc = Get-Service -Name RabbitMQ -ErrorAction SilentlyContinue
-            if ($svc -and $svc.Status -eq 'Running') { break }
+            & "$sbin\rabbitmq-diagnostics.bat" -q ping 2>$null
+            if ($LASTEXITCODE -eq 0) { break }
             Start-Sleep -Seconds 5
           }
-          Get-Service RabbitMQ
-      - name: B2. Locate rabbitmqctl / rabbitmqadmin
-        id: rmqpath
+          & "$sbin\rabbitmq-diagnostics.bat" -q ping
+          if ($LASTEXITCODE -ne 0) { throw "B1: RabbitMQ erlang node never reached ping-ready" }
+      - name: B2. Enable management plugin + wait for HTTP API
         run: |
-          $sbin = (Get-ChildItem 'C:\Program Files\RabbitMQ Server\*\sbin' -Directory | Select-Object -First 1).FullName
-          if (-not $sbin) { throw "RabbitMQ sbin not found under C:\Program Files\RabbitMQ Server" }
-          Write-Host "sbin: $sbin"
-          echo "SBIN=$sbin" >> $env:GITHUB_ENV
-          echo "RABBITMQCTL=$sbin\rabbitmqctl.bat" >> $env:GITHUB_ENV
-          # rabbitmqadmin is a python script bundled with the management plugin.
-          & "$sbin\rabbitmq-plugins.bat" enable rabbitmq_management
-          $deadline = (Get-Date).AddMinutes(2)
+          & "$env:SBIN\rabbitmq-plugins.bat" enable rabbitmq_management
+          # plugin enable is online but the HTTP listener still takes a few
+          # seconds to bind 15672. Verify the TCP listener is up first, then
+          # poll the API itself.
+          $deadline = (Get-Date).AddMinutes(3)
           while ((Get-Date) -lt $deadline) {
-            try { (Invoke-WebRequest -Uri 'http://localhost:15672/cli/rabbitmqadmin' -UseBasicParsing -TimeoutSec 5) | Out-Null; break }
-            catch { Start-Sleep -Seconds 5 }
+            $tcp = Test-NetConnection -ComputerName 127.0.0.1 -Port 15672 -WarningAction SilentlyContinue
+            if ($tcp.TcpTestSucceeded) { break }
+            Start-Sleep -Seconds 3
           }
-          Invoke-WebRequest -Uri 'http://localhost:15672/cli/rabbitmqadmin' -UseBasicParsing -OutFile rabbitmqadmin.py
-          echo "RABBITMQADMIN=python rabbitmqadmin.py" >> $env:GITHUB_ENV
+          if (-not $tcp.TcpTestSucceeded) {
+              & "$env:SBIN\rabbitmqctl.bat" status
+              throw "B2: 15672 never became reachable"
+          }
+          $cred = New-Object PSCredential('guest', (ConvertTo-SecureString 'guest' -AsPlainText -Force))
+          $deadline = (Get-Date).AddMinutes(3)
+          while ((Get-Date) -lt $deadline) {
+            try {
+              Invoke-WebRequest -Uri 'http://127.0.0.1:15672/api/overview' -Credential $cred -UseBasicParsing -TimeoutSec 5 | Out-Null
+              break
+            } catch { Start-Sleep -Seconds 3 }
+          }
+          Invoke-WebRequest -Uri 'http://127.0.0.1:15672/cli/rabbitmqadmin' -Credential $cred -UseBasicParsing -OutFile rabbitmqadmin.py
       - name: B3. Bootstrap exchange + queue
         run: |
-          & python rabbitmqadmin.py declare exchange name=assessment type=direct durable=true
-          & python rabbitmqadmin.py declare queue    name=server.metrics  durable=true
-          & python rabbitmqadmin.py declare binding  source=assessment destination=server.metrics  routing_key=server.metrics
-          & python rabbitmqadmin.py declare queue    name=server.inventory durable=true
-          & python rabbitmqadmin.py declare binding  source=assessment destination=server.inventory routing_key=server.inventory
+          python rabbitmqadmin.py -u guest -p guest declare exchange name=assessment type=direct durable=true
+          python rabbitmqadmin.py -u guest -p guest declare queue    name=server.metrics  durable=true
+          python rabbitmqadmin.py -u guest -p guest declare binding  source=assessment destination=server.metrics  routing_key=server.metrics
+          python rabbitmqadmin.py -u guest -p guest declare queue    name=server.inventory durable=true
+          python rabbitmqadmin.py -u guest -p guest declare binding  source=assessment destination=server.inventory routing_key=server.inventory
       - name: B4. Seed agent.env (broker connectable, plain TCP)
         run: |
           $env_text = @'
@@ -435,18 +466,19 @@ jobs:
           }
       - name: B8. Publish reaches queue (metrics)
         run: |
+          $cred = New-Object PSCredential('guest', (ConvertTo-SecureString 'guest' -AsPlainText -Force))
           $depth = 0
           for ($i=0; $i -lt 20; $i++) {
-              $line = (& $env:RABBITMQCTL list_queues name messages --no-table-headers 2>$null | Select-String 'server.metrics')
-              if ($line) {
-                  $depth = [int]($line -split '\s+')[1]
+              try {
+                  $r = Invoke-RestMethod -Uri 'http://127.0.0.1:15672/api/queues/%2F/server.metrics' -Credential $cred -UseBasicParsing
+                  $depth = [int]$r.messages
                   if ($depth -gt 0) { break }
-              }
+              } catch {}
               Start-Sleep -Seconds 2
           }
           if ($depth -le 0) { throw "B8: no metrics published in 40s" }
-          # peek payload
-          & python rabbitmqadmin.py get queue=server.metrics ackmode=ack_requeue_false count=1 | Tee-Object -FilePath metric.json
+          Write-Host "depth=$depth"
+          python rabbitmqadmin.py -u guest -p guest get queue=server.metrics ackmode=ack_requeue_false count=1 | Tee-Object -FilePath metric.json
           if (-not (Select-String -Path metric.json -Pattern '"message_type"' -Quiet)) { throw "B8: missing message_type" }
           if (-not (Select-String -Path metric.json -Pattern '"machine_id"'   -Quiet)) { throw "B8: missing machine_id" }
       - name: B9. Upgrade — install twice, service stays Running
