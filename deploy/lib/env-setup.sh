@@ -6,7 +6,11 @@
 # Rules (matches deploy/install.ps1 on Windows):
 #   - canonical key list + suggested defaults come from <example_file>
 #   - <target_env_file> preserves any KEY=value with non-empty value
-#     (NEVER overwrite — operator's value wins). Empty / missing keys prompt.
+#     (NEVER overwrite — operator's value wins).
+#   - only $PROMPT_KEYS are interactively prompted when missing. Other
+#     non-secret keys silently fall back to the <example_file> default
+#     — most operators run the agent on standard topology, so asking
+#     20+ questions for values they'd never change is friction.
 #   - secret keys (RABBITMQ_PASS, RABBITMQ_WORKER_PASS) are written to
 #     <local_secret_file> with chmod 0600, entered via stty -echo so they
 #     do not appear on screen.
@@ -22,7 +26,22 @@ EXAMPLE="${1:?usage: env-setup.sh EXAMPLE TARGET LOCAL}"
 TARGET="${2:?usage: env-setup.sh EXAMPLE TARGET LOCAL}"
 LOCAL="${3:?usage: env-setup.sh EXAMPLE TARGET LOCAL}"
 
+# Keys we *do* interactively prompt for. Everything else in agent.env.example
+# silently takes the example default. Keep this list tight — every entry is
+# friction at install time.
+#
+# RABBITMQ_HOST                  broker address (always site-specific)
+# WORKER_DOWNLOAD_ALLOWED_HOSTS  task.install whitelist; empty = worker dies
+PROMPT_KEYS="RABBITMQ_HOST WORKER_DOWNLOAD_ALLOWED_HOSTS"
+
 SECRET_KEYS="RABBITMQ_PASS RABBITMQ_WORKER_PASS"
+
+is_prompt() {
+	case " $PROMPT_KEYS " in
+		*" $1 "*) return 0 ;;
+		*)        return 1 ;;
+	esac
+}
 
 is_secret() {
 	case " $SECRET_KEYS " in
@@ -115,8 +134,14 @@ while IFS= read -r line || [ -n "$line" ]; do
 		continue
 	fi
 
-	entered=$(prompt "$key" "$default")
-	printf '%s=%s\n' "$key" "$entered" >> "$TMP"
+	if is_prompt "$key"; then
+		entered=$(prompt "$key" "$default")
+		printf '%s=%s\n' "$key" "$entered" >> "$TMP"
+	else
+		# Silent default — operator can still edit /etc/assessment-agent/agent.env
+		# after install if a non-standard value is required.
+		printf '%s=%s\n' "$key" "$default" >> "$TMP"
+	fi
 done < "$EXAMPLE"
 
 # install handles atomic ownership + mode

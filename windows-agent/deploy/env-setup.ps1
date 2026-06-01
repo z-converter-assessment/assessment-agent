@@ -11,7 +11,10 @@
 # Rules:
 #   - reads the canonical key list from -Example
 #   - non-secret keys go in -EnvFile; existing non-empty values are NEVER
-#     overwritten — only empty / missing keys prompt
+#     overwritten
+#   - only $PromptKeys are interactively prompted when missing. Other
+#     non-secret keys silently fall back to the example default — most
+#     operators run on standard topology and never change those values.
 #   - secret keys (RABBITMQ_PASS, RABBITMQ_WORKER_PASS) go in -LocalFile,
 #     entered via Read-Host -AsSecureString. ACLs tightened to SYSTEM +
 #     Administrators only.
@@ -25,6 +28,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Keys we *do* interactively prompt for. Mirror of PROMPT_KEYS in
+# deploy/lib/env-setup.sh — keep the two lists in sync.
+$PromptKeys = @('RABBITMQ_HOST', 'WORKER_DOWNLOAD_ALLOWED_HOSTS')
 
 $SecretKeys = @('RABBITMQ_PASS', 'RABBITMQ_WORKER_PASS')
 
@@ -90,13 +97,19 @@ foreach ($key in $exampleOrder) {
         continue  # already filled — never overwrite
     }
     $def = $exampleHash[$key]
-    if (-not [string]::IsNullOrWhiteSpace($def)) {
-        $entered = Read-Host "$key [$def]"
-        if ([string]::IsNullOrWhiteSpace($entered)) { $entered = $def }
+    if ($PromptKeys -contains $key) {
+        if (-not [string]::IsNullOrWhiteSpace($def)) {
+            $entered = Read-Host "$key [$def]"
+            if ([string]::IsNullOrWhiteSpace($entered)) { $entered = $def }
+        } else {
+            $entered = Read-Host "$key"
+        }
+        $existing[$key] = $entered
     } else {
-        $entered = Read-Host "$key"
+        # Silent default — operator can edit the env file post-install if a
+        # non-standard value is required.
+        $existing[$key] = $def
     }
-    $existing[$key] = $entered
 }
 Save-Env $EnvFile $existing
 Write-Host "[env-setup] wrote $EnvFile"
