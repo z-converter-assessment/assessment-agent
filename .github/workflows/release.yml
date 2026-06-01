@@ -300,10 +300,16 @@ jobs:
           cp dist/assessment-agent-linux-x86_64 dev-stage/dist/
           cp -r deploy dev-stage/
           (cd dev-stage/dist && sha256sum assessment-agent-linux-x86_64 > SHA256SUMS)
-      - name: C3. sudo ./deploy/install.sh < /dev/null (no INSTALLER_SELF_PATH)
+      - name: C3. dev path — ./deploy/install.sh (no INSTALLER_SELF_PATH)
         run: |
           cd dev-stage
-          sudo ./deploy/install.sh < /dev/null
+          ls -la deploy/install.sh
+          file deploy/install.sh
+          head -1 deploy/install.sh
+          # Absolute path + explicit `bash` so sudo's secure_path / cwd handling
+          # cannot mask the script. This is the operator's actual fallback path
+          # for a freshly cloned repo on the target host.
+          sudo bash "$(pwd)/deploy/install.sh" < /dev/null
           systemctl is-active assessment-agent
 
       # ---------- Phase D: --purge cleanup ----------
@@ -377,24 +383,46 @@ jobs:
           if (-not (Test-Path 'C:\ProgramData\assessment-agent')) { throw "A5: state dir wiped" }
 
       # ---------- Phase B: broker + full install flow ----------
-      - name: B1. Install RabbitMQ via Chocolatey + force restart
+      - name: B1. Install RabbitMQ via Chocolatey + wait for erlang node
         run: |
           choco install rabbitmq --no-progress -y
-          # choco starts the service but in 4.x the listener registration races
-          # the install completion. Force a clean restart + poll until erlang
-          # node answers `rabbitmq-diagnostics ping`.
-          Restart-Service -Name RabbitMQ -Force
           $sbin = (Get-ChildItem 'C:\Program Files\RabbitMQ Server\*\sbin' -Directory | Select-Object -First 1).FullName
           if (-not $sbin) { throw "B1: RabbitMQ sbin not found" }
           echo "SBIN=$sbin" >> $env:GITHUB_ENV
+
+          # In 4.x the chocolatey post-install plays with the service while
+          # the listener is still binding. Do NOT Restart-Service — that races
+          # with the in-progress start and leaves the erlang node in a half-up
+          # state where `rabbitmq-diagnostics ping` never returns. Just poll
+          # the service status first, then poll erlang readiness.
           $deadline = (Get-Date).AddMinutes(5)
           while ((Get-Date) -lt $deadline) {
-            & "$sbin\rabbitmq-diagnostics.bat" -q ping 2>$null
-            if ($LASTEXITCODE -eq 0) { break }
-            Start-Sleep -Seconds 5
+              $svc = Get-Service -Name RabbitMQ -ErrorAction SilentlyContinue
+              if ($svc -and $svc.Status -eq 'Running') { break }
+              Start-Sleep -Seconds 3
           }
-          & "$sbin\rabbitmq-diagnostics.bat" -q ping
-          if ($LASTEXITCODE -ne 0) { throw "B1: RabbitMQ erlang node never reached ping-ready" }
+          Get-Service RabbitMQ
+          if (-not $svc -or $svc.Status -ne 'Running') {
+              Get-WinEvent -LogName Application -MaxEvents 30 -ErrorAction SilentlyContinue |
+                  Where-Object { $_.ProviderName -match 'RabbitMQ|erlang' } |
+                  Format-List TimeCreated, LevelDisplayName, Message
+              throw "B1: RabbitMQ service never reached Running"
+          }
+
+          $deadline = (Get-Date).AddMinutes(5)
+          while ((Get-Date) -lt $deadline) {
+              & "$sbin\rabbitmq-diagnostics.bat" -q ping 2>$null
+              if ($LASTEXITCODE -eq 0) { break }
+              Start-Sleep -Seconds 5
+          }
+          if ($LASTEXITCODE -ne 0) {
+              # Dump everything that helps figure out why erlang is wedged.
+              & "$sbin\rabbitmqctl.bat" status 2>&1 | Out-String | Write-Host
+              Get-WinEvent -LogName Application -MaxEvents 30 -ErrorAction SilentlyContinue |
+                  Where-Object { $_.ProviderName -match 'RabbitMQ|erlang' } |
+                  Format-List TimeCreated, LevelDisplayName, Message
+              throw "B1: RabbitMQ erlang node never reached ping-ready"
+          }
       - name: B2. Enable management plugin + wait for HTTP API
         run: |
           & "$env:SBIN\rabbitmq-plugins.bat" enable rabbitmq_management
