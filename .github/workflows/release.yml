@@ -135,6 +135,99 @@ jobs:
           retention-days: 90
 
   # ============================================================
+  # Installer smoke — Linux runner 의 sudo + systemd 와 Windows runner 의
+  # Administrator + SCM 을 활용해서 self-installer 서브커맨드를 실제로 한 번
+  # 돌려봄. stdin 을 닫고 시작 → env-setup 의 prompt 가 EOF 를 받아 default
+  # 로 떨어지므로 broker 자격증명 없이도 install --image-prep 까지 진입 가능.
+  # 실제 service start 는 broker 가 없어 일부러 안 함 (--image-prep).
+  # ============================================================
+  install-smoke-linux:
+    name: Linux installer smoke
+    needs: build-linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: assessment-agent-linux-x86_64
+          path: dist
+      - name: install --image-prep
+        run: |
+          chmod +x dist/assessment-agent-linux-x86_64
+          # stdin closed so env-setup prompts get EOF → falls back to defaults
+          sudo ./dist/assessment-agent-linux-x86_64 install --image-prep < /dev/null
+      - name: Verify service registered + files placed
+        run: |
+          systemctl is-enabled assessment-agent
+          test -f /etc/systemd/system/assessment-agent.service
+          test -f /usr/local/bin/assessment-agent
+          test -f /etc/assessment-agent/agent.env
+          id assessment-agent
+          getent group assessment-agent
+      - name: prep-image (clears /etc/machine-id)
+        run: sudo ./dist/assessment-agent-linux-x86_64 prep-image
+      - name: Verify machine-id cleared
+        run: test ! -s /etc/machine-id
+      - name: uninstall (env preserved)
+        run: sudo ./dist/assessment-agent-linux-x86_64 uninstall
+      - name: Verify service removed + env preserved
+        run: |
+          ! test -f /etc/systemd/system/assessment-agent.service
+          ! test -f /usr/local/bin/assessment-agent
+          test -f /etc/assessment-agent/agent.env
+      - name: Reinstall + uninstall --purge
+        run: |
+          sudo ./dist/assessment-agent-linux-x86_64 install --image-prep < /dev/null
+          sudo ./dist/assessment-agent-linux-x86_64 uninstall --purge
+      - name: Verify purge wiped state + user
+        run: |
+          ! test -d /etc/assessment-agent
+          ! test -d /var/lib/agent-worker
+          ! id assessment-agent 2>/dev/null
+          ! getent group assessment-agent
+
+  install-smoke-windows:
+    name: Windows installer smoke
+    needs: build-windows
+    runs-on: windows-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: assessment-agent-windows-x86_64
+          path: dist
+      - name: install --image-prep
+        run: |
+          # stdin closed → env-setup prompts get EOF → defaults
+          $null | .\dist\assessment-agent.exe install --image-prep
+      - name: Verify service registered + files placed
+        run: |
+          $svc = Get-Service -Name assessment-agent
+          if ($svc.Status -ne 'Stopped')   { throw "expected Stopped, got $($svc.Status)" }
+          if ($svc.StartType -ne 'Automatic') { throw "expected Automatic, got $($svc.StartType)" }
+          if (-not (Test-Path 'C:\Program Files\assessment-agent\assessment-agent.exe')) { throw "exe not placed" }
+          if (-not (Test-Path 'C:\ProgramData\assessment-agent\agent.env')) { throw "agent.env not written" }
+      - name: prep-image (regenerate MachineGuid)
+        run: |
+          $before = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography' MachineGuid).MachineGuid
+          .\dist\assessment-agent.exe prep-image
+          $after = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography' MachineGuid).MachineGuid
+          if ($before -eq $after) { throw "MachineGuid did not change" }
+          Write-Host "MachineGuid: $before -> $after"
+      - name: uninstall (state preserved)
+        run: .\dist\assessment-agent.exe uninstall
+      - name: Verify service removed + state preserved
+        run: |
+          $svc = Get-Service -Name assessment-agent -ErrorAction SilentlyContinue
+          if ($svc) { throw "service still registered: $($svc.Status)" }
+          if (-not (Test-Path 'C:\ProgramData\assessment-agent')) { throw "state dir wiped unexpectedly" }
+
+  # ============================================================
   # Release 잡 — tag v* push 시에만 실행. 두 artifact 다운로드 → GitHub
   # Release 페이지에 첨부. body 는 자동 생성 (PR / commit history 기반).
   # ============================================================
