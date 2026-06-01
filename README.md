@@ -266,23 +266,43 @@ OpenSSL/zlib/libcurl/cJSON/rabbitmq-c/libarchive 는 정적 링크되어 ldd 출
 
 ### 운영 배포 (server 측, 한 방)
 
-빌드 머신에서 만든 `dist/assessment-agent-linux-x86_64` 를 git pull 로 서버로 가져온 후:
+운영 호스트에 복사하는 파일은 **`assessment-agent-linux-x86_64` ELF 한 개**.
+install.sh / detect-os.sh / env-setup.sh / systemd unit / agent.env.example
+은 모두 ELF 내부에 `ld -r -b binary` 로 박혀 있고 install 서브커맨드가
+`/tmp/agent-installer-XXXXXX/` 에 풀어 실행합니다.
 
 ```bash
-sudo ./deploy/install.sh
+sudo ./assessment-agent-linux-x86_64 install
 ```
 
-`install.sh` 가 자동으로:
-1. OS 매칭 (지원 매트릭스 = `deploy/SUPPORTED_OS.md`)
-2. SHA256 검증 (`dist/SHA256SUMS`)
-3. `assessment-agent` user/group 생성
-4. 바이너리 + systemd unit 배치
-5. `deploy/lib/env-setup.sh` 호출 — `agent.env` 빈 키만 대화형 prompt (시크릿은 `agent.env.local` 에 0600)
-6. `systemctl enable --now`
+서브커맨드 동작 (idempotent — 재실행 안전):
 
-재실행 가능 (idempotent) — 이미 채워진 env 키는 다시 묻지 않습니다.
+1. root 권한 확인
+2. `mkdtemp` 로 `/tmp/agent-installer-XXXXXX/` (0700) 만들고 임베디드 sh /
+   systemd unit / agent.env.example 풀기 — deploy/ 구조 흉내
+3. `INSTALLER_SELF_PATH=/proc/self/exe` + `SKIP_SHA256=1` (자기 자신이라
+   SHA256 비교 대상 없음) 환경에서 `install.sh` 실행
+4. install.sh 가 평소처럼: OS 매칭 → user/group 생성 → 바이너리 +
+   systemd unit 배치 → env-setup 빈 키만 prompt → `systemctl enable --now`
+5. 종료 시 `/tmp/agent-installer-XXXXXX/` 삭제
 
-골든 VM 이미지 생성 시: `sudo IMAGE_PREP=1 ./deploy/install.sh` 로 service 만 enable (start 안 함) → `sudo ./scripts/image-prep.sh` 로 `/etc/machine-id` 클리어 → 스냅샷.
+골든 VM 이미지 생성:
+
+```bash
+sudo ./assessment-agent-linux-x86_64 install --image-prep   # service enable 만, start X
+sudo ./assessment-agent-linux-x86_64 prep-image             # /etc/machine-id 클리어 + cloud-init / random-seed 정리
+```
+
+### 제거
+
+```bash
+sudo ./assessment-agent-linux-x86_64 uninstall              # service stop/disable + binary/unit 제거 (env / state 보존)
+sudo ./assessment-agent-linux-x86_64 uninstall --purge      # 위 + /etc/assessment-agent + /var/lib/agent-worker + user/group 제거
+```
+
+> 이전 방식 (`sudo ./deploy/install.sh` 직접 호출) 도 호환을 위해 그대로
+> 동작합니다 — repo clone 한 dev / CI 환경에서 여전히 사용 가능. 운영
+> 배포 단계에서는 single-binary 서브커맨드 경로가 권장.
 
 ### 로컬 개발 (외부 브로커 필요)
 

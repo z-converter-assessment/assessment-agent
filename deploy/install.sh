@@ -37,7 +37,10 @@ printf '\n'
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 AGENT_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 
-DIST_BIN="$AGENT_ROOT/dist/assessment-agent-linux-x86_64"
+# INSTALLER_SELF_PATH lets the self-installer subcommand (assessment-agent
+# install) point DIST_BIN at /proc/self/exe so install.sh runs against the
+# single-binary bundle without needing a dist/ directory on disk.
+DIST_BIN="${INSTALLER_SELF_PATH:-$AGENT_ROOT/dist/assessment-agent-linux-x86_64}"
 SHA_FILE="$AGENT_ROOT/dist/SHA256SUMS"
 ENV_EXAMPLE="$SCRIPT_DIR/systemd/agent.env.example"
 SERVICE_FILE="$SCRIPT_DIR/systemd/assessment-agent.service"
