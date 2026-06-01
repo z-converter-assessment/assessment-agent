@@ -409,7 +409,24 @@ jobs:
               throw "B1: RabbitMQ service never reached Running"
           }
 
-          $deadline = (Get-Date).AddMinutes(5)
+          # Sync erlang cookie — the service runs as SYSTEM so its cookie lives
+          # in C:\Windows\System32\config\systemprofile\AppData\Roaming\RabbitMQ.
+          # `rabbitmqctl` / `rabbitmq-diagnostics` invoked by this CI step run
+          # as a different user and look in $USERPROFILE\.erlang.cookie first
+          # — mismatch means erlang distribution (and thus ping) fails with
+          # "unable to perform an operation on node". Copy SYSTEM's cookie to
+          # the CI user's profile so both sides agree.
+          $sysCookie = "C:\Windows\System32\config\systemprofile\AppData\Roaming\RabbitMQ\.erlang.cookie"
+          if (Test-Path $sysCookie) {
+              Copy-Item -Path $sysCookie -Destination "$env:USERPROFILE\.erlang.cookie" -Force
+              Write-Host "Synced erlang cookie to $env:USERPROFILE\.erlang.cookie"
+          } else {
+              Write-Host "WARN: SYSTEM cookie not at expected path; listing dir:"
+              Get-ChildItem -Path "C:\Windows\System32\config\systemprofile\AppData\Roaming\RabbitMQ" -ErrorAction SilentlyContinue | Format-Table
+              throw "B1: SYSTEM erlang cookie missing — cannot sync"
+          }
+
+          $deadline = (Get-Date).AddMinutes(3)
           while ((Get-Date) -lt $deadline) {
               & "$sbin\rabbitmq-diagnostics.bat" -q ping 2>$null
               if ($LASTEXITCODE -eq 0) { break }
