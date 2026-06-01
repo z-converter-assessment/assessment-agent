@@ -463,24 +463,39 @@ jobs:
           # plugin enable is online but the HTTP listener still takes a few
           # seconds to bind 15672. Verify the TCP listener is up first, then
           # poll the API itself.
+          $tcpOk = $false
           $deadline = (Get-Date).AddMinutes(3)
           while ((Get-Date) -lt $deadline) {
-            $tcp = Test-NetConnection -ComputerName 127.0.0.1 -Port 15672 -WarningAction SilentlyContinue
-            if ($tcp.TcpTestSucceeded) { break }
+            if (Test-NetConnection -ComputerName 127.0.0.1 -Port 15672 -InformationLevel Quiet -WarningAction SilentlyContinue) {
+                $tcpOk = $true; break
+            }
             Start-Sleep -Seconds 3
           }
-          if (-not $tcp.TcpTestSucceeded) {
-              & "$env:SBIN\rabbitmqctl.bat" status
+          if (-not $tcpOk) {
+              Write-Host "==== rabbitmqctl status (listeners) ===="
+              & "$env:SBIN\rabbitmqctl.bat" status 2>&1 | Out-String | Write-Host
+              Write-Host "==== netstat 15672 ===="
+              netstat -an | Select-String 15672
               throw "B2: 15672 never became reachable"
           }
+          Write-Host "TCP 15672 reachable"
+
           $cred = New-Object PSCredential('guest', (ConvertTo-SecureString 'guest' -AsPlainText -Force))
+          $apiOk = $false
           $deadline = (Get-Date).AddMinutes(3)
           while ((Get-Date) -lt $deadline) {
             try {
               Invoke-WebRequest -Uri 'http://127.0.0.1:15672/api/overview' -Credential $cred -UseBasicParsing -TimeoutSec 5 | Out-Null
-              break
+              $apiOk = $true; break
             } catch { Start-Sleep -Seconds 3 }
           }
+          if (-not $apiOk) {
+              Write-Host "==== rabbitmqctl status ===="
+              & "$env:SBIN\rabbitmqctl.bat" status 2>&1 | Out-String | Write-Host
+              throw "B2: management API /api/overview never answered"
+          }
+          Write-Host "Management API ready"
+
           Invoke-WebRequest -Uri 'http://127.0.0.1:15672/cli/rabbitmqadmin' -Credential $cred -UseBasicParsing -OutFile rabbitmqadmin.py
       - name: B3. Bootstrap exchange + queue
         run: |
