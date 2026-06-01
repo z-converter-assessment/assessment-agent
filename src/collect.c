@@ -44,12 +44,14 @@
 /**
  * @brief Return cached boot_time as ISO 8601 UTC, or NULL if unreadable.
  *
- * Cached on first call. /proc/stat's `btime` is recomputed every read as
- * `wall_clock_now - uptime`, so NTP corrections jitter it by 1~2s within a
- * single boot. Computing it once at process start eliminates that drift —
- * the only authoritative reset signal we have is "did this string change
- * across messages?", and false-positive flips would corrupt counter-reset
- * detection on the consumer side.
+ * Source: `btime <epoch>` line in /proc/stat. The kernel reflects NTP
+ * corrections into btime, so reading it once at process start and caching
+ * is mandatory — re-reading every cycle would jitter by 1~2s per NTP
+ * step and produce false counter-reset events on the engine. (The earlier
+ * implementation derived this from `CLOCK_REALTIME - /proc/uptime`; the
+ * new path is shorter, gives a kernel-consistent value across the fleet,
+ * and stays slightly more robust through cold-boot NTP convergence on
+ * agent restart.)
  *
  * Read failure is sticky (cached as "unreadable") so we don't retry on
  * every message. Callers emit JSON null in that case.
@@ -62,17 +64,27 @@ static const char *cached_boot_time_iso(void)
 
 	if (!initialized) {
 		initialized = 1;
-		char *content = read_file_all("/proc/uptime");
+		char *content = read_file_all("/proc/stat");
 		if (content) {
-			double uptime = strtod(content, NULL);
-			free(content);
-			if (uptime > 0) {
-				struct timespec now;
-				clock_gettime(CLOCK_REALTIME, &now);
-				time_t boot = now.tv_sec - (time_t)uptime;
-				iso8601_utc(boot, buf, sizeof buf);
-				ok = 1;
+			/* Locate "btime <epoch>" — typically on its own line. Anchor on
+			 * "\nbtime " to avoid matching an in-line substring; first-line
+			 * match handled by also accepting the file head. */
+			const char *p = NULL;
+			if (strncmp(content, "btime ", 6) == 0) {
+				p = content + 6;
+			} else {
+				const char *needle = strstr(content, "\nbtime ");
+				if (needle) p = needle + 7;
 			}
+			if (p) {
+				char *end = NULL;
+				long long epoch = strtoll(p, &end, 10);
+				if (end != p && epoch > 0) {
+					iso8601_utc((time_t)epoch, buf, sizeof buf);
+					ok = 1;
+				}
+			}
+			free(content);
 		}
 	}
 	return ok ? buf : NULL;
@@ -943,6 +955,17 @@ static cJSON *collect_mounts_metrics(void)
 	return arr;
 }
 
+/* Count contiguous high bits in a network-order IPv4 mask (e.g. 0xffffff00
+ * → 24). Non-contiguous masks are rare in practice — we still count the
+ * popcount and let the engine notice via prefix length validity. */
+static int ipv4_netmask_prefix(uint32_t mask_n)
+{
+	uint32_t m = ntohl(mask_n);
+	int n = 0;
+	while (m & 0x80000000u) { n++; m <<= 1; }
+	return n;
+}
+
 static cJSON *collect_internal_ips(void)
 {
 	cJSON *arr = cJSON_CreateArray();
@@ -961,7 +984,17 @@ static cJSON *collect_internal_ips(void)
 		struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
 		if (!inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof ip))
 			continue;
-		cJSON_AddItemToArray(arr, cJSON_CreateString(ip));
+
+		/* CIDR: "<ip>/<prefix>". Missing netmask → prefix 0 (rare; e.g.
+		 * point-to-point without IFA_NETMASK). Buffer fits "xxx.xxx.xxx.xxx/32". */
+		int prefix = 0;
+		if (ifa->ifa_netmask && ifa->ifa_netmask->sa_family == AF_INET) {
+			struct sockaddr_in *mask = (struct sockaddr_in *)ifa->ifa_netmask;
+			prefix = ipv4_netmask_prefix(mask->sin_addr.s_addr);
+		}
+		char cidr[INET_ADDRSTRLEN + 4];
+		snprintf(cidr, sizeof cidr, "%s/%d", ip, prefix);
+		cJSON_AddItemToArray(arr, cJSON_CreateString(cidr));
 	}
 	freeifaddrs(ifap);
 	return arr;

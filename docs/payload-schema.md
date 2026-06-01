@@ -14,6 +14,9 @@
   - 필터: loopback / docker / br-* / veth* / virbr* / 비-Ethernet(type≠ARPHRD_ETHER) 제외, all-zero MAC 제외, 정렬 + dedup.
   - 윈도우 에이전트 (Phase 1) 동시 합류 — 동일 페이로드 v3.3 emit. Windows 한정: `metrics.load_*m` 항상 null, `cpu_stat.{nice,iowait,irq,softirq,steal}` 항상 0, `listen_ports[].uid` 항상 null. 다른 모든 필드는 Linux 와 동일.
   - 윈도우용 image-prep 가이드 추가 — Sysprep `/generalize` 또는 `scripts\image-prep.ps1` 로 MachineGuid 재발급 후 골든 이미지화 권장 (Linux 의 `truncate -s 0 /etc/machine-id` 와 동일 목적).
+- **v3.4 (2026-05-28)**
+  - `inventory.ip_internal` 항목 형식을 **CIDR 표기 문자열**로 변경 (`"10.0.1.15"` → `"10.0.1.15/24"`). 서브넷 prefix를 함께 emit하여 엔진이 네트워크 토폴로지/세그먼트 분석에 사용. 소스: Linux는 `getifaddrs`의 `ifa_netmask`, Windows는 `IP_ADAPTER_UNICAST_ADDRESS.OnLinkPrefixLength`
+  - `boot_time` 소스를 `/proc/stat`의 `btime` 라인으로 전환 (이전: `/proc/uptime + CLOCK_REALTIME`). 의미 동일, 형식 동일. 커널이 NTP 보정을 반영한 값을 직접 노출하므로 cold-boot 직후 NTP convergence 구간에서 에이전트가 재시작될 때 false reset 가능성이 미세하게 더 낮음. 캐시 정책은 그대로 (프로세스 시작 시 1회 read → process lifetime cache)
 - **v3.2 (2026-05-11)**
   - **Worker (task.install) 도입**. agent가 portal로부터 `task.install` 메시지를 받아 HTTPS tar 다운로드 → 압축 해제 → user-level `install.sh` 실행 → `task.result` 회신
   - 신규 exchange `assessment.tasks` (direct) + 머신별 큐 `agent.tasks.<machine_id>` + DLX `assessment.tasks.dlx` → `assessment.tasks.dead`
@@ -66,7 +69,7 @@
 | `collected_at` | string | ISO 8601 UTC (예: `"2026-04-23T14:30:00Z"`). `error` 메시지에서는 에러 발생 시각 |
 | `hostname` | string | 보조 식별자 (운영 중 변경 가능) |
 | `message_id` | string | UUID v4 |
-| `boot_time` | string\|null | ISO 8601 UTC. 시스템 부팅 시각. 프로세스 시작 시 `/proc/uptime` + `CLOCK_REALTIME`으로 1회 캐시(NTP 보정 흔들림 제거). **카운터 리셋 판정의 유일한 권위 소스** — 변경 감지(`prev != curr`)만 사용, 절대값 비교 금지. `/proc/uptime` 미접근 시 `null`. `task.result`는 항상 `null` (worker가 collect.c 캐시와 분리됨) |
+| `boot_time` | string\|null | ISO 8601 UTC. 시스템 부팅 시각. 프로세스 시작 시 `/proc/stat`의 `btime` 라인을 1회 read 후 캐시(NTP 보정 흔들림 제거 위해 캐시 필수). **카운터 리셋 판정의 유일한 권위 소스** — 변경 감지(`prev != curr`)만 사용, 절대값 비교 금지. `/proc/stat` 미접근/파싱 실패 시 `null`. `task.result`는 항상 `null` (worker가 collect.c 캐시와 분리됨) |
 | `agent_started_at` | string\|null | ISO 8601 UTC. agent 프로세스 기동 시각. 프로세스 시작 시 1회 캡처. **관측·디버깅용** — 차분/리셋 로직에서 사용 금지. `task.result`는 항상 `null` (위와 동일 사유) |
 
 > 컨슈머는 **`composite_id`를 기준으로 upsert** 한다. `machine_id`는 디버깅·운영 식별 보조용, `hostname`은 표시용. 같은 `composite_id` 인입 → 같은 호스트 (이미지 클론으로 `machine_id`가 중복돼도 MAC이 다르면 `composite_id`가 분기). 같은 `machine_id`인데 `composite_id`가 다르면 별도 호스트로 인식.
@@ -117,7 +120,7 @@ DLX(`assessment.dlx`)는 컨슈머 측 NAK / TTL 만료 / `x-max-length` 초과 
 | `mounts` | array | `/proc/self/mountinfo` + `statfs(2)` | 마운트별 디스크 사용량 (raw bytes). 가상 fstype 제외 + `(major:minor)`로 bind mount dedup |
 | `services` | array\|null | `systemctl list-units --type=service --state=running --no-pager --plain --no-legend` | 활성 systemd 서비스 unit. systemd 미존재(systemctl 부재·exit≠0)는 **`null` 발행** — 빈 배열(서비스 0개)과 명시적으로 구분. unit 이름은 OS별로 다르며 정규화는 엔진 책임 |
 | `listen_ports` | array | `/proc/net/tcp{,6}` (state=`0A` LISTEN) + `/proc/net/udp{,6}` (no peer) + `/proc/<pid>/fd/*` 소켓 inode 매칭 | TCP listen + UDP 비-connected 소켓. `pid`/`comm`은 권한·프로세스 종료로 미해상 시 `null` |
-| `ip_internal` | array | `getifaddrs(3)` (Linux) / `GetAdaptersAddresses` (Windows) | 내부 IP 주소 목록 (loopback 제외) |
+| `ip_internal` | array | `getifaddrs(3)` (Linux) / `GetAdaptersAddresses` (Windows) | 내부 IP를 **CIDR 표기** 문자열로 emit (loopback 제외). 예: `"10.0.1.15/24"`. 서브넷 정보를 함께 담아 엔진의 네트워크 토폴로지 분석에 사용. Linux는 `ifa_netmask`에서 prefix 환산, Windows는 `OnLinkPrefixLength` 직사용 |
 | `mac_addresses` | array | `/sys/class/net/<iface>/address` (Linux) / `IP_ADAPTER_ADDRESSES.PhysicalAddress` (Windows) | 정렬 + dedup된 lowercase MAC 목록. **`machine_id` 와 함께 클론 충돌 감지** 용도. loopback / docker / br-* / veth* / virbr* / 비-Ethernet / all-zero 제외. 빈 배열 가능 |
 | `ip_external` | array\|null | 클라우드 메타데이터 API | 외부 IP. 메타데이터 미접근 시 `null` |
 
@@ -191,7 +194,7 @@ DLX(`assessment.dlx`)는 컨슈머 측 NAK / TTL 만료 / `x-max-length` 초과 
     { "proto": "udp",  "addr": "0.0.0.0", "port": 53,   "uid": 101, "pid": 612,  "comm": "systemd-resolve" },
     { "proto": "udp",  "addr": "0.0.0.0", "port": 123,  "uid": 0,   "pid": 555,  "comm": "ntpd" }
   ],
-  "ip_internal":   ["10.0.1.15", "172.16.0.3"],
+  "ip_internal":   ["10.0.1.15/24", "172.16.0.3/16"],
   "mac_addresses": ["02:42:ac:11:00:03", "fa:16:3e:7a:1b:5c"],
   "ip_external":   ["54.123.45.67"]
 }
