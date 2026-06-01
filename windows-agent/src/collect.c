@@ -527,7 +527,13 @@ static void fill_network_info(cJSON *inv)
 				struct sockaddr_in6 *sa = (struct sockaddr_in6 *)u->Address.lpSockaddr;
 				inet_ntop(AF_INET6, &sa->sin6_addr, ip, sizeof ip);
 			}
-			if (ip[0]) cJSON_AddItemToArray(ips, cJSON_CreateString(ip));
+			if (!ip[0]) continue;
+			/* CIDR: "<ip>/<prefix>" — OnLinkPrefixLength is supplied by
+			 * GetAdaptersAddresses (Vista+). Buffer fits IPv6 + "/128". */
+			char cidr[INET6_ADDRSTRLEN + 5];
+			snprintf(cidr, sizeof cidr, "%s/%u", ip,
+				(unsigned)u->OnLinkPrefixLength);
+			cJSON_AddItemToArray(ips, cJSON_CreateString(cidr));
 		}
 
 		if (p->PhysicalAddressLength == 6 && mac_count < MAC_CAP) {
