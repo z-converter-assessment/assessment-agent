@@ -409,22 +409,39 @@ jobs:
               throw "B1: RabbitMQ service never reached Running"
           }
 
-          # Sync erlang cookie — the service runs as SYSTEM so its cookie lives
-          # in C:\Windows\System32\config\systemprofile\AppData\Roaming\RabbitMQ.
-          # `rabbitmqctl` / `rabbitmq-diagnostics` invoked by this CI step run
-          # as a different user and look in $USERPROFILE\.erlang.cookie first
-          # — mismatch means erlang distribution (and thus ping) fails with
-          # "unable to perform an operation on node". Copy SYSTEM's cookie to
-          # the CI user's profile so both sides agree.
-          $sysCookie = "C:\Windows\System32\config\systemprofile\AppData\Roaming\RabbitMQ\.erlang.cookie"
-          if (Test-Path $sysCookie) {
-              Copy-Item -Path $sysCookie -Destination "$env:USERPROFILE\.erlang.cookie" -Force
-              Write-Host "Synced erlang cookie to $env:USERPROFILE\.erlang.cookie"
-          } else {
-              Write-Host "WARN: SYSTEM cookie not at expected path; listing dir:"
-              Get-ChildItem -Path "C:\Windows\System32\config\systemprofile\AppData\Roaming\RabbitMQ" -ErrorAction SilentlyContinue | Format-Table
-              throw "B1: SYSTEM erlang cookie missing — cannot sync"
+          # Sync erlang cookie — service runs as SYSTEM, CI step runs as another
+          # user. erlang distribution requires both sides' cookies to match,
+          # otherwise rabbitmqctl/diagnostics fail with "unable to perform an
+          # operation on node". Cookie location varies by chocolatey package
+          # version and erlang installer — search all known spots, then fall
+          # back to filesystem scan.
+          $candidates = @(
+              "C:\Windows\System32\config\systemprofile\.erlang.cookie",
+              "C:\Windows\System32\config\systemprofile\AppData\Roaming\RabbitMQ\.erlang.cookie",
+              "C:\Windows\.erlang.cookie",
+              "$env:ProgramData\RabbitMQ\.erlang.cookie",
+              "$env:APPDATA\RabbitMQ\.erlang.cookie"
+          )
+          $sysCookie = $null
+          foreach ($c in $candidates) {
+              if (Test-Path $c) { $sysCookie = $c; break }
           }
+          if (-not $sysCookie) {
+              Write-Host "Cookie not at any known location — scanning C:\ ..."
+              $hits = Get-ChildItem -Path C:\ -Filter '.erlang.cookie' -Recurse -Force -ErrorAction SilentlyContinue
+              $hits | Format-Table FullName, Length, LastWriteTime
+              if ($hits.Count -gt 0) { $sysCookie = $hits[0].FullName }
+          }
+          if (-not $sysCookie) { throw "B1: no .erlang.cookie found anywhere" }
+          Write-Host "Found SYSTEM cookie at: $sysCookie"
+          Copy-Item -Path $sysCookie -Destination "$env:USERPROFILE\.erlang.cookie" -Force
+          # Lock down ACL — some erlang versions refuse to use a world-readable cookie.
+          $acl = Get-Acl "$env:USERPROFILE\.erlang.cookie"
+          $acl.SetAccessRuleProtection($true, $false)
+          $me  = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+          $acl.SetAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($me, 'FullControl', 'Allow')))
+          Set-Acl "$env:USERPROFILE\.erlang.cookie" $acl
+          Write-Host "Synced cookie to $env:USERPROFILE\.erlang.cookie"
 
           $deadline = (Get-Date).AddMinutes(3)
           while ((Get-Date) -lt $deadline) {
