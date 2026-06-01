@@ -19,6 +19,7 @@
 CC      ?= gcc
 AR      ?= ar
 CMAKE   ?= cmake
+WINDRES ?= windres
 JOBS    ?= 4
 
 CFLAGS  ?= -Wall -Wextra -Wpedantic -O2 -std=c11 \
@@ -67,26 +68,36 @@ CFLAGS += -I$(CJSON_DIR) \
 # with every supported Windows version, see deploy/SUPPORTED_OS.md):
 #   ws2_32   : Winsock (AMQP socket, gethostname, inet_ntop)
 #   iphlpapi : GetAdaptersAddresses, GetIfTable2 (network inventory + io)
-#   advapi32 : Registry, Service Control Manager, EnumServicesStatusEx
+#   advapi32 : Registry, Service Control Manager, ACL (SetNamedSecurityInfoW)
 #   crypt32  : OpenSSL on Windows needs CertOpenSystemStoreW etc.
 #   secur32  : SSPI (used transitively by some Schannel paths)
 #   bcrypt   : BCryptGenRandom (UUID v4 generation)
 #   ole32 / oleaut32 : COM init (used by some Windows API surfaces)
+#   shell32  : installer subcommand — SHCreateDirectoryExW, ShellExecuteW
 LDLIBS := $(RABBITMQ_C_LIB) $(CJSON_LIB) $(CURL_LIB) $(OPENSSL_SSL) $(OPENSSL_CRYPTO) $(ZLIB_LIB) \
           -lws2_32 -liphlpapi -ladvapi32 -lkernel32 -luser32 \
-          -lcrypt32 -lsecur32 -lbcrypt -lole32 -loleaut32
+          -lcrypt32 -lsecur32 -lbcrypt -lole32 -loleaut32 -lshell32
 
 SRC := $(wildcard src/*.c)
 OBJ := $(SRC:.c=.o)
+RES := src/resources.res
 BIN := assessment-agent.exe
 
 all: $(BIN)
 
-$(BIN): $(OBJ)
-	$(CC) $(OBJ) -o $@ $(LDFLAGS) $(LDLIBS)
+$(BIN): $(OBJ) $(RES)
+	$(CC) $(OBJ) $(RES) -o $@ $(LDFLAGS) $(LDLIBS)
 
 src/%.o: src/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
+
+# PE resource — embeds deploy/agent.env.example as RT_RCDATA so the installer
+# subcommand (assessment-agent.exe install) can seed and prompt without any
+# external files on the target host.
+# `-I .` so the `deploy/agent.env.example` reference in resources.rc resolves
+# against the windows-agent/ root (windres' default is the .rc file's dir).
+$(RES): src/resources.rc deploy/agent.env.example
+	$(WINDRES) -O coff -I . -i $< -o $@
 
 # ----------------------------------------------------------------------
 # Vendor fetch (one-time clone — network required)
@@ -191,7 +202,7 @@ vendor-clean:
 	rm -rf $(VENDOR_DIR)
 
 clean:
-	rm -f $(OBJ) $(BIN) build-deps.txt
+	rm -f $(OBJ) $(RES) $(BIN) build-deps.txt
 
 # ----------------------------------------------------------------------
 # Verify — only Windows system DLLs allowed in import table
@@ -200,7 +211,7 @@ verify: $(BIN)
 	@echo "[verify] checking DLL dependencies of $(BIN)..."
 	@objdump -p $(BIN) | awk '/DLL Name:/ {print tolower($$3)}' | sort -u > build-deps.txt
 	@cat build-deps.txt
-	@if grep -vE '^(kernel32|advapi32|user32|ws2_32|iphlpapi|crypt32|secur32|bcrypt|ole32|oleaut32|msvcrt|ntdll|api-ms-win-.+)\.dll$$' build-deps.txt; then \
+	@if grep -vE '^(kernel32|advapi32|user32|ws2_32|iphlpapi|crypt32|secur32|bcrypt|ole32|oleaut32|shell32|msvcrt|ntdll|api-ms-win-.+)\.dll$$' build-deps.txt; then \
 		echo "[verify] FAIL: non-system DLL dependency listed above"; \
 		exit 1; \
 	fi

@@ -67,49 +67,66 @@ disable 옵션 다수:
 
 ## 배포
 
+운영 호스트에 복사하는 파일은 **`assessment-agent.exe` 한 개**. install /
+uninstall / 골든 이미지 준비까지 모두 exe 의 서브커맨드. PowerShell 스크립트
+없음, agent.env.example 도 exe 내부에 RT_RCDATA 로 박힘.
+
 ### 신규 설치 (Server 측, 한 방)
 
 ```powershell
-# 1. CI 또는 운영자 빌드한 dist\ 폴더 + windows-agent\deploy\ 폴더를 서버에 복사
+# 1. CI 산출물 dist\assessment-agent.exe 만 서버에 복사
 # 2. admin PowerShell 에서:
-PS> .\windows-agent\deploy\install.ps1
+PS> .\assessment-agent.exe install
 ```
 
-`install.ps1` 동작 (idempotent):
+`install` 동작 (idempotent — 재실행 안전):
 
-1. Windows 버전 확인 (NT 10.0+)
-2. `dist\assessment-agent.exe` SHA256 검증
-3. `C:\Program Files\assessment-agent\` + `C:\ProgramData\assessment-agent\` +
+1. Administrator 권한 확인 (`TokenIsElevated`)
+2. Windows 버전 확인 (`RtlGetVersion` ≥ 10)
+3. 기존 service stop (있으면) — 30초 polling 후 exe 교체
+4. `C:\Program Files\assessment-agent\` + `C:\ProgramData\assessment-agent\` +
    `C:\ProgramData\assessment-agent\worker\{results,done,running}\` 생성
-4. 기존 service stop → exe 교체
-5. `agent.env` seed (`agent.env.example` 복사) + `env-setup.ps1` 가 빈 필드만
-   대화형 입력
-6. data dir ACL tighten — SYSTEM + Administrators 만 (시크릿 보호)
-7. `assessment-agent` service 등록 (StartupType Automatic) +
-   `sc.exe failure` 으로 자동 재시작 정책 (5s/10s/30s backoff, 1day reset)
-8. service 시작 + Event Log 확인
+   (`SHCreateDirectoryExW`)
+5. 자기 자신 → `C:\Program Files\assessment-agent\assessment-agent.exe` 복사
+6. `agent.env` seed (임베디드 example) + 빈 키만 대화형 prompt.
+   시크릿(`RABBITMQ_PASS`, `RABBITMQ_WORKER_PASS`) 은 `agent.env.local` 에
+   분리, 입력 시 콘솔 echo off (`SetConsoleMode & ~ENABLE_ECHO_INPUT`)
+7. data dir ACL tighten (`SetNamedSecurityInfoW`) — SYSTEM + Administrators 만
+8. `assessment-agent` service 등록 (`CreateServiceW`, StartupType Automatic)
+   + 자동 재시작 정책 (`ChangeServiceConfig2W` / 5s, 10s, 30s backoff, 1 day reset)
+9. service 시작 + RUNNING 도달 확인
 
 ### 골든 이미지 준비 (VM 템플릿)
 
 ```powershell
-# 1. install.ps1 -ImagePrep   (서비스 등록만, 시작 X)
-PS> .\windows-agent\deploy\install.ps1 -ImagePrep
+# 1. service 등록만, 시작 X
+PS> .\assessment-agent.exe install --image-prep
 
-# 2. machine_id (Registry MachineGuid) 재발급
-PS> .\windows-agent\scripts\image-prep.ps1
-#    또는 더 철저히:
-PS> .\windows-agent\scripts\image-prep.ps1 -RunSysprep
+# 2. MachineGuid 재발급 (machine_id 충돌 방지)
+PS> .\assessment-agent.exe prep-image
+#    또는 더 철저히 (sysprep /generalize /oobe /shutdown):
+PS> .\assessment-agent.exe prep-image --sysprep
 ```
 
-**중요**: image-prep 안 하면 clone 된 VM 들이 모두 같은 `MachineGuid` 를 들고
+**중요**: prep-image 안 하면 clone 된 VM 들이 모두 같은 `MachineGuid` 를 들고
 나옴. engine 은 `composite_id`(= `sha256(machine_id + sorted MACs)`) 로 호스트
 식별하므로 MAC 만 달라도 분기 가능하지만, `MachineGuid` 단독 중복은 운영 가시성
-저해. Sysprep `/generalize` 가 가장 안전.
+저해. `--sysprep` 옵션이 가장 안전 (SID·hostname·license 까지 generalize).
 
 ### 업그레이드
 
-`install.ps1` 를 새 `dist\` 와 함께 다시 실행. 기존 service stop → exe 교체 →
-restart. agent.env / agent.env.local 은 보존.
+새 `assessment-agent.exe` 로 `install` 다시 실행. 기존 service stop → exe
+교체 → restart. agent.env / agent.env.local 은 보존되고, 빈 키만 다시 prompt.
+
+### 제거
+
+```powershell
+PS> .\assessment-agent.exe uninstall
+```
+
+service stop + delete. on-disk state (`C:\Program Files\assessment-agent\`,
+`C:\ProgramData\assessment-agent\`) 는 보존 — 재설치 시 설정 유지.
+완전 제거가 필요하면 두 디렉토리를 수동 삭제.
 
 ---
 
