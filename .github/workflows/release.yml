@@ -492,23 +492,31 @@ jobs:
           }
           Write-Host "TCP 15672 reachable"
 
-          $cred = New-Object PSCredential('guest', (ConvertTo-SecureString 'guest' -AsPlainText -Force))
+          # PowerShell's -Credential is lazy (it waits for a 401 challenge),
+          # which can race the RabbitMQ management plugin's first-response
+          # initialization. Send Authorization: Basic on the first request
+          # instead so the server never has to challenge.
+          $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('guest:guest'))
+          $headers = @{ Authorization = "Basic $b64" }
           $apiOk = $false
+          $lastErr = $null
           $deadline = (Get-Date).AddMinutes(3)
           while ((Get-Date) -lt $deadline) {
             try {
-              Invoke-WebRequest -Uri 'http://127.0.0.1:15672/api/overview' -Credential $cred -UseBasicParsing -TimeoutSec 5 | Out-Null
-              $apiOk = $true; break
-            } catch { Start-Sleep -Seconds 3 }
+              $r = Invoke-WebRequest -Uri 'http://127.0.0.1:15672/api/overview' -Headers $headers -UseBasicParsing -TimeoutSec 5
+              if ($r.StatusCode -eq 200) { $apiOk = $true; break }
+            } catch { $lastErr = $_.Exception.Message }
+            Start-Sleep -Seconds 3
           }
           if (-not $apiOk) {
+              Write-Host "Last API error: $lastErr"
               Write-Host "==== rabbitmqctl status ===="
               & "$env:SBIN\rabbitmqctl.bat" status 2>&1 | Out-String | Write-Host
               throw "B2: management API /api/overview never answered"
           }
           Write-Host "Management API ready"
 
-          Invoke-WebRequest -Uri 'http://127.0.0.1:15672/cli/rabbitmqadmin' -Credential $cred -UseBasicParsing -OutFile rabbitmqadmin.py
+          Invoke-WebRequest -Uri 'http://127.0.0.1:15672/cli/rabbitmqadmin' -Headers $headers -UseBasicParsing -OutFile rabbitmqadmin.py
       - name: B3. Bootstrap exchange + queue
         run: |
           python rabbitmqadmin.py -u guest -p guest declare exchange name=assessment type=direct durable=true
@@ -555,11 +563,12 @@ jobs:
           }
       - name: B8. Publish reaches queue (metrics)
         run: |
-          $cred = New-Object PSCredential('guest', (ConvertTo-SecureString 'guest' -AsPlainText -Force))
+          $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('guest:guest'))
+          $headers = @{ Authorization = "Basic $b64" }
           $depth = 0
           for ($i=0; $i -lt 20; $i++) {
               try {
-                  $r = Invoke-RestMethod -Uri 'http://127.0.0.1:15672/api/queues/%2F/server.metrics' -Credential $cred -UseBasicParsing
+                  $r = Invoke-RestMethod -Uri 'http://127.0.0.1:15672/api/queues/%2F/server.metrics' -Headers $headers -UseBasicParsing
                   $depth = [int]$r.messages
                   if ($depth -gt 0) { break }
               } catch {}
