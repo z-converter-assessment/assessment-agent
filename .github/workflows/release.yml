@@ -516,17 +516,23 @@ jobs:
           }
           Write-Host "Management API ready"
 
-          # RabbitMQ 4.x removed the /cli/rabbitmqadmin endpoint that older
-          # docs reference (returns 404 "Object Not Found"). Grab the script
-          # directly from the upstream tag instead.
-          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/rabbitmq/rabbitmq-server/v4.3.1/deps/rabbitmq_management/bin/rabbitmqadmin' -UseBasicParsing -OutFile rabbitmqadmin.py
-      - name: B3. Bootstrap exchange + queue
+          # No rabbitmqadmin download — 4.x removed the /cli endpoint AND moved
+          # the script source. We talk to the management API directly via
+          # Invoke-RestMethod in subsequent steps. The Basic auth header is
+          # re-exported here so later steps can reuse it.
+          echo "RMQ_AUTH=Basic $b64" >> $env:GITHUB_ENV
+      - name: B3. Bootstrap exchange + queue (management API)
         run: |
-          python rabbitmqadmin.py -u guest -p guest declare exchange name=assessment type=direct durable=true
-          python rabbitmqadmin.py -u guest -p guest declare queue    name=server.metrics  durable=true
-          python rabbitmqadmin.py -u guest -p guest declare binding  source=assessment destination=server.metrics  routing_key=server.metrics
-          python rabbitmqadmin.py -u guest -p guest declare queue    name=server.inventory durable=true
-          python rabbitmqadmin.py -u guest -p guest declare binding  source=assessment destination=server.inventory routing_key=server.inventory
+          $headers = @{ Authorization = $env:RMQ_AUTH; 'Content-Type' = 'application/json' }
+          Invoke-RestMethod -Method Put -Uri 'http://127.0.0.1:15672/api/exchanges/%2F/assessment' `
+              -Headers $headers -Body '{"type":"direct","durable":true}' | Out-Null
+          foreach ($q in @('server.metrics', 'server.inventory')) {
+              Invoke-RestMethod -Method Put -Uri "http://127.0.0.1:15672/api/queues/%2F/$q" `
+                  -Headers $headers -Body '{"durable":true}' | Out-Null
+              Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:15672/api/bindings/%2F/e/assessment/q/$q" `
+                  -Headers $headers -Body "{`"routing_key`":`"$q`"}" | Out-Null
+          }
+          Write-Host "Topology bootstrapped: exchange + 2 queues + 2 bindings"
       - name: B4. Seed agent.env (broker connectable, plain TCP)
         run: |
           $env_text = @'
@@ -566,22 +572,26 @@ jobs:
           }
       - name: B8. Publish reaches queue (metrics)
         run: |
-          $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('guest:guest'))
-          $headers = @{ Authorization = "Basic $b64" }
+          $headers = @{ Authorization = $env:RMQ_AUTH; 'Content-Type' = 'application/json' }
           $depth = 0
           for ($i=0; $i -lt 20; $i++) {
               try {
-                  $r = Invoke-RestMethod -Uri 'http://127.0.0.1:15672/api/queues/%2F/server.metrics' -Headers $headers -UseBasicParsing
+                  $r = Invoke-RestMethod -Uri 'http://127.0.0.1:15672/api/queues/%2F/server.metrics' -Headers $headers
                   $depth = [int]$r.messages
                   if ($depth -gt 0) { break }
               } catch {}
               Start-Sleep -Seconds 2
           }
           if ($depth -le 0) { throw "B8: no metrics published in 40s" }
-          Write-Host "depth=$depth"
-          python rabbitmqadmin.py -u guest -p guest get queue=server.metrics ackmode=ack_requeue_false count=1 | Tee-Object -FilePath metric.json
-          if (-not (Select-String -Path metric.json -Pattern '"message_type"' -Quiet)) { throw "B8: missing message_type" }
-          if (-not (Select-String -Path metric.json -Pattern '"machine_id"'   -Quiet)) { throw "B8: missing machine_id" }
+          Write-Host "queue depth=$depth"
+          # peek a message via management API
+          $msgs = Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:15672/api/queues/%2F/server.metrics/get' `
+              -Headers $headers -Body '{"count":1,"ackmode":"ack_requeue_false","encoding":"auto","truncate":50000}'
+          $msgs | ConvertTo-Json -Depth 10 | Tee-Object -FilePath metric.json | Out-Null
+          $payload = $msgs[0].payload
+          Write-Host $payload
+          if ($payload -notmatch '"message_type"') { throw "B8: missing message_type" }
+          if ($payload -notmatch '"machine_id"')   { throw "B8: missing machine_id" }
       - name: B9. Upgrade — install twice, service stays Running
         run: |
           $pid_before = (Get-CimInstance Win32_Service -Filter "Name='assessment-agent'").ProcessId
