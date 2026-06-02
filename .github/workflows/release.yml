@@ -457,12 +457,24 @@ jobs:
                   Format-List TimeCreated, LevelDisplayName, Message
               throw "B1: RabbitMQ erlang node never reached ping-ready"
           }
-      - name: B2. Enable management plugin + wait for HTTP API
+      - name: B2. Enable management plugin + restart + wait for HTTP API
         run: |
           & "$env:SBIN\rabbitmq-plugins.bat" enable rabbitmq_management
-          # plugin enable is online but the HTTP listener still takes a few
-          # seconds to bind 15672. Verify the TCP listener is up first, then
-          # poll the API itself.
+          # 4.x on Windows: plugin enable does NOT auto-bind the HTTP listener
+          # (previous run: `rabbitmqctl status Listeners` shows only amqp/clustering
+          # ports, no http endpoint). Force a restart so the management binding
+          # gets registered, then wait for the node to come back.
+          Restart-Service -Name RabbitMQ -Force
+          $deadline = (Get-Date).AddMinutes(3)
+          while ((Get-Date) -lt $deadline) {
+              & "$env:SBIN\rabbitmq-diagnostics.bat" -q ping 2>$null
+              if ($LASTEXITCODE -eq 0) { break }
+              Start-Sleep -Seconds 5
+          }
+          if ($LASTEXITCODE -ne 0) {
+              & "$env:SBIN\rabbitmqctl.bat" status 2>&1 | Out-String | Write-Host
+              throw "B2: erlang node did not come back after restart"
+          }
           $tcpOk = $false
           $deadline = (Get-Date).AddMinutes(3)
           while ((Get-Date) -lt $deadline) {
