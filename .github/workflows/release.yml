@@ -516,7 +516,10 @@ jobs:
           }
           Write-Host "Management API ready"
 
-          Invoke-WebRequest -Uri 'http://127.0.0.1:15672/cli/rabbitmqadmin' -Headers $headers -UseBasicParsing -OutFile rabbitmqadmin.py
+          # RabbitMQ 4.x removed the /cli/rabbitmqadmin endpoint that older
+          # docs reference (returns 404 "Object Not Found"). Grab the script
+          # directly from the upstream tag instead.
+          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/rabbitmq/rabbitmq-server/v4.3.1/deps/rabbitmq_management/bin/rabbitmqadmin' -UseBasicParsing -OutFile rabbitmqadmin.py
       - name: B3. Bootstrap exchange + queue
         run: |
           python rabbitmqadmin.py -u guest -p guest declare exchange name=assessment type=direct durable=true
