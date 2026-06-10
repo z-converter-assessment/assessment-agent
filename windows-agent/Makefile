@@ -84,8 +84,16 @@ ifeq ($(PROFILE),legacy)
   OPENSSL_CONFIG_OPTS := no-shared no-dso \
       -Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration \
       -Wno-error=int-conversion -Wno-error=implicit-int
+  # OpenSSL 1.0.2 rand_win.c gathers entropy via GDI (screen) — needs gdi32.
+  EXTRA_SYS_LIBS      := -lgdi32
+  # Propagate the NT 5.2 target into the vendor builds. Without it curl 8.x
+  # compiles its RNG against the toolchain default (NT10) and hard-links
+  # BCryptGenRandom (Vista+), which does not exist on Server 2003. With the
+  # define curl takes the pre-Vista RNG path (no bcrypt dependency).
+  VENDOR_CFLAGS       := -D_WIN32_WINNT=0x0502 -DWINVER=0x0502
   # NT 5.2 has no api-ms-win-* umbrella DLLs and bcrypt is runtime-loaded.
-  ALLOWED_DLLS        := kernel32|advapi32|user32|ws2_32|iphlpapi|crypt32|secur32|ole32|oleaut32|shell32|msvcrt|ntdll
+  # gdi32 ships on every Windows incl. Server 2003.
+  ALLOWED_DLLS        := kernel32|advapi32|user32|gdi32|ws2_32|iphlpapi|crypt32|secur32|ole32|oleaut32|shell32|msvcrt|ntdll
 else ifeq ($(PROFILE),win7)
   WINNT_VER           := 0x0601
   OPENSSL_VERSION     ?= openssl-3.0.15
@@ -104,9 +112,13 @@ else
   ALLOWED_DLLS        := kernel32|advapi32|user32|ws2_32|iphlpapi|crypt32|secur32|bcrypt|ole32|oleaut32|shell32|msvcrt|ntdll|api-ms-win-.+
 endif
 
+# Profile-specific extras (empty on modern/win7; set in the legacy block).
+EXTRA_SYS_LIBS ?=
+VENDOR_CFLAGS  ?=
+
 CFLAGS  ?= -Wall -Wextra -Wpedantic -O2 -std=c11 \
            -D_WIN32_WINNT=$(WINNT_VER) -DWINVER=$(WINNT_VER) -DUNICODE -D_UNICODE \
-           -DCURL_STATICLIB
+           -DCURL_STATICLIB -DAMQP_STATIC
 LDFLAGS ?= -static -static-libgcc -Wl,--no-insert-timestamp
 
 AGENT_VERSION ?= 1.0.0
@@ -164,7 +176,7 @@ CFLAGS += -I$(CJSON_DIR) \
 #   shell32  : installer subcommand — SHCreateDirectoryExW, ShellExecuteW
 LDLIBS := $(RABBITMQ_C_LIB) $(CJSON_LIB) $(CURL_LIB) $(OPENSSL_SSL) $(OPENSSL_CRYPTO) $(ZLIB_LIB) \
           -lws2_32 -liphlpapi -ladvapi32 -lkernel32 -luser32 \
-          -lcrypt32 -lsecur32 $(BCRYPT_LIB) -lole32 -loleaut32 -lshell32
+          -lcrypt32 -lsecur32 $(BCRYPT_LIB) -lole32 -loleaut32 -lshell32 $(EXTRA_SYS_LIBS)
 
 SRC := $(wildcard src/*.c)
 OBJ := $(SRC:.c=.o)
@@ -273,6 +285,7 @@ vendor-build-curl:
 	# 위해 모든 선택적 의존을 명시적으로 OFF.
 	$(CMAKE) -S $(CURL_DIR) -B $(CURL_DIR)/build \
 	      -DCMAKE_C_COMPILER=$(CC) \
+	      -DCMAKE_C_FLAGS="$(VENDOR_CFLAGS)" \
 	      -DBUILD_SHARED_LIBS=OFF -DCURL_STATICLIB=ON \
 	      -DBUILD_CURL_EXE=OFF -DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF \
 	      -DCURL_USE_OPENSSL=ON -DCMAKE_USE_OPENSSL=ON \
