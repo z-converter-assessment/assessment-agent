@@ -194,10 +194,15 @@ ifeq ($(PROFILE),legacy)
 	# not reliably parallel-safe, so build serially.
 	$(MAKE) -C $(OPENSSL_DIR) depend
 	$(MAKE) -C $(OPENSSL_DIR)
+	# 1.0.2 install_sw's mkdir is NOT idempotent — it dies with
+	# "Cannot create directory .../install: File exists" (Error 17) when the
+	# prefix dir already exists. Wipe it first so install starts clean.
+	rm -rf $(OPENSSL_DIR)/install
+	$(MAKE) -C $(OPENSSL_DIR) install_sw
 else
 	$(MAKE) -C $(OPENSSL_DIR) -j$(JOBS)
-endif
 	$(MAKE) -C $(OPENSSL_DIR) install_sw
+endif
 
 vendor-build-zlib:
 	# zlib win32/Makefile.gcc 가 ARFLAGS=rcs 를 자체 정의함. AR 변수에는
