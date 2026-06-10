@@ -65,6 +65,7 @@ ifeq ($(PROFILE),legacy)
   # OpenSSL 1.0.2u but 1.1.1 or later is required"). 0.10.0 still builds
   # against 1.0.2 and keeps the amqp_* API the agent uses.
   RABBITMQ_C_VERSION  ?= v0.10.0
+  CURL_STATIC_TARGET  ?= libcurl
   BIN                 := assessment-agent-legacy.exe
   BCRYPT_LIB          :=
   # OpenSSL 1.0.2 Configure has no `no-tests` option.
@@ -126,6 +127,9 @@ ZLIB_DIR           := $(VENDOR_DIR)/zlib
 CJSON_LIB          := $(CJSON_DIR)/build/libcjson.a
 RABBITMQ_C_LIB     := $(RABBITMQ_C_DIR)/build/librabbitmq/librabbitmq.a
 CURL_LIB           := $(CURL_DIR)/build/lib/libcurl.a
+# curl >= 7.77 splits the static lib into the `libcurl_static` target; older
+# curl (legacy pins 7.64.1) only exposes `libcurl`. Profile blocks override.
+CURL_STATIC_TARGET ?= libcurl_static
 OPENSSL_SSL        := $(OPENSSL_DIR)/install/lib/libssl.a
 OPENSSL_CRYPTO     := $(OPENSSL_DIR)/install/lib/libcrypto.a
 ZLIB_LIB           := $(ZLIB_DIR)/libz.a
@@ -266,7 +270,8 @@ vendor-build-curl:
 	      -DCMAKE_C_COMPILER=$(CC) \
 	      -DBUILD_SHARED_LIBS=OFF -DCURL_STATICLIB=ON \
 	      -DBUILD_CURL_EXE=OFF -DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF \
-	      -DCURL_USE_OPENSSL=ON -DCURL_DISABLE_LDAP=ON -DCURL_DISABLE_FTP=ON \
+	      -DCURL_USE_OPENSSL=ON -DCMAKE_USE_OPENSSL=ON \
+	      -DCURL_DISABLE_LDAP=ON -DCURL_DISABLE_FTP=ON \
 	      -DCURL_DISABLE_FILE=ON -DCURL_DISABLE_DICT=ON -DCURL_DISABLE_TELNET=ON \
 	      -DCURL_DISABLE_TFTP=ON -DCURL_DISABLE_RTSP=ON -DCURL_DISABLE_POP3=ON \
 	      -DCURL_DISABLE_IMAP=ON -DCURL_DISABLE_SMTP=ON -DCURL_DISABLE_GOPHER=ON \
@@ -289,7 +294,7 @@ vendor-build-curl:
 	      -DZLIB_INCLUDE_DIR=$(CURDIR)/$(ZLIB_DIR) \
 	      -DZLIB_LIBRARY=$(CURDIR)/$(ZLIB_LIB) \
 	      -DCMAKE_POLICY_VERSION_MINIMUM=3.5
-	$(CMAKE) --build $(CURL_DIR)/build --target libcurl_static -- -j$(JOBS)
+	$(CMAKE) --build $(CURL_DIR)/build --target $(CURL_STATIC_TARGET) -- -j$(JOBS)
 	# Windows mingw cmake 출력 이름은 `libcurl.a` 가 아닐 수 있어 — `libcurl_static`
 	# target 의 실제 파일을 $(CURL_LIB) 경로(`build/lib/libcurl.a`) 로 별칭.
 	@if [ ! -f $(CURL_DIR)/build/lib/libcurl.a ]; then \
