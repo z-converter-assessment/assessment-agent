@@ -75,13 +75,17 @@ tests/
 scripts/
   image-prep.sh       # golden-image cleanup — clears /etc/machine-id before snapshot
 deploy/
-  install.sh          # POSIX-sh single-shot installer (idempotent)
+  install.sh          # POSIX-sh installer (idempotent). systemd host → USER-LEVEL
+                      #   (no root); SysV/EL6 host → system install, root once.
+  uninstall.sh        # symmetric teardown (user-level on systemd, root on SysV)
   SUPPORTED_OS.md     # OS matrix (RHEL/CentOS 7+, Ubuntu 18.04+, Debian 10+, SLES 12+, etc.)
+  sysv/
+    assessment-agent  # SysV init script (EL6) — runs the binary as RUNAS=assessment-agent
   lib/
     detect-os.sh      # /etc/os-release matcher
-    env-setup.sh      # idempotent env populator (prompts only for empty keys)
+    env-setup.sh      # idempotent env populator (env-preset / no-TTY → non-interactive)
   systemd/
-    assessment-agent.service  # systemd unit with User= and TimeoutStopSec= aligned with worker drain
+    assessment-agent.service  # systemd USER unit (systemctl --user; no User=; %h/%S/%E)
     agent.env.example
 windows-agent/         # Phase 1 Windows agent (MinGW + Win32 collectors, no worker)
 vendor/                # gitignored; populated by `make vendor-fetch`
@@ -89,6 +93,18 @@ vendor/                # gitignored; populated by `make vendor-fetch`
 ```
 
 > Repo scope: **agent only**. RabbitMQ broker provisioning (server bring-up, vhost/queue declare, user permission setup) lives outside this repo. The agent assumes an externally-managed broker reachable at `RABBITMQ_HOST`.
+
+### Installation & Privilege Model
+
+The guiding rule: **a customer should never have to run a vendor program as root 24/7.** Installation asks for at most a one-time privilege; the agent then runs unprivileged. `assessment-agent install / uninstall / prep-image` self-installer subcommands stage embedded scripts; no root gate lives in the C layer — each script decides what it needs.
+
+| Host | Install privilege | Runtime | Boot start | Paths |
+|------|-------------------|---------|-----------|-------|
+| Linux + systemd | **none** (pure user) | `systemctl --user` as the invoking user | `loginctl enable-linger` (best-effort; falls back to login-start) | `~/.local/bin`, `${XDG_CONFIG_HOME}/assessment-agent`, `${XDG_STATE_HOME}/assessment-agent`, user unit under `~/.config/systemd/user` |
+| Linux SysV/EL6 | **root once** (register `/etc/init.d`) | `assessment-agent` system user via `su` (RUNAS) | init.d + chkconfig/update-rc.d | `/usr/local/bin`, `/etc/assessment-agent`, `/var/lib/agent-worker` |
+| Windows | **admin once** (register a boot scheduled task, S4U) | per-user scheduled task running `assessment-agent.exe run` | `schtasks /SC ONSTART /RU <user> /RL LIMITED` | `%LOCALAPPDATA%\assessment-agent` |
+
+Common line: **install takes a one-time privilege, the 24/7 runtime is user-level. No cron.** Identity (`machine_id`) is unchanged by this model — it is display-only; the engine keys hosts on `composite_id` (MAC-bound), so clone collisions are handled without root-level machine-id resets (`prep-image` machine-id/MachineGuid reset is now best-effort). Install is **non-interactive** when config is preset in the environment or no TTY is attached (high-latency SSH / no copy-paste deploy path).
 
 ### Core Principles
 
@@ -365,8 +381,8 @@ The worker consumes `task.install` messages from a per-machine queue, executes a
 
 ### Out of Scope
 
-- Agent self-upgrade via `task.install` — agent binary lives in root-owned `/usr/local/bin`, so user-level install.sh **cannot replace it**. Self-upgrade goes through a separate deploy channel.
-- Privileged installs (system packages, systemd unit registration, kernel modules) — blocked by U1 user-level execution. Such installs must be performed out-of-band.
+- Agent self-upgrade via `task.install` — self-upgrade goes through a separate deploy channel, not the task channel. **Trade-off note (user-level install):** on the systemd/user path the agent binary lives in the agent user's `~/.local/bin` (not root-owned `/usr/local/bin`), so a malicious `task.install` running as that same user *could* overwrite it — turning a one-shot compromise into persistence. This is the one residual risk the user-level model adds; it is NOT defended by filesystem ownership (which never enforced agent integrity anyway — a compromised binary emits arbitrary payloads regardless). It belongs to the portal trust boundary (P1) + binary signing, not host root. Credential theft / data forgery were already possible under any model because the worker runs arbitrary `install.sh` as the agent user. The SysV/EL6 system install keeps the binary in root-owned `/usr/local/bin`.
+- Privileged installs (system packages, systemd unit registration, kernel modules) — blocked by U1 user-level execution (no root, no sudo: a `task.install` that needs `sudo` fails — no TTY, cleared env, agent user not in sudoers). Such installs must be performed out-of-band.
 - Multiple concurrent installs on the same host — blocked by M1. The MQ queue handles backpressure.
 - Automatic retry of failed downloads — F1: no agent-side retry. Portal re-issues with a new `task_id` if retry is desired.
 
