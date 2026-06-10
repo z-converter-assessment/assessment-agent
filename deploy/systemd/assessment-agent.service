@@ -1,34 +1,40 @@
 [Unit]
 Description=Assessment Agent — collector + worker (task.install)
-Documentation=file:/usr/local/share/doc/assessment-agent/CLAUDE.md
-After=network-online.target
-Wants=network-online.target
+# USER unit (systemctl --user). Installed under
+#   ${XDG_CONFIG_HOME:-~/.config}/systemd/user/assessment-agent.service
+# and run as the invoking unprivileged user — no root, no system service.
+# network-online.target is intentionally omitted: it is not reliably started
+# in the per-user manager, and the agent already retries the broker
+# connection, so network startup ordering is unnecessary.
 
 [Service]
 Type=simple
 
-# Run as the dedicated non-privileged user. Create with:
-#   useradd --system --home /var/lib/agent-worker \
-#           --shell /usr/sbin/nologin assessment-agent
-User=assessment-agent
-Group=assessment-agent
+# No User=/Group= — the per-user systemd manager already runs this as the
+# owning user. The whole point of the user-level model is that the vendor
+# agent never holds root.
 
-# Worker writes /var/lib/agent-worker/{results,done} and extracts under /tmp.
-# Both must be writable by the User above.
-WorkingDirectory=/var/lib/agent-worker
-ReadWritePaths=/var/lib/agent-worker /tmp
-StateDirectory=agent-worker
+# State lives under the user's state dir (%S = $XDG_STATE_HOME, e.g.
+# ~/.local/state). StateDirectory= creates it 0700 and marks it writable.
+StateDirectory=assessment-agent
 StateDirectoryMode=0700
 RuntimeDirectory=assessment-agent
 RuntimeDirectoryMode=0700
+WorkingDirectory=%S/assessment-agent
 
-# Environment — point at the production .env (chmod 600, owned by User).
-# Sensitive variables (RABBITMQ_PASS, RABBITMQ_WORKER_PASS) MUST come via
-# secret store / drop-in, not committed to git.
-EnvironmentFile=-/etc/assessment-agent/agent.env
-EnvironmentFile=-/etc/assessment-agent/agent.env.local
+# Environment — point at the per-user config (%E = $XDG_CONFIG_HOME). Both
+# files are optional (leading '-'); secrets live in agent.env.local.
+EnvironmentFile=-%E/assessment-agent/agent.env
+EnvironmentFile=-%E/assessment-agent/agent.env.local
 
-ExecStart=/usr/local/bin/assessment-agent
+# Force the worker paths into the user's tree. These come AFTER the
+# EnvironmentFile lines so they override the system-oriented defaults the
+# shipped agent.env.example carries (/var/lib/agent-worker, used only by the
+# SysV system install) — a user-level agent cannot write there.
+Environment=WORKER_STATE_DIR=%S/assessment-agent
+Environment=WORKER_TMP_DIR=%T
+
+ExecStart=%h/.local/bin/assessment-agent
 
 # C5: drain in-flight install on SIGTERM. install.timeout_sec is normally
 # <= 600s, so 15 min covers the maximum drain plus result publish + ack.
@@ -42,13 +48,13 @@ RestartSec=10s
 StartLimitBurst=5
 StartLimitIntervalSec=300
 
-# Hardening — these are belt-and-suspenders on top of U1 (running as a
-# non-privileged user) and EC1 (clearenv + setrlimit on install.sh
-# children). All flags below are tightened to the level the agent + the
-# worker child (running install.sh) actually need.
+# Hardening — limited to the subset that is meaningful and compatible inside
+# a per-user manager. Primary containment is already that the process runs
+# unprivileged; install.sh children are sandboxed separately in exec.c
+# (clearenv + setrlimit + setsid). ProtectSystem=/ProtectHome= are
+# deliberately NOT set: the binary and config live under the user's $HOME, so
+# virtualizing them away would break startup and worker writes.
 NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
@@ -58,14 +64,14 @@ RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 PrivateDevices=yes
-PrivateTmp=no                     # install.sh extraction sandbox lives under /tmp
+PrivateTmp=no                     # install.sh extraction sandbox lives under %T
 SystemCallArchitectures=native
 CapabilityBoundingSet=
 
-# Logging — stderr captured by systemd-journald (E1 decision).
+# Logging — stderr captured by the user journal (journalctl --user).
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=assessment-agent
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
