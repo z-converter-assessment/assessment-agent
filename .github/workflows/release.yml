@@ -142,13 +142,18 @@ jobs:
 
       # OpenSSL version differs per profile, so vendor static libs are not
       # interchangeable — key the cache on the profile.
+      #
+      # NO restore-keys: a prefix fallback restores a PARTIALLY-built OpenSSL
+      # tree from a previous (differently-configured) Makefile, which then
+      # fails with "Because of configuration changes, you MUST..." + a missing
+      # generated header (e.g. engine.h). Exact-key-only means a Makefile change
+      # → cache miss → a clean from-scratch vendor build, which is correct.
+      # `-v2` busts the poisoned legacy caches saved by earlier failed runs.
       - name: Cache vendor (Windows ${{ matrix.profile }})
         uses: actions/cache@v4
         with:
           path: windows-agent/vendor
-          key: vendor-windows-${{ matrix.profile }}-${{ hashFiles('windows-agent/Makefile') }}
-          restore-keys: |
-            vendor-windows-${{ matrix.profile }}-
+          key: vendor-windows-v2-${{ matrix.profile }}-${{ hashFiles('windows-agent/Makefile') }}
 
       - name: Vendor fetch
         run: make PROFILE=${{ matrix.profile }} vendor-fetch
