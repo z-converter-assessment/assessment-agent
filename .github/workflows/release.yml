@@ -135,6 +135,481 @@ jobs:
           retention-days: 90
 
   # ============================================================
+  # Installer smoke — Linux runner 의 sudo + systemd 와 Windows runner 의
+  # Administrator + SCM 을 활용해서 self-installer 서브커맨드를 실제로 한 번
+  # 돌려봄. stdin 을 닫고 시작 → env-setup 의 prompt 가 EOF 를 받아 default
+  # 로 떨어지므로 broker 자격증명 없이도 install --image-prep 까지 진입 가능.
+  # 실제 service start 는 broker 가 없어 일부러 안 함 (--image-prep).
+  # ============================================================
+  # ------------------------------------------------------------
+  # Linux installer smoke — broker(rabbitmq:3 docker) 까지 띄우고:
+  #   1. install --image-prep flow  (서비스 등록만)
+  #   2. install flow (broker 있는 상태에서 service start → publish 도달 검증)
+  #   3. ACL / mode / ownership 검증
+  #   4. 업그레이드 (install 두 번 → service stop → exe 교체 → restart)
+  #   5. /tmp 임시 디렉토리 정리 확인
+  #   6. dev path (deploy/install.sh + INSTALLER_SELF_PATH 미설정) 호환 검증
+  #   7. uninstall (env 보존) + uninstall --purge (state + user 정리)
+  # ------------------------------------------------------------
+  install-smoke-linux:
+    name: Linux installer smoke
+    needs: build-linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # GHA 가 RabbitMQ 컨테이너를 띄우고 healthcheck (`rabbitmq-diagnostics ping`)
+    # 통과까지 기다린 뒤 step 진행. 직접 `docker run` 보다 안정적 — 컨테이너가
+    # init 중 die 하면 GHA 가 fail-fast 로 job 자체를 실패시켜 원인을 보여줌.
+    services:
+      rabbitmq:
+        image: rabbitmq:3-management
+        ports:
+          - 5672:5672
+          - 15672:15672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 30
+          --health-start-period 30s
+    steps:
+      - name: Checkout (dev path 검증용)
+        uses: actions/checkout@v4
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: assessment-agent-linux-x86_64
+          path: dist
+      - name: chmod
+        run: chmod +x dist/assessment-agent-linux-x86_64
+
+      # ---------- Phase A: --image-prep flow ----------
+      - name: A1. install --image-prep
+        run: sudo ./dist/assessment-agent-linux-x86_64 install --image-prep < /dev/null
+      - name: A2. Verify registered (Stopped) + files + user
+        run: |
+          systemctl is-enabled assessment-agent
+          test "$(systemctl is-active assessment-agent || true)" != "active"
+          test -f /etc/systemd/system/assessment-agent.service
+          test -f /usr/local/bin/assessment-agent
+          test -f /etc/assessment-agent/agent.env
+          id assessment-agent
+          getent group assessment-agent
+      - name: A3. ACL — agent.env (0640 root:assessment-agent)
+        run: |
+          mode=$(stat -c '%a' /etc/assessment-agent/agent.env)
+          own=$(stat -c '%U:%G' /etc/assessment-agent/agent.env)
+          [ "$mode" = "640" ] || { echo "expected 0640, got $mode"; exit 1; }
+          [ "$own"  = "root:assessment-agent" ] || { echo "expected root:assessment-agent, got $own"; exit 1; }
+      - name: A4. /tmp bundle cleaned
+        run: |
+          leftover=$(ls -d /tmp/agent-installer-* 2>/dev/null || true)
+          [ -z "$leftover" ] || { echo "leftover bundle: $leftover"; exit 1; }
+      - name: A5. prep-image clears /etc/machine-id
+        run: |
+          sudo ./dist/assessment-agent-linux-x86_64 prep-image
+          test ! -s /etc/machine-id
+      - name: A6. uninstall (env preserved)
+        run: |
+          sudo ./dist/assessment-agent-linux-x86_64 uninstall
+          ! test -f /etc/systemd/system/assessment-agent.service
+          ! test -f /usr/local/bin/assessment-agent
+          test -f /etc/assessment-agent/agent.env
+
+      # ---------- Phase B: broker (services container) + full install flow ----------
+      - name: B1. Wait for RabbitMQ management API
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf -u guest:guest http://127.0.0.1:15672/api/overview >/dev/null; then break; fi
+            sleep 2
+          done
+          curl -sf -u guest:guest http://127.0.0.1:15672/api/overview | head -c 200; echo
+      - name: B2. Bootstrap exchange + queue (engine topology surrogate)
+        run: |
+          curl -sf -u guest:guest -o rabbitmqadmin http://127.0.0.1:15672/cli/rabbitmqadmin
+          chmod +x rabbitmqadmin
+          ./rabbitmqadmin declare exchange name=assessment type=direct durable=true
+          ./rabbitmqadmin declare queue    name=server.metrics  durable=true
+          ./rabbitmqadmin declare binding  source=assessment destination=server.metrics  routing_key=server.metrics
+          ./rabbitmqadmin declare queue    name=server.inventory durable=true
+          ./rabbitmqadmin declare binding  source=assessment destination=server.inventory routing_key=server.inventory
+      - name: B3. Seed agent.env (broker connectable, plain TCP)
+        run: |
+          sudo mkdir -p /etc/assessment-agent
+          sudo tee /etc/assessment-agent/agent.env >/dev/null <<'EOF'
+          RABBITMQ_HOST=127.0.0.1
+          RABBITMQ_PORT=5672
+          RABBITMQ_VHOST=/
+          RABBITMQ_USER=guest
+          RABBITMQ_TLS_ENABLED=false
+          RABBITMQ_EXCHANGE=assessment
+          RABBITMQ_ROUTING_KEY_INVENTORY=server.inventory
+          RABBITMQ_ROUTING_KEY_METRICS=server.metrics
+          RABBITMQ_ROUTING_KEY_ERROR=server.error
+          AGENT_INTERVAL_SEC=5
+          AGENT_INVENTORY_REFRESH_SEC=0
+          WORKER_DOWNLOAD_ALLOWED_HOSTS=
+          EOF
+          sudo tee /etc/assessment-agent/agent.env.local >/dev/null <<'EOF'
+          RABBITMQ_PASS=guest
+          EOF
+      - name: B4. install (no --image-prep) — service must reach active
+        run: sudo ./dist/assessment-agent-linux-x86_64 install < /dev/null
+      - name: B5. systemctl is-active + journal sanity
+        run: |
+          systemctl is-active assessment-agent
+          sudo journalctl -u assessment-agent -n 30 --no-pager
+      - name: B6. Publish reaches queue (metrics + inventory)
+        run: |
+          for i in $(seq 1 20); do
+            depth=$(curl -sf -u guest:guest http://127.0.0.1:15672/api/queues/%2F/server.metrics \
+                    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("messages",0))' 2>/dev/null || echo 0)
+            [ "$depth" -gt 0 ] && break
+            sleep 2
+          done
+          curl -sf -u guest:guest http://127.0.0.1:15672/api/queues/%2F | \
+              python3 -c 'import json,sys; [print(q["name"], q["messages"]) for q in json.load(sys.stdin)]'
+          [ "$depth" -gt 0 ] || { echo "no metrics published in 40s"; exit 1; }
+          # peek a message — must contain message_type=metrics
+          ./rabbitmqadmin get queue=server.metrics ackmode=ack_requeue_false count=1 | tee /tmp/metric.json
+          grep -q '"message_type"' /tmp/metric.json || { echo "payload missing message_type"; exit 1; }
+          grep -q '"machine_id"'   /tmp/metric.json || { echo "payload missing machine_id"; exit 1; }
+      - name: B7. ACL — agent.env.local (0600 root:assessment-agent)
+        run: |
+          mode=$(stat -c '%a' /etc/assessment-agent/agent.env.local)
+          own=$(stat -c '%U:%G' /etc/assessment-agent/agent.env.local)
+          [ "$mode" = "600" ] || { echo "expected 0600, got $mode"; exit 1; }
+          [ "$own"  = "root:assessment-agent" ] || { echo "expected root:assessment-agent, got $own"; exit 1; }
+      - name: B8. Upgrade flow — install twice, service stays active
+        run: |
+          pid_before=$(systemctl show -p MainPID --value assessment-agent)
+          sudo ./dist/assessment-agent-linux-x86_64 install < /dev/null
+          sleep 3
+          systemctl is-active assessment-agent
+          pid_after=$(systemctl show -p MainPID --value assessment-agent)
+          [ "$pid_before" != "$pid_after" ] || { echo "upgrade did not restart (PID unchanged=$pid_before)"; exit 1; }
+          echo "upgrade PID: $pid_before -> $pid_after"
+
+      # ---------- Phase C: dev path (deploy/install.sh 직접) ----------
+      - name: C1. uninstall + Verify removal
+        run: |
+          sudo ./dist/assessment-agent-linux-x86_64 uninstall
+          ! test -f /usr/local/bin/assessment-agent
+      - name: C2. Stage dist for dev install.sh path
+        run: |
+          mkdir -p dev-stage/dist
+          cp dist/assessment-agent-linux-x86_64 dev-stage/dist/
+          cp -r deploy dev-stage/
+          (cd dev-stage/dist && sha256sum assessment-agent-linux-x86_64 > SHA256SUMS)
+      - name: C3. dev path — ./deploy/install.sh (no INSTALLER_SELF_PATH)
+        run: |
+          cd dev-stage
+          ls -la deploy/install.sh
+          file deploy/install.sh
+          head -1 deploy/install.sh
+          # Absolute path + explicit `bash` so sudo's secure_path / cwd handling
+          # cannot mask the script. This is the operator's actual fallback path
+          # for a freshly cloned repo on the target host.
+          sudo bash "$(pwd)/deploy/install.sh" < /dev/null
+          systemctl is-active assessment-agent
+
+      # ---------- Phase D: --purge cleanup ----------
+      - name: D1. uninstall --purge wipes state + user
+        run: |
+          sudo ./dist/assessment-agent-linux-x86_64 uninstall --purge
+          ! test -d /etc/assessment-agent
+          ! test -d /var/lib/agent-worker
+          ! id assessment-agent 2>/dev/null
+          ! getent group assessment-agent 2>/dev/null
+
+  # ------------------------------------------------------------
+  # Windows installer smoke — chocolatey RabbitMQ 까지 띄우고:
+  #   1. install --image-prep flow
+  #   2. install flow (broker 있는 상태에서 service start → publish 도달)
+  #   3. SCM BinaryPath 가 따옴표로 감싸졌는지 (sc qc)
+  #   4. ACL — agent.env.local 이 SYSTEM + Administrators 만인지 (Get-Acl)
+  #   5. 업그레이드 (install 두 번)
+  #   6. uninstall + Verify
+  # ------------------------------------------------------------
+  install-smoke-windows:
+    name: Windows installer smoke
+    needs: build-windows
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: assessment-agent-windows-x86_64
+          path: dist
+
+      # ---------- Phase A: --image-prep flow ----------
+      - name: A1. install --image-prep
+        run: $null | .\dist\assessment-agent.exe install --image-prep
+      - name: A2. Verify registered (Stopped) + files + ACL on env.local
+        run: |
+          $svc = Get-Service -Name assessment-agent
+          if ($svc.Status -ne 'Stopped')      { throw "A2: expected Stopped, got $($svc.Status)" }
+          if ($svc.StartType -ne 'Automatic') { throw "A2: expected Automatic, got $($svc.StartType)" }
+          foreach ($p in @(
+              'C:\Program Files\assessment-agent\assessment-agent.exe',
+              'C:\ProgramData\assessment-agent\agent.env',
+              'C:\ProgramData\assessment-agent\worker\results',
+              'C:\ProgramData\assessment-agent\worker\done',
+              'C:\ProgramData\assessment-agent\worker\running')) {
+              if (-not (Test-Path $p)) { throw "A2: missing $p" }
+          }
+      - name: A3. SCM BinaryPath is quoted (space-safe)
+        run: |
+          $out = (& sc.exe qc assessment-agent | Out-String)
+          Write-Host $out
+          if ($out -notmatch '\"C:\\Program Files\\assessment-agent\\assessment-agent\.exe\"') {
+              throw "A3: BinaryPath is not quoted: $out"
+          }
+      - name: A4. prep-image regenerates MachineGuid
+        run: |
+          $before = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography' MachineGuid).MachineGuid
+          .\dist\assessment-agent.exe prep-image
+          $after = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography' MachineGuid).MachineGuid
+          if ($before -eq $after) { throw "A4: MachineGuid did not change" }
+          Write-Host "MachineGuid: $before -> $after"
+      - name: A5. uninstall (state preserved)
+        run: |
+          .\dist\assessment-agent.exe uninstall
+          $svc = Get-Service -Name assessment-agent -ErrorAction SilentlyContinue
+          if ($svc) { throw "A5: service still registered: $($svc.Status)" }
+          if (-not (Test-Path 'C:\ProgramData\assessment-agent')) { throw "A5: state dir wiped" }
+
+      # ---------- Phase B: broker + full install flow ----------
+      - name: B1. Install RabbitMQ via Chocolatey + wait for erlang node
+        run: |
+          choco install rabbitmq --no-progress -y
+          $sbin = (Get-ChildItem 'C:\Program Files\RabbitMQ Server\*\sbin' -Directory | Select-Object -First 1).FullName
+          if (-not $sbin) { throw "B1: RabbitMQ sbin not found" }
+          echo "SBIN=$sbin" >> $env:GITHUB_ENV
+
+          # In 4.x the chocolatey post-install plays with the service while
+          # the listener is still binding. Do NOT Restart-Service — that races
+          # with the in-progress start and leaves the erlang node in a half-up
+          # state where `rabbitmq-diagnostics ping` never returns. Just poll
+          # the service status first, then poll erlang readiness.
+          $deadline = (Get-Date).AddMinutes(5)
+          while ((Get-Date) -lt $deadline) {
+              $svc = Get-Service -Name RabbitMQ -ErrorAction SilentlyContinue
+              if ($svc -and $svc.Status -eq 'Running') { break }
+              Start-Sleep -Seconds 3
+          }
+          Get-Service RabbitMQ
+          if (-not $svc -or $svc.Status -ne 'Running') {
+              Get-WinEvent -LogName Application -MaxEvents 30 -ErrorAction SilentlyContinue |
+                  Where-Object { $_.ProviderName -match 'RabbitMQ|erlang' } |
+                  Format-List TimeCreated, LevelDisplayName, Message
+              throw "B1: RabbitMQ service never reached Running"
+          }
+
+          # Sync erlang cookie — service runs as SYSTEM, CI step runs as another
+          # user. erlang distribution requires both sides' cookies to match,
+          # otherwise rabbitmqctl/diagnostics fail with "unable to perform an
+          # operation on node". Cookie location varies by chocolatey package
+          # version and erlang installer — search all known spots, then fall
+          # back to filesystem scan.
+          $candidates = @(
+              "C:\Windows\System32\config\systemprofile\.erlang.cookie",
+              "C:\Windows\System32\config\systemprofile\AppData\Roaming\RabbitMQ\.erlang.cookie",
+              "C:\Windows\.erlang.cookie",
+              "$env:ProgramData\RabbitMQ\.erlang.cookie",
+              "$env:APPDATA\RabbitMQ\.erlang.cookie"
+          )
+          $sysCookie = $null
+          foreach ($c in $candidates) {
+              if (Test-Path $c) { $sysCookie = $c; break }
+          }
+          if (-not $sysCookie) {
+              Write-Host "Cookie not at any known location — scanning C:\ ..."
+              $hits = Get-ChildItem -Path C:\ -Filter '.erlang.cookie' -Recurse -Force -ErrorAction SilentlyContinue
+              $hits | Format-Table FullName, Length, LastWriteTime
+              if ($hits.Count -gt 0) { $sysCookie = $hits[0].FullName }
+          }
+          if (-not $sysCookie) { throw "B1: no .erlang.cookie found anywhere" }
+          Write-Host "Found SYSTEM cookie at: $sysCookie"
+          Copy-Item -Path $sysCookie -Destination "$env:USERPROFILE\.erlang.cookie" -Force
+          # Lock down ACL — some erlang versions refuse to use a world-readable cookie.
+          $acl = Get-Acl "$env:USERPROFILE\.erlang.cookie"
+          $acl.SetAccessRuleProtection($true, $false)
+          $me  = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+          $acl.SetAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($me, 'FullControl', 'Allow')))
+          Set-Acl "$env:USERPROFILE\.erlang.cookie" $acl
+          Write-Host "Synced cookie to $env:USERPROFILE\.erlang.cookie"
+
+          $deadline = (Get-Date).AddMinutes(3)
+          while ((Get-Date) -lt $deadline) {
+              & "$sbin\rabbitmq-diagnostics.bat" -q ping 2>$null
+              if ($LASTEXITCODE -eq 0) { break }
+              Start-Sleep -Seconds 5
+          }
+          if ($LASTEXITCODE -ne 0) {
+              # Dump everything that helps figure out why erlang is wedged.
+              & "$sbin\rabbitmqctl.bat" status 2>&1 | Out-String | Write-Host
+              Get-WinEvent -LogName Application -MaxEvents 30 -ErrorAction SilentlyContinue |
+                  Where-Object { $_.ProviderName -match 'RabbitMQ|erlang' } |
+                  Format-List TimeCreated, LevelDisplayName, Message
+              throw "B1: RabbitMQ erlang node never reached ping-ready"
+          }
+      - name: B2. Enable management plugin + restart + wait for HTTP API
+        run: |
+          & "$env:SBIN\rabbitmq-plugins.bat" enable rabbitmq_management
+          # 4.x on Windows: plugin enable does NOT auto-bind the HTTP listener
+          # (previous run: `rabbitmqctl status Listeners` shows only amqp/clustering
+          # ports, no http endpoint). Force a restart so the management binding
+          # gets registered, then wait for the node to come back.
+          Restart-Service -Name RabbitMQ -Force
+          $deadline = (Get-Date).AddMinutes(3)
+          while ((Get-Date) -lt $deadline) {
+              & "$env:SBIN\rabbitmq-diagnostics.bat" -q ping 2>$null
+              if ($LASTEXITCODE -eq 0) { break }
+              Start-Sleep -Seconds 5
+          }
+          if ($LASTEXITCODE -ne 0) {
+              & "$env:SBIN\rabbitmqctl.bat" status 2>&1 | Out-String | Write-Host
+              throw "B2: erlang node did not come back after restart"
+          }
+          $tcpOk = $false
+          $deadline = (Get-Date).AddMinutes(3)
+          while ((Get-Date) -lt $deadline) {
+            if (Test-NetConnection -ComputerName 127.0.0.1 -Port 15672 -InformationLevel Quiet -WarningAction SilentlyContinue) {
+                $tcpOk = $true; break
+            }
+            Start-Sleep -Seconds 3
+          }
+          if (-not $tcpOk) {
+              Write-Host "==== rabbitmqctl status (listeners) ===="
+              & "$env:SBIN\rabbitmqctl.bat" status 2>&1 | Out-String | Write-Host
+              Write-Host "==== netstat 15672 ===="
+              netstat -an | Select-String 15672
+              throw "B2: 15672 never became reachable"
+          }
+          Write-Host "TCP 15672 reachable"
+
+          # PowerShell's -Credential is lazy (it waits for a 401 challenge),
+          # which can race the RabbitMQ management plugin's first-response
+          # initialization. Send Authorization: Basic on the first request
+          # instead so the server never has to challenge.
+          $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('guest:guest'))
+          $headers = @{ Authorization = "Basic $b64" }
+          $apiOk = $false
+          $lastErr = $null
+          $deadline = (Get-Date).AddMinutes(3)
+          while ((Get-Date) -lt $deadline) {
+            try {
+              $r = Invoke-WebRequest -Uri 'http://127.0.0.1:15672/api/overview' -Headers $headers -UseBasicParsing -TimeoutSec 5
+              if ($r.StatusCode -eq 200) { $apiOk = $true; break }
+            } catch { $lastErr = $_.Exception.Message }
+            Start-Sleep -Seconds 3
+          }
+          if (-not $apiOk) {
+              Write-Host "Last API error: $lastErr"
+              Write-Host "==== rabbitmqctl status ===="
+              & "$env:SBIN\rabbitmqctl.bat" status 2>&1 | Out-String | Write-Host
+              throw "B2: management API /api/overview never answered"
+          }
+          Write-Host "Management API ready"
+
+          # No rabbitmqadmin download — 4.x removed the /cli endpoint AND moved
+          # the script source. We talk to the management API directly via
+          # Invoke-RestMethod in subsequent steps. The Basic auth header is
+          # re-exported here so later steps can reuse it.
+          echo "RMQ_AUTH=Basic $b64" >> $env:GITHUB_ENV
+      - name: B3. Bootstrap exchange + queue (management API)
+        run: |
+          $headers = @{ Authorization = $env:RMQ_AUTH; 'Content-Type' = 'application/json' }
+          Invoke-RestMethod -Method Put -Uri 'http://127.0.0.1:15672/api/exchanges/%2F/assessment' `
+              -Headers $headers -Body '{"type":"direct","durable":true}' | Out-Null
+          foreach ($q in @('server.metrics', 'server.inventory')) {
+              Invoke-RestMethod -Method Put -Uri "http://127.0.0.1:15672/api/queues/%2F/$q" `
+                  -Headers $headers -Body '{"durable":true}' | Out-Null
+              Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:15672/api/bindings/%2F/e/assessment/q/$q" `
+                  -Headers $headers -Body "{`"routing_key`":`"$q`"}" | Out-Null
+          }
+          Write-Host "Topology bootstrapped: exchange + 2 queues + 2 bindings"
+      - name: B4. Seed agent.env (broker connectable, plain TCP)
+        run: |
+          $env_text = @'
+          RABBITMQ_HOST=127.0.0.1
+          RABBITMQ_PORT=5672
+          RABBITMQ_VHOST=/
+          RABBITMQ_USER=guest
+          RABBITMQ_TLS_ENABLED=false
+          RABBITMQ_EXCHANGE=assessment
+          RABBITMQ_ROUTING_KEY_INVENTORY=server.inventory
+          RABBITMQ_ROUTING_KEY_METRICS=server.metrics
+          RABBITMQ_ROUTING_KEY_ERROR=server.error
+          AGENT_INTERVAL_SEC=5
+          AGENT_INVENTORY_REFRESH_SEC=0
+          WORKER_DOWNLOAD_ALLOWED_HOSTS=
+          '@
+          New-Item -ItemType Directory -Force -Path 'C:\ProgramData\assessment-agent' | Out-Null
+          [IO.File]::WriteAllText('C:\ProgramData\assessment-agent\agent.env', $env_text, (New-Object Text.UTF8Encoding $false))
+          [IO.File]::WriteAllText('C:\ProgramData\assessment-agent\agent.env.local', "RABBITMQ_PASS=guest`n", (New-Object Text.UTF8Encoding $false))
+      - name: B5. install (no --image-prep) — service must reach Running
+        run: $null | .\dist\assessment-agent.exe install
+      - name: B6. Get-Service Running
+        run: |
+          $svc = Get-Service -Name assessment-agent
+          if ($svc.Status -ne 'Running') { throw "B6: expected Running, got $($svc.Status)" }
+      - name: B7. ACL — agent.env.local restricted to SYSTEM + Administrators
+        run: |
+          $acl = Get-Acl 'C:\ProgramData\assessment-agent\agent.env.local'
+          $idents = $acl.Access | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique
+          Write-Host ($idents -join '; ')
+          $expected = @('BUILTIN\Administrators','NT AUTHORITY\SYSTEM')
+          foreach ($i in $idents) {
+              if ($expected -notcontains $i) { throw "B7: unexpected ACE for $i" }
+          }
+          foreach ($e in $expected) {
+              if ($idents -notcontains $e) { throw "B7: missing ACE for $e" }
+          }
+      - name: B8. Publish reaches queue (metrics)
+        run: |
+          $headers = @{ Authorization = $env:RMQ_AUTH; 'Content-Type' = 'application/json' }
+          $depth = 0
+          for ($i=0; $i -lt 20; $i++) {
+              try {
+                  $r = Invoke-RestMethod -Uri 'http://127.0.0.1:15672/api/queues/%2F/server.metrics' -Headers $headers
+                  $depth = [int]$r.messages
+                  if ($depth -gt 0) { break }
+              } catch {}
+              Start-Sleep -Seconds 2
+          }
+          if ($depth -le 0) { throw "B8: no metrics published in 40s" }
+          Write-Host "queue depth=$depth"
+          # peek a message via management API
+          $msgs = Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:15672/api/queues/%2F/server.metrics/get' `
+              -Headers $headers -Body '{"count":1,"ackmode":"ack_requeue_false","encoding":"auto","truncate":50000}'
+          $msgs | ConvertTo-Json -Depth 10 | Tee-Object -FilePath metric.json | Out-Null
+          $payload = $msgs[0].payload
+          Write-Host $payload
+          if ($payload -notmatch '"message_type"') { throw "B8: missing message_type" }
+          if ($payload -notmatch '"machine_id"')   { throw "B8: missing machine_id" }
+      - name: B9. Upgrade — install twice, service stays Running
+        run: |
+          $pid_before = (Get-CimInstance Win32_Service -Filter "Name='assessment-agent'").ProcessId
+          $null | .\dist\assessment-agent.exe install
+          Start-Sleep -Seconds 3
+          $svc = Get-Service -Name assessment-agent
+          if ($svc.Status -ne 'Running') { throw "B9: not Running after upgrade ($($svc.Status))" }
+          $pid_after = (Get-CimInstance Win32_Service -Filter "Name='assessment-agent'").ProcessId
+          if ($pid_before -eq $pid_after) { throw "B9: upgrade did not restart (PID unchanged=$pid_before)" }
+          Write-Host "upgrade PID: $pid_before -> $pid_after"
+      - name: B10. uninstall (state preserved)
+        run: |
+          .\dist\assessment-agent.exe uninstall
+          $svc = Get-Service -Name assessment-agent -ErrorAction SilentlyContinue
+          if ($svc) { throw "B10: service still registered" }
+          if (-not (Test-Path 'C:\ProgramData\assessment-agent')) { throw "B10: state wiped" }
+
+  # ============================================================
   # Release 잡 — tag v* push 시에만 실행. 두 artifact 다운로드 → GitHub
   # Release 페이지에 첨부. body 는 자동 생성 (PR / commit history 기반).
   # ============================================================

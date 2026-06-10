@@ -17,6 +17,7 @@
  */
 
 #include "collect.h"
+#include "installer.h"
 #include "publish.h"
 #include "service.h"
 #include "util.h"
@@ -386,17 +387,56 @@ int agent_run(void)
 }
 
 /* ============================================================
- *  main
+ *  main — subcommand dispatch.
+ *
+ *   (none)        → SCM dispatcher (default; how `sc start` invokes us)
+ *   install       → register service, populate env, start
+ *   install --image-prep
+ *                 → register but do NOT start (golden-image flow)
+ *   uninstall     → stop + delete service
+ *   prep-image    → regenerate MachineGuid (clone safety)
+ *   prep-image --sysprep
+ *                 → also kick Sysprep /generalize /oobe /shutdown
+ *   --console / -c → foreground run (debugging)
  * ============================================================ */
+static void print_usage(void)
+{
+	fprintf(stderr,
+	    "assessment-agent.exe — Resource assessment collector\n"
+	    "\n"
+	    "Subcommands:\n"
+	    "  install [--image-prep]    register service (start unless --image-prep)\n"
+	    "  uninstall                 stop and delete service\n"
+	    "  prep-image [--sysprep]    regenerate MachineGuid for image cloning\n"
+	    "  --console, -c             foreground run for debugging\n"
+	    "  (no args)                 SCM service-mode entry (used by Windows itself)\n");
+}
+
 int main(int argc, char **argv)
 {
-	int console_mode = 0;
-	for (int i = 1; i < argc; i++) {
-		if (strcmp(argv[i], "--console") == 0 ||
-		    strcmp(argv[i], "-c") == 0)
-			console_mode = 1;
+	if (argc >= 2) {
+		const char *cmd = argv[1];
+		int flag = 0;
+		for (int i = 2; i < argc; i++) {
+			if (strcmp(argv[i], "--image-prep") == 0 ||
+			    strcmp(argv[i], "--sysprep") == 0)
+				flag = 1;
+		}
+		if (strcmp(cmd, "install") == 0)
+			return installer_run_install(flag);
+		if (strcmp(cmd, "uninstall") == 0)
+			return installer_run_uninstall();
+		if (strcmp(cmd, "prep-image") == 0)
+			return installer_run_prep_image(flag);
+		if (strcmp(cmd, "--console") == 0 || strcmp(cmd, "-c") == 0)
+			return run_as_console();
+		if (strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0) {
+			print_usage();
+			return 0;
+		}
+		fprintf(stderr, "[agent] unknown subcommand: %s\n\n", cmd);
+		print_usage();
+		return 2;
 	}
-	if (console_mode)
-		return run_as_console();
 	return run_as_service();
 }

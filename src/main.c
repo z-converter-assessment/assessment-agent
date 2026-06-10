@@ -26,6 +26,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "collect.h"
+#include "installer.h"
 #include "publish.h"
 #include "util.h"
 #include "worker.h"
@@ -241,8 +242,43 @@ static void log_optional_cmds(void)
 	}
 }
 
-int main(void)
+static void print_usage(void)
 {
+	fprintf(stderr,
+	    "assessment-agent — Resource assessment collector\n"
+	    "\n"
+	    "Subcommands:\n"
+	    "  install [--image-prep]   register systemd service (start unless --image-prep)\n"
+	    "  uninstall [--purge]      stop + remove service (--purge also wipes state)\n"
+	    "  prep-image               clear /etc/machine-id for VM image cloning\n"
+	    "  (no args)                run the collector + worker (used by systemd)\n");
+}
+
+int main(int argc, char **argv)
+{
+	if (argc >= 2) {
+		const char *cmd = argv[1];
+		int flag = 0;
+		for (int i = 2; i < argc; i++) {
+			if (strcmp(argv[i], "--image-prep") == 0 ||
+			    strcmp(argv[i], "--purge") == 0)
+				flag = 1;
+		}
+		if (strcmp(cmd, "install") == 0)
+			return installer_run_install(flag);
+		if (strcmp(cmd, "uninstall") == 0)
+			return installer_run_uninstall(flag);
+		if (strcmp(cmd, "prep-image") == 0)
+			return installer_run_prep_image();
+		if (strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0) {
+			print_usage();
+			return 0;
+		}
+		fprintf(stderr, "[agent] unknown subcommand: %s\n\n", cmd);
+		print_usage();
+		return 2;
+	}
+
 	signal(SIGINT,  on_signal);
 	signal(SIGTERM, on_signal);
 	/*

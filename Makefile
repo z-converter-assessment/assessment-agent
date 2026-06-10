@@ -68,10 +68,58 @@ SRC := $(wildcard src/*.c)
 OBJ := $(SRC:.c=.o)
 BIN := assessment-agent
 
+# ----------------------------------------------------------------------
+# Embedded sh / systemd unit / env example.
+#
+# `ld -r -b binary` packs each input file as raw bytes and emits
+#   _binary_<basename>_start / _end / _size
+# symbols (non-alnum chars in the basename become underscores). The
+# installer subcommand reads these blobs and dumps them under
+# /tmp/agent-installer-XXXXXX/ before exec'ing /bin/sh against install.sh.
+#
+# We stage the inputs into build/embed/ with flat names so the symbols are
+# `_binary_install_sh_start` (etc) rather than `_binary_deploy_install_sh_start`.
+# A single ld -r call collapses all blobs into one .o and objcopy moves the
+# bytes from .data to .rodata so they cannot be modified at runtime.
+# ----------------------------------------------------------------------
+LD       ?= ld
+OBJCOPY  ?= objcopy
+EMBED_DIR := build/embed
+EMBED_OBJ := $(EMBED_DIR)/embed.o
+
+$(EMBED_DIR)/install.sh:               deploy/install.sh
+$(EMBED_DIR)/uninstall.sh:             deploy/uninstall.sh
+$(EMBED_DIR)/image-prep.sh:            scripts/image-prep.sh
+$(EMBED_DIR)/detect-os.sh:             deploy/lib/detect-os.sh
+$(EMBED_DIR)/env-setup.sh:             deploy/lib/env-setup.sh
+$(EMBED_DIR)/assessment-agent.service: deploy/systemd/assessment-agent.service
+$(EMBED_DIR)/agent.env.example:        deploy/systemd/agent.env.example
+
+$(EMBED_DIR):
+	mkdir -p $@
+
+$(EMBED_DIR)/%: | $(EMBED_DIR)
+	cp $< $@
+
+EMBED_STAGED := \
+    $(EMBED_DIR)/install.sh \
+    $(EMBED_DIR)/uninstall.sh \
+    $(EMBED_DIR)/image-prep.sh \
+    $(EMBED_DIR)/detect-os.sh \
+    $(EMBED_DIR)/env-setup.sh \
+    $(EMBED_DIR)/assessment-agent.service \
+    $(EMBED_DIR)/agent.env.example
+
+$(EMBED_OBJ): $(EMBED_STAGED)
+	cd $(EMBED_DIR) && $(LD) -r -b binary -o embed.raw.o $(notdir $(EMBED_STAGED))
+	$(OBJCOPY) --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	    $(EMBED_DIR)/embed.raw.o $@
+	rm -f $(EMBED_DIR)/embed.raw.o
+
 all: $(BIN)
 
-$(BIN): $(OBJ)
-	$(CC) $(OBJ) -o $@ $(LDFLAGS) $(LDLIBS)
+$(BIN): $(OBJ) $(EMBED_OBJ)
+	$(CC) $(OBJ) $(EMBED_OBJ) -o $@ $(LDFLAGS) $(LDLIBS)
 
 src/%.o: src/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -198,6 +246,7 @@ vendor-clean:
 
 clean:
 	rm -f $(OBJ) $(BIN) $(TEST_BIN)
+	rm -rf $(EMBED_DIR)
 
 # ----------------------------------------------------------------------
 # verify — manylinux2014 ABI compliance.
