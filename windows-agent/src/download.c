@@ -20,6 +20,7 @@
 
 #include <curl/curl.h>
 #include <openssl/evp.h>
+#include "openssl_compat.h"   /* EVP_MD_CTX_new/_free on OpenSSL 1.0.2 (legacy) */
 
 #include <ctype.h>
 #include <stdint.h>
