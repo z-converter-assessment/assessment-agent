@@ -53,7 +53,9 @@ ifeq ($(USE_VENDORED),1)
              -I$(ZLIB_DIR)
   LDLIBS  := $(RABBITMQ_C_LIB) $(CJSON_LIB) $(CURL_LIB) $(LIBARCHIVE_LIB) \
              $(OPENSSL_SSL) $(OPENSSL_CRYPTO) $(ZLIB_LIB) \
-             -lpthread -ldl
+             -lpthread -ldl -lrt
+  # -lrt: clock_gettime lives in librt on glibc < 2.17 (CentOS 6 / legacy
+  # build); folded into libc since 2.17. `-Wl,--as-needed` drops it on modern.
   # Hardening + size: PIE, full RELRO, BIND_NOW, drop unused libs, static libgcc.
   # `make verify` confirms only the glibc whitelist remains in ldd output.
   LDFLAGS += -pie -Wl,-z,relro,-z,now -Wl,--as-needed -static-libgcc
