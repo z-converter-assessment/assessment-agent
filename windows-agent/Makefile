@@ -61,6 +61,10 @@ ifeq ($(PROFILE),legacy)
   WINNT_VER           := 0x0502
   OPENSSL_VERSION     ?= OpenSSL_1_0_2u
   CURL_VERSION        ?= curl-7_64_1
+  # rabbitmq-c >= 0.11 requires OpenSSL 1.1.1+ (CMake hard-fails: "Found
+  # OpenSSL 1.0.2u but 1.1.1 or later is required"). 0.10.0 still builds
+  # against 1.0.2 and keeps the amqp_* API the agent uses.
+  RABBITMQ_C_VERSION  ?= v0.10.0
   BIN                 := assessment-agent-legacy.exe
   BCRYPT_LIB          :=
   # OpenSSL 1.0.2 Configure has no `no-tests` option.
@@ -97,7 +101,7 @@ AGENT_VERSION ?= 1.0.0
 # ----------------------------------------------------------------------
 VENDOR_DIR         := vendor
 CJSON_VERSION      := v1.7.18
-RABBITMQ_C_VERSION := v0.15.0
+RABBITMQ_C_VERSION ?= v0.15.0
 ZLIB_VERSION       := v1.3.1
 # CURL_VERSION / OPENSSL_VERSION are set by the build-profile block above
 # (modern vs LEGACY) so they can be pinned per ABI target.
