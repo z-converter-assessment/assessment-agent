@@ -186,7 +186,17 @@ vendor-build-openssl:
 	# (`install/lib/libssl.a`) 와 어긋난다.
 	cd $(OPENSSL_DIR) && ./Configure $(OPENSSL_TARGET) $(OPENSSL_CONFIG_OPTS) $(OPENSSL_CROSS) \
 	    --libdir=lib --prefix=$(CURDIR)/$(OPENSSL_DIR)/install
+ifeq ($(PROFILE),legacy)
+	# OpenSSL 1.0.2u (legacy profile): Configure mandates `make depend` before
+	# building — without it the generated Makefile keeps a stale dependency on
+	# include/openssl/engine.h, which `no-engine` never generates, and the
+	# build dies with "No rule to make target engine.h". 1.0.2's build is also
+	# not reliably parallel-safe, so build serially.
+	$(MAKE) -C $(OPENSSL_DIR) depend
+	$(MAKE) -C $(OPENSSL_DIR)
+else
 	$(MAKE) -C $(OPENSSL_DIR) -j$(JOBS)
+endif
 	$(MAKE) -C $(OPENSSL_DIR) install_sw
 
 vendor-build-zlib:
