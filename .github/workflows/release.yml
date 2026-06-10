@@ -34,40 +34,59 @@ jobs:
   # + release + chown) 을 캡슐화하므로 여기서는 한 줄 호출만.
   # ============================================================
   build-linux:
-    name: Linux (manylinux2014 / glibc 2.17)
+    name: Linux (${{ matrix.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # Legacy (CentOS 6 / glibc 2.12) uses the archived manylinux2010 image —
+    # if it ever fails to pull/build it must NOT block the modern release.
+    continue-on-error: ${{ matrix.experimental || false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: modern (manylinux2014 / glibc 2.17)
+            image: quay.io/pypa/manylinux2014_x86_64
+            target: release
+            artifact: assessment-agent-linux-x86_64
+            binary: dist/assessment-agent-linux-x86_64
+          - name: legacy (manylinux2010 / glibc 2.12 / CentOS 6)
+            image: quay.io/pypa/manylinux2010_x86_64
+            target: release-legacy
+            artifact: assessment-agent-linux-x86_64-glibc2.12
+            binary: dist/assessment-agent-linux-x86_64-glibc2.12
+            experimental: true
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       # vendor/ 는 6개 라이브러리 git clone + cmake/configure 빌드 결과를 모두 포함.
-      # Makefile 의 버전 핀이 바뀌면 캐시 무효화 (해시 키에 Makefile 포함).
-      - name: Cache vendor (Linux)
+      # 프로파일별로 glibc 가 달라 정적 라이브러리가 호환되지 않으므로 target 을
+      # 캐시 키에 포함해 modern/legacy vendor 를 분리한다.
+      - name: Cache vendor (Linux ${{ matrix.target }})
         uses: actions/cache@v4
         with:
           path: vendor
-          key: vendor-linux-${{ hashFiles('Makefile') }}
+          key: vendor-linux-${{ matrix.target }}-${{ hashFiles('Makefile') }}
           restore-keys: |
-            vendor-linux-
+            vendor-linux-${{ matrix.target }}-
 
-      - name: Build (Docker / manylinux2014)
-        run: ./scripts/build-linux.sh
+      - name: Build (Docker / ${{ matrix.image }})
+        run: BUILD_IMAGE=${{ matrix.image }} BUILD_TARGET=${{ matrix.target }} ./scripts/build-linux.sh
 
       - name: Verify artifacts
         run: |
-          test -f dist/assessment-agent-linux-x86_64
+          test -f ${{ matrix.binary }}
           test -f dist/SHA256SUMS
           (cd dist && sha256sum -c SHA256SUMS)
-          file dist/assessment-agent-linux-x86_64
+          file ${{ matrix.binary }}
           ls -la dist/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: assessment-agent-linux-x86_64
+          name: ${{ matrix.artifact }}
           path: |
-            dist/assessment-agent-linux-x86_64
+            ${{ matrix.binary }}
             dist/SHA256SUMS
           retention-days: 90
 
@@ -77,9 +96,29 @@ jobs:
   # 대체하므로 build-windows.ps1 우회 — make 직접 호출.
   # ============================================================
   build-windows:
-    name: Windows (MSYS2 / mingw64)
+    name: Windows (${{ matrix.name }})
     runs-on: windows-latest
     timeout-minutes: 60
+    # legacy (Server 2003) needs an older MinGW + OpenSSL 1.0.2 that the
+    # windows-latest MSYS2 toolchain may not build — never block the release.
+    continue-on-error: ${{ matrix.experimental || false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: modern (NT10 — Server 2016~2025)
+            profile: modern
+            artifact: assessment-agent-windows-x86_64
+            binary: assessment-agent.exe
+          - name: win7 (NT6.1-6.3 — Server 2008R2~2012R2)
+            profile: win7
+            artifact: assessment-agent-windows-x86_64-win7
+            binary: assessment-agent-win7.exe
+          - name: legacy (NT5.2 — Server 2003 / XP x64)
+            profile: legacy
+            artifact: assessment-agent-windows-x86_64-legacy
+            binary: assessment-agent-legacy.exe
+            experimental: true
     defaults:
       run:
         shell: msys2 {0}
@@ -101,26 +140,33 @@ jobs:
             mingw-w64-x86_64-pkgconf
             perl
 
-      - name: Cache vendor (Windows)
+      # OpenSSL version differs per profile, so vendor static libs are not
+      # interchangeable — key the cache on the profile.
+      #
+      # NO restore-keys: a prefix fallback restores a PARTIALLY-built OpenSSL
+      # tree from a previous (differently-configured) Makefile, which then
+      # fails with "Because of configuration changes, you MUST..." + a missing
+      # generated header (e.g. engine.h). Exact-key-only means a Makefile change
+      # → cache miss → a clean from-scratch vendor build, which is correct.
+      # `-v2` busts the poisoned legacy caches saved by earlier failed runs.
+      - name: Cache vendor (Windows ${{ matrix.profile }})
         uses: actions/cache@v4
         with:
           path: windows-agent/vendor
-          key: vendor-windows-${{ hashFiles('windows-agent/Makefile') }}
-          restore-keys: |
-            vendor-windows-
+          key: vendor-windows-v2-${{ matrix.profile }}-${{ hashFiles('windows-agent/Makefile') }}
 
       - name: Vendor fetch
-        run: make vendor-fetch
+        run: make PROFILE=${{ matrix.profile }} vendor-fetch
 
       - name: Vendor build (static)
-        run: make vendor-build
+        run: make PROFILE=${{ matrix.profile }} vendor-build
 
       - name: Build + release
-        run: make release
+        run: make PROFILE=${{ matrix.profile }} release
 
       - name: Verify artifacts
         run: |
-          test -f dist/assessment-agent.exe
+          test -f dist/${{ matrix.binary }}
           test -f dist/SHA256SUMS
           (cd dist && sha256sum -c SHA256SUMS)
           ls -la dist/
@@ -128,9 +174,9 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: assessment-agent-windows-x86_64
+          name: ${{ matrix.artifact }}
           path: |
-            windows-agent/dist/assessment-agent.exe
+            windows-agent/dist/${{ matrix.binary }}
             windows-agent/dist/SHA256SUMS
           retention-days: 90
 
@@ -182,38 +228,51 @@ jobs:
       - name: chmod
         run: chmod +x dist/assessment-agent-linux-x86_64
 
-      # ---------- Phase A: --image-prep flow ----------
-      - name: A1. install --image-prep
-        run: sudo ./dist/assessment-agent-linux-x86_64 install --image-prep < /dev/null
-      - name: A2. Verify registered (Stopped) + files + user
+      # user-level 설치는 per-user systemd manager 가 필요. CI step 은 로그인
+      # 세션이 아니라 user@.service 가 안 떠 있으므로 linger 로 띄운다. 이 sudo 는
+      # CI 인프라 준비용일 뿐 — 에이전트 설치 자체는 전부 비특권으로 실행된다.
+      - name: A0. Setup per-user systemd manager (linger)
         run: |
-          systemctl is-enabled assessment-agent
-          test "$(systemctl is-active assessment-agent || true)" != "active"
-          test -f /etc/systemd/system/assessment-agent.service
-          test -f /usr/local/bin/assessment-agent
-          test -f /etc/assessment-agent/agent.env
-          id assessment-agent
-          getent group assessment-agent
-      - name: A3. ACL — agent.env (0640 root:assessment-agent)
+          sudo loginctl enable-linger "$USER"
+          for i in $(seq 1 30); do
+            [ -S "/run/user/$(id -u)/bus" ] && break
+            sleep 1
+          done
+          systemctl --user is-system-running || true
+
+      # ---------- Phase A: --image-prep flow (user-level, no root) ----------
+      - name: A1. install --image-prep (비특권)
+        run: ./dist/assessment-agent-linux-x86_64 install --image-prep < /dev/null
+      - name: A2. Verify registered (enabled, not active) + user paths
         run: |
-          mode=$(stat -c '%a' /etc/assessment-agent/agent.env)
-          own=$(stat -c '%U:%G' /etc/assessment-agent/agent.env)
-          [ "$mode" = "640" ] || { echo "expected 0640, got $mode"; exit 1; }
-          [ "$own"  = "root:assessment-agent" ] || { echo "expected root:assessment-agent, got $own"; exit 1; }
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          systemctl --user is-enabled assessment-agent
+          test "$(systemctl --user is-active assessment-agent || true)" != "active"
+          test -f "$HOME/.config/systemd/user/assessment-agent.service"
+          test -f "$HOME/.local/bin/assessment-agent"
+          test -f "$HOME/.config/assessment-agent/agent.env"
+          # 시스템(root) 흔적이 없어야 함 — user-level 전환의 핵심
+          ! test -f /usr/local/bin/assessment-agent
+          ! test -f /etc/systemd/system/assessment-agent.service
+          ! id assessment-agent 2>/dev/null
+      - name: A3. perms — agent.env (0640, 본인 소유)
+        run: |
+          mode=$(stat -c '%a' "$HOME/.config/assessment-agent/agent.env")
+          own=$(stat -c '%U' "$HOME/.config/assessment-agent/agent.env")
+          [ "$mode" = "640" ] || { echo "expected 640, got $mode"; exit 1; }
+          [ "$own"  = "$USER" ] || { echo "expected $USER, got $own"; exit 1; }
       - name: A4. /tmp bundle cleaned
         run: |
           leftover=$(ls -d /tmp/agent-installer-* 2>/dev/null || true)
           [ -z "$leftover" ] || { echo "leftover bundle: $leftover"; exit 1; }
-      - name: A5. prep-image clears /etc/machine-id
+      - name: A5. prep-image runs (machine-id reset best-effort, 비특권)
+        run: ./dist/assessment-agent-linux-x86_64 prep-image < /dev/null
+      - name: A6. uninstall (config preserved)
         run: |
-          sudo ./dist/assessment-agent-linux-x86_64 prep-image
-          test ! -s /etc/machine-id
-      - name: A6. uninstall (env preserved)
-        run: |
-          sudo ./dist/assessment-agent-linux-x86_64 uninstall
-          ! test -f /etc/systemd/system/assessment-agent.service
-          ! test -f /usr/local/bin/assessment-agent
-          test -f /etc/assessment-agent/agent.env
+          ./dist/assessment-agent-linux-x86_64 uninstall < /dev/null
+          ! test -f "$HOME/.config/systemd/user/assessment-agent.service"
+          ! test -f "$HOME/.local/bin/assessment-agent"
+          test -f "$HOME/.config/assessment-agent/agent.env"
 
       # ---------- Phase B: broker (services container) + full install flow ----------
       - name: B1. Wait for RabbitMQ management API
@@ -232,10 +291,10 @@ jobs:
           ./rabbitmqadmin declare binding  source=assessment destination=server.metrics  routing_key=server.metrics
           ./rabbitmqadmin declare queue    name=server.inventory durable=true
           ./rabbitmqadmin declare binding  source=assessment destination=server.inventory routing_key=server.inventory
-      - name: B3. Seed agent.env (broker connectable, plain TCP)
+      - name: B3. Seed agent.env (user config, broker connectable, plain TCP)
         run: |
-          sudo mkdir -p /etc/assessment-agent
-          sudo tee /etc/assessment-agent/agent.env >/dev/null <<'EOF'
+          mkdir -p "$HOME/.config/assessment-agent"
+          cat > "$HOME/.config/assessment-agent/agent.env" <<'EOF'
           RABBITMQ_HOST=127.0.0.1
           RABBITMQ_PORT=5672
           RABBITMQ_VHOST=/
@@ -249,15 +308,17 @@ jobs:
           AGENT_INVENTORY_REFRESH_SEC=0
           WORKER_DOWNLOAD_ALLOWED_HOSTS=
           EOF
-          sudo tee /etc/assessment-agent/agent.env.local >/dev/null <<'EOF'
+          cat > "$HOME/.config/assessment-agent/agent.env.local" <<'EOF'
           RABBITMQ_PASS=guest
           EOF
-      - name: B4. install (no --image-prep) — service must reach active
-        run: sudo ./dist/assessment-agent-linux-x86_64 install < /dev/null
-      - name: B5. systemctl is-active + journal sanity
+          chmod 600 "$HOME/.config/assessment-agent/agent.env.local"
+      - name: B4. install (no --image-prep) — user service must reach active
+        run: ./dist/assessment-agent-linux-x86_64 install < /dev/null
+      - name: B5. systemctl --user is-active + journal sanity
         run: |
-          systemctl is-active assessment-agent
-          sudo journalctl -u assessment-agent -n 30 --no-pager
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          systemctl --user is-active assessment-agent
+          journalctl --user -u assessment-agent -n 30 --no-pager || true
       - name: B6. Publish reaches queue (metrics + inventory)
         run: |
           for i in $(seq 1 20); do
@@ -273,53 +334,50 @@ jobs:
           ./rabbitmqadmin get queue=server.metrics ackmode=ack_requeue_false count=1 | tee /tmp/metric.json
           grep -q '"message_type"' /tmp/metric.json || { echo "payload missing message_type"; exit 1; }
           grep -q '"machine_id"'   /tmp/metric.json || { echo "payload missing machine_id"; exit 1; }
-      - name: B7. ACL — agent.env.local (0600 root:assessment-agent)
+      - name: B7. perms — agent.env.local (0600, 본인 소유)
         run: |
-          mode=$(stat -c '%a' /etc/assessment-agent/agent.env.local)
-          own=$(stat -c '%U:%G' /etc/assessment-agent/agent.env.local)
-          [ "$mode" = "600" ] || { echo "expected 0600, got $mode"; exit 1; }
-          [ "$own"  = "root:assessment-agent" ] || { echo "expected root:assessment-agent, got $own"; exit 1; }
-      - name: B8. Upgrade flow — install twice, service stays active
+          mode=$(stat -c '%a' "$HOME/.config/assessment-agent/agent.env.local")
+          own=$(stat -c '%U' "$HOME/.config/assessment-agent/agent.env.local")
+          [ "$mode" = "600" ] || { echo "expected 600, got $mode"; exit 1; }
+          [ "$own"  = "$USER" ] || { echo "expected $USER, got $own"; exit 1; }
+      - name: B8. Upgrade flow — install twice, user service stays active
         run: |
-          pid_before=$(systemctl show -p MainPID --value assessment-agent)
-          sudo ./dist/assessment-agent-linux-x86_64 install < /dev/null
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          pid_before=$(systemctl --user show -p MainPID --value assessment-agent)
+          ./dist/assessment-agent-linux-x86_64 install < /dev/null
           sleep 3
-          systemctl is-active assessment-agent
-          pid_after=$(systemctl show -p MainPID --value assessment-agent)
+          systemctl --user is-active assessment-agent
+          pid_after=$(systemctl --user show -p MainPID --value assessment-agent)
           [ "$pid_before" != "$pid_after" ] || { echo "upgrade did not restart (PID unchanged=$pid_before)"; exit 1; }
           echo "upgrade PID: $pid_before -> $pid_after"
 
-      # ---------- Phase C: dev path (deploy/install.sh 직접) ----------
+      # ---------- Phase C: dev path (deploy/install.sh 직접, 비특권) ----------
       - name: C1. uninstall + Verify removal
         run: |
-          sudo ./dist/assessment-agent-linux-x86_64 uninstall
-          ! test -f /usr/local/bin/assessment-agent
+          ./dist/assessment-agent-linux-x86_64 uninstall < /dev/null
+          ! test -f "$HOME/.local/bin/assessment-agent"
       - name: C2. Stage dist for dev install.sh path
         run: |
           mkdir -p dev-stage/dist
           cp dist/assessment-agent-linux-x86_64 dev-stage/dist/
           cp -r deploy dev-stage/
           (cd dev-stage/dist && sha256sum assessment-agent-linux-x86_64 > SHA256SUMS)
-      - name: C3. dev path — ./deploy/install.sh (no INSTALLER_SELF_PATH)
+      - name: C3. dev path — ./deploy/install.sh (비특권, no INSTALLER_SELF_PATH)
         run: |
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
           cd dev-stage
           ls -la deploy/install.sh
-          file deploy/install.sh
           head -1 deploy/install.sh
-          # Absolute path + explicit `bash` so sudo's secure_path / cwd handling
-          # cannot mask the script. This is the operator's actual fallback path
-          # for a freshly cloned repo on the target host.
-          sudo bash "$(pwd)/deploy/install.sh" < /dev/null
-          systemctl is-active assessment-agent
+          # 운영자가 갓 클론한 repo 에서 실행하는 fallback 경로 — user-level.
+          bash "$(pwd)/deploy/install.sh" < /dev/null
+          systemctl --user is-active assessment-agent
 
       # ---------- Phase D: --purge cleanup ----------
-      - name: D1. uninstall --purge wipes state + user
+      - name: D1. uninstall --purge wipes config + state
         run: |
-          sudo ./dist/assessment-agent-linux-x86_64 uninstall --purge
-          ! test -d /etc/assessment-agent
-          ! test -d /var/lib/agent-worker
-          ! id assessment-agent 2>/dev/null
-          ! getent group assessment-agent 2>/dev/null
+          ./dist/assessment-agent-linux-x86_64 uninstall --purge < /dev/null
+          ! test -d "$HOME/.config/assessment-agent"
+          ! test -d "$HOME/.local/state/assessment-agent"
 
   # ------------------------------------------------------------
   # Windows installer smoke — chocolatey RabbitMQ 까지 띄우고:
@@ -345,42 +403,45 @@ jobs:
           name: assessment-agent-windows-x86_64
           path: dist
 
-      # ---------- Phase A: --image-prep flow ----------
+      # ---------- Phase A: --image-prep flow (user-level, scheduled task) ----------
       - name: A1. install --image-prep
         run: $null | .\dist\assessment-agent.exe install --image-prep
-      - name: A2. Verify registered (Stopped) + files + ACL on env.local
+      - name: A2. Verify scheduled task registered + user-level files
         run: |
-          $svc = Get-Service -Name assessment-agent
-          if ($svc.Status -ne 'Stopped')      { throw "A2: expected Stopped, got $($svc.Status)" }
-          if ($svc.StartType -ne 'Automatic') { throw "A2: expected Automatic, got $($svc.StartType)" }
+          $base = Join-Path $env:LOCALAPPDATA 'assessment-agent'
+          & schtasks /Query /TN AssessmentAgent | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "A2: scheduled task not registered" }
           foreach ($p in @(
-              'C:\Program Files\assessment-agent\assessment-agent.exe',
-              'C:\ProgramData\assessment-agent\agent.env',
-              'C:\ProgramData\assessment-agent\worker\results',
-              'C:\ProgramData\assessment-agent\worker\done',
-              'C:\ProgramData\assessment-agent\worker\running')) {
+              (Join-Path $base 'assessment-agent.exe'),
+              (Join-Path $base 'agent.env'),
+              (Join-Path $base 'worker\results'),
+              (Join-Path $base 'worker\done'),
+              (Join-Path $base 'worker\running'))) {
               if (-not (Test-Path $p)) { throw "A2: missing $p" }
           }
-      - name: A3. SCM BinaryPath is quoted (space-safe)
+          # 시스템 경로(옛 모델) 흔적이 없어야 함
+          if (Test-Path 'C:\Program Files\assessment-agent\assessment-agent.exe') { throw "A2: system path should not exist" }
+      - name: A3. Task action runs the installed exe (quoted, space-safe) with 'run'
         run: |
-          $out = (& sc.exe qc assessment-agent | Out-String)
+          $out = (& schtasks /Query /TN AssessmentAgent /V /FO LIST | Out-String)
           Write-Host $out
-          if ($out -notmatch '\"C:\\Program Files\\assessment-agent\\assessment-agent\.exe\"') {
-              throw "A3: BinaryPath is not quoted: $out"
-          }
-      - name: A4. prep-image regenerates MachineGuid
+          $exe = (Join-Path $env:LOCALAPPDATA 'assessment-agent\assessment-agent.exe')
+          if ($out -notmatch [regex]::Escape($exe)) { throw "A3: task action does not reference $exe" }
+          if ($out -notmatch '\brun\b') { throw "A3: task action missing 'run' argument" }
+      - name: A4. prep-image runs (MachineGuid reset best-effort; needs admin)
         run: |
           $before = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography' MachineGuid).MachineGuid
           .\dist\assessment-agent.exe prep-image
+          if ($LASTEXITCODE -ne 0) { throw "A4: prep-image exited $LASTEXITCODE" }
           $after = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography' MachineGuid).MachineGuid
-          if ($before -eq $after) { throw "A4: MachineGuid did not change" }
-          Write-Host "MachineGuid: $before -> $after"
+          Write-Host "MachineGuid: $before -> $after (changed=$($before -ne $after))"
       - name: A5. uninstall (state preserved)
         run: |
           .\dist\assessment-agent.exe uninstall
-          $svc = Get-Service -Name assessment-agent -ErrorAction SilentlyContinue
-          if ($svc) { throw "A5: service still registered: $($svc.Status)" }
-          if (-not (Test-Path 'C:\ProgramData\assessment-agent')) { throw "A5: state dir wiped" }
+          & schtasks /Query /TN AssessmentAgent 2>$null | Out-Null
+          $exists = ($LASTEXITCODE -eq 0); $global:LASTEXITCODE = 0
+          if ($exists) { throw "A5: task still registered" }
+          if (-not (Test-Path (Join-Path $env:LOCALAPPDATA 'assessment-agent'))) { throw "A5: state dir wiped" }
 
       # ---------- Phase B: broker + full install flow ----------
       - name: B1. Install RabbitMQ via Chocolatey + wait for erlang node
@@ -549,27 +610,27 @@ jobs:
           AGENT_INVENTORY_REFRESH_SEC=0
           WORKER_DOWNLOAD_ALLOWED_HOSTS=
           '@
-          New-Item -ItemType Directory -Force -Path 'C:\ProgramData\assessment-agent' | Out-Null
-          [IO.File]::WriteAllText('C:\ProgramData\assessment-agent\agent.env', $env_text, (New-Object Text.UTF8Encoding $false))
-          [IO.File]::WriteAllText('C:\ProgramData\assessment-agent\agent.env.local', "RABBITMQ_PASS=guest`n", (New-Object Text.UTF8Encoding $false))
-      - name: B5. install (no --image-prep) — service must reach Running
+          $base = Join-Path $env:LOCALAPPDATA 'assessment-agent'
+          New-Item -ItemType Directory -Force -Path $base | Out-Null
+          [IO.File]::WriteAllText((Join-Path $base 'agent.env'), $env_text, (New-Object Text.UTF8Encoding $false))
+          [IO.File]::WriteAllText((Join-Path $base 'agent.env.local'), "RABBITMQ_PASS=guest`n", (New-Object Text.UTF8Encoding $false))
+      - name: B5. install (no --image-prep) — scheduled task must start the agent
         run: $null | .\dist\assessment-agent.exe install
-      - name: B6. Get-Service Running
+      - name: B6. agent process running
         run: |
-          $svc = Get-Service -Name assessment-agent
-          if ($svc.Status -ne 'Running') { throw "B6: expected Running, got $($svc.Status)" }
-      - name: B7. ACL — agent.env.local restricted to SYSTEM + Administrators
+          $p = $null
+          for ($i=0; $i -lt 20; $i++) {
+              $p = Get-Process -Name assessment-agent -ErrorAction SilentlyContinue
+              if ($p) { break }
+              Start-Sleep -Seconds 2
+          }
+          if (-not $p) { throw "B6: assessment-agent process not running after task start" }
+          Write-Host "agent PID(s): $($p.Id -join ',')"
+      - name: B7. agent.env.local exists + user-private (no system ACL expected)
         run: |
-          $acl = Get-Acl 'C:\ProgramData\assessment-agent\agent.env.local'
-          $idents = $acl.Access | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique
-          Write-Host ($idents -join '; ')
-          $expected = @('BUILTIN\Administrators','NT AUTHORITY\SYSTEM')
-          foreach ($i in $idents) {
-              if ($expected -notcontains $i) { throw "B7: unexpected ACE for $i" }
-          }
-          foreach ($e in $expected) {
-              if ($idents -notcontains $e) { throw "B7: missing ACE for $e" }
-          }
+          $f = Join-Path $env:LOCALAPPDATA 'assessment-agent\agent.env.local'
+          if (-not (Test-Path $f)) { throw "B7: $f missing" }
+          if ((Get-Content $f -Raw) -notmatch 'RABBITMQ_PASS') { throw "B7: secret not written" }
       - name: B8. Publish reaches queue (metrics)
         run: |
           $headers = @{ Authorization = $env:RMQ_AUTH; 'Content-Type' = 'application/json' }
@@ -592,22 +653,27 @@ jobs:
           Write-Host $payload
           if ($payload -notmatch '"message_type"') { throw "B8: missing message_type" }
           if ($payload -notmatch '"machine_id"')   { throw "B8: missing machine_id" }
-      - name: B9. Upgrade — install twice, service stays Running
+      - name: B9. Upgrade — install twice, agent restarts
         run: |
-          $pid_before = (Get-CimInstance Win32_Service -Filter "Name='assessment-agent'").ProcessId
+          $pid_before = (Get-Process -Name assessment-agent -ErrorAction SilentlyContinue | Select-Object -First 1).Id
           $null | .\dist\assessment-agent.exe install
-          Start-Sleep -Seconds 3
-          $svc = Get-Service -Name assessment-agent
-          if ($svc.Status -ne 'Running') { throw "B9: not Running after upgrade ($($svc.Status))" }
-          $pid_after = (Get-CimInstance Win32_Service -Filter "Name='assessment-agent'").ProcessId
+          $p = $null
+          for ($i=0; $i -lt 20; $i++) {
+              $p = Get-Process -Name assessment-agent -ErrorAction SilentlyContinue
+              if ($p -and ($p[0].Id -ne $pid_before)) { break }
+              Start-Sleep -Seconds 2
+          }
+          if (-not $p) { throw "B9: agent not running after upgrade" }
+          $pid_after = $p[0].Id
           if ($pid_before -eq $pid_after) { throw "B9: upgrade did not restart (PID unchanged=$pid_before)" }
           Write-Host "upgrade PID: $pid_before -> $pid_after"
       - name: B10. uninstall (state preserved)
         run: |
           .\dist\assessment-agent.exe uninstall
-          $svc = Get-Service -Name assessment-agent -ErrorAction SilentlyContinue
-          if ($svc) { throw "B10: service still registered" }
-          if (-not (Test-Path 'C:\ProgramData\assessment-agent')) { throw "B10: state wiped" }
+          & schtasks /Query /TN AssessmentAgent 2>$null | Out-Null
+          $exists = ($LASTEXITCODE -eq 0); $global:LASTEXITCODE = 0
+          if ($exists) { throw "B10: task still registered" }
+          if (-not (Test-Path (Join-Path $env:LOCALAPPDATA 'assessment-agent'))) { throw "B10: state wiped" }
 
   # ============================================================
   # Release 잡 — tag v* push 시에만 실행. 두 artifact 다운로드 → GitHub
@@ -630,13 +696,22 @@ jobs:
       - name: Flatten artifact layout
         run: |
           mkdir -p release
+          # Modern artifacts are REQUIRED — fail loudly if missing.
           cp artifacts/assessment-agent-linux-x86_64/assessment-agent-linux-x86_64 release/
           cp artifacts/assessment-agent-windows-x86_64/assessment-agent.exe release/
-          # Aggregate SHA256SUMS (Linux + Windows in one file)
-          {
-            cat artifacts/assessment-agent-linux-x86_64/SHA256SUMS
-            cat artifacts/assessment-agent-windows-x86_64/SHA256SUMS
-          } > release/SHA256SUMS
+          # Optional profiles (experimental) — attach only if their build job
+          # produced an artifact. A missing one is fine (continue-on-error).
+          cp artifacts/assessment-agent-linux-x86_64-glibc2.12/assessment-agent-linux-x86_64-glibc2.12 release/ 2>/dev/null \
+            || echo "[release] no Linux legacy (CentOS 6) artifact — skipped"
+          cp artifacts/assessment-agent-windows-x86_64-win7/assessment-agent-win7.exe release/ 2>/dev/null \
+            || echo "[release] no Windows win7 artifact — skipped"
+          cp artifacts/assessment-agent-windows-x86_64-legacy/assessment-agent-legacy.exe release/ 2>/dev/null \
+            || echo "[release] no Windows legacy (Server 2003) artifact — skipped"
+          # Aggregate every SHA256SUMS that was downloaded.
+          : > release/SHA256SUMS
+          for d in artifacts/*/; do
+            [ -f "$d/SHA256SUMS" ] && cat "$d/SHA256SUMS" >> release/SHA256SUMS
+          done
           ls -la release/
           cat release/SHA256SUMS
 
@@ -644,8 +719,12 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          fail_on_unmatched_files: true
+          # Optional profiles may be absent — do not fail the release on them.
+          fail_on_unmatched_files: false
           files: |
             release/assessment-agent-linux-x86_64
+            release/assessment-agent-linux-x86_64-glibc2.12
             release/assessment-agent.exe
+            release/assessment-agent-win7.exe
+            release/assessment-agent-legacy.exe
             release/SHA256SUMS

@@ -78,6 +78,19 @@ getval() {
 }
 
 prompt() {
+	# Non-interactive (high-latency SSH / no copy-paste): a value preset in the
+	# environment wins outright — `RABBITMQ_HOST=broker ./install.sh` needs zero
+	# round-trips.
+	eval "preset=\${$1:-}"
+	if [ -n "$preset" ]; then
+		printf '%s' "$preset"
+		return
+	fi
+	# No TTY (piped install / SSH bare exec): take the default, never block.
+	if [ ! -t 0 ]; then
+		printf '%s' "$2"
+		return
+	fi
 	if [ -n "$2" ]; then
 		printf "%s [%s]: " "$1" "$2" >&2
 	else
@@ -89,9 +102,20 @@ prompt() {
 }
 
 prompt_secret() {
+	# Preset secret in the environment → use it, no prompt.
+	eval "preset=\${$1:-}"
+	if [ -n "$preset" ]; then
+		printf '%s' "$preset"
+		return
+	fi
+	# No TTY and no preset → cannot capture a secret without blocking; leave
+	# empty so the install completes. Operator fills agent.env.local later.
+	if [ ! -t 0 ]; then
+		printf ''
+		return
+	fi
 	printf "%s (입력 시 화면에 표시되지 않습니다): " "$1" >&2
-	# stty -echo on a tty hides input. If stdin is not a tty (CI), the
-	# fallback is plain read — safer than failing the install.
+	# stty -echo on a tty hides input.
 	stty -echo 2>/dev/null || true
 	IFS= read -r ans || ans=""
 	stty echo 2>/dev/null || true
@@ -144,11 +168,14 @@ while IFS= read -r line || [ -n "$line" ]; do
 	fi
 done < "$EXAMPLE"
 
-# install handles atomic ownership + mode
-if id assessment-agent >/dev/null 2>&1; then
+# Atomic install + mode. Ownership: only the root (SysV system) path can/should
+# chown to root:assessment-agent so the service user can read /etc config. The
+# user-level path runs unprivileged — the file is simply owned by the invoking
+# user (no chown, which would fail as non-root anyway).
+if [ "$(id -u)" -eq 0 ] && id assessment-agent >/dev/null 2>&1; then
 	install -o root -g assessment-agent -m 0640 "$TMP" "$TARGET"
 else
-	install -o root -g root -m 0640 "$TMP" "$TARGET"
+	install -m 0640 "$TMP" "$TARGET"
 fi
 printf '[env-setup] wrote %s\n' "$TARGET" >&2
 
@@ -168,10 +195,10 @@ for key in $SECRET_KEYS; do
 	fi
 done
 if [ "$wrote_secrets" = "1" ]; then
-	if id assessment-agent >/dev/null 2>&1; then
+	if [ "$(id -u)" -eq 0 ] && id assessment-agent >/dev/null 2>&1; then
 		install -o root -g assessment-agent -m 0600 "$TMP_LOCAL" "$LOCAL"
 	else
-		install -o root -g root -m 0600 "$TMP_LOCAL" "$LOCAL"
+		install -m 0600 "$TMP_LOCAL" "$LOCAL"
 	fi
 	printf '[env-setup] wrote %s (mode 0600)\n' "$LOCAL" >&2
 fi

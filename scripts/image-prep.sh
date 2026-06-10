@@ -3,62 +3,81 @@
 #
 # Run this on the GOLDEN VM IMAGE before snapshotting / sealing.
 #
-# Without this step, every VM cloned from the image inherits the same
-# /etc/machine-id. The agent uses /etc/machine-id as `machine_id`; cloned
-# VMs all publish under the same identifier and the engine overwrites
-# records on every receive.
+# Identity in this system is keyed on `composite_id` = sha256(machine_id +
+# MAC addresses), and the engine upserts on composite_id (machine_id is
+# display-only). Cloned VMs almost always get fresh MACs, so their
+# composite_id diverges automatically — clone collisions are largely handled
+# without this script. It remains useful belt-and-suspenders for the rare
+# identical-MAC clone (virtual-NIC-only hosts) and general image hygiene.
 #
-# This is the standard cloud-init / Packer "generalize" pattern.
+# USER-LEVEL by design: this runs as the unprivileged agent user. The system
+# hygiene steps below (/etc/machine-id, random-seed, cloud-init cache) require
+# root; each is attempted best-effort and SKIPPED with a note when not
+# writable — never fatal. If you want the full generalize, run the image build
+# as root (image builders normally have root) or use cloud-init's standard
+# image-cleanup.
 
 set -eu
-
-if [ "$(id -u)" -ne 0 ]; then
-	echo "[image-prep] must run as root (try: sudo $0)" >&2
-	exit 1
-fi
 
 printf '\n=== Assessment Agent — image preparation ===\n'
 printf 'Run this once on the GOLDEN TEMPLATE before snapshotting.\n\n'
 
-# --- 1. Stop agent if running (it should be stopped already; defensive).
-if systemctl is-active --quiet assessment-agent.service 2>/dev/null; then
-	echo "[image-prep] stopping assessment-agent.service..."
-	systemctl stop assessment-agent.service
+am_root=0
+[ "$(id -u)" -eq 0 ] && am_root=1
+
+# --- 1. Stop the agent if running (user service; best-effort).
+uid=$(id -u)
+: "${XDG_RUNTIME_DIR:=/run/user/$uid}"
+export XDG_RUNTIME_DIR
+if command -v systemctl >/dev/null 2>&1; then
+	if systemctl --user is-active --quiet assessment-agent.service 2>/dev/null; then
+		echo "[image-prep] stopping user assessment-agent.service..."
+		systemctl --user stop assessment-agent.service || true
+	fi
+	# SysV/root install variant.
+	if [ "$am_root" -eq 1 ] && systemctl is-active --quiet assessment-agent.service 2>/dev/null; then
+		systemctl stop assessment-agent.service || true
+	fi
 fi
 
-# --- 2. Clear /etc/machine-id.
+# --- 2. Clear /etc/machine-id (root only — best-effort).
 #
-# systemd-machine-id-setup runs on every boot and regenerates this file if
-# it is empty (zero bytes — not deleted). The dbus copy under
-# /var/lib/dbus/machine-id is replaced with a symlink to /etc/machine-id so
-# the two stay in sync after regeneration.
-echo "[image-prep] clearing /etc/machine-id (systemd will regenerate on next boot)"
-: > /etc/machine-id
-if [ -e /var/lib/dbus/machine-id ] && [ ! -L /var/lib/dbus/machine-id ]; then
-	rm -f /var/lib/dbus/machine-id
-	ln -s /etc/machine-id /var/lib/dbus/machine-id
+# systemd-machine-id-setup regenerates an empty (zero-byte, not deleted) file
+# on next boot. The dbus copy is symlinked so the two stay in sync.
+if [ "$am_root" -eq 1 ] && [ -w /etc/machine-id ]; then
+	echo "[image-prep] clearing /etc/machine-id (regenerated on next boot)"
+	: > /etc/machine-id
+	if [ -e /var/lib/dbus/machine-id ] && [ ! -L /var/lib/dbus/machine-id ]; then
+		rm -f /var/lib/dbus/machine-id
+		ln -s /etc/machine-id /var/lib/dbus/machine-id
+	fi
+else
+	echo "[image-prep] SKIP /etc/machine-id reset (needs root)."
+	echo "[image-prep]   Not fatal — composite_id diverges via per-clone MACs."
 fi
 
-# --- 3. Clear systemd random seed (regenerated on boot).
-rm -f /var/lib/systemd/random-seed
+# --- 3. Clear systemd random seed (root only — regenerated on boot).
+if [ "$am_root" -eq 1 ] && [ -e /var/lib/systemd/random-seed ]; then
+	rm -f /var/lib/systemd/random-seed
+fi
 
-# --- 4. Clear cloud-init instance cache so each clone fetches its own
-#        metadata on first boot (otherwise instance-id, ssh keys, etc.
-#        are stale).
-if [ -d /var/lib/cloud ]; then
+# --- 4. Clear cloud-init instance cache (root only) so each clone fetches its
+#        own metadata on first boot.
+if [ "$am_root" -eq 1 ] && [ -d /var/lib/cloud ]; then
 	rm -rf /var/lib/cloud/instance \
 	       /var/lib/cloud/instances/* \
 	       /var/lib/cloud/data/* 2>/dev/null || true
 	echo "[image-prep] cleared cloud-init cache"
 fi
 
-# --- 5. We deliberately KEEP /etc/assessment-agent/agent.env.local.
-#
-# agent.env.local holds broker credentials, which are per-tenant, not
-# per-machine. Operators who want per-machine credentials should delete
-# the file manually before this script.
-echo "[image-prep] keeping /etc/assessment-agent/agent.env{,.local} (per-tenant secrets)"
+# --- 5. We deliberately KEEP the agent config (agent.env / agent.env.local).
+#        Broker credentials are per-tenant, not per-machine. Delete manually
+#        before this script if you want per-machine credentials.
+echo "[image-prep] keeping agent.env{,.local} (per-tenant secrets)"
 
 printf '\n[image-prep] done — VM is ready to snapshot.\n'
-printf '[image-prep] reminder: assessment-agent.service should already be enabled\n'
-printf '[image-prep]           (install.sh IMAGE_PREP=1 enables without starting).\n'
+if [ "$am_root" -eq 0 ]; then
+	printf '[image-prep] NOTE: ran unprivileged — system-wide hygiene steps were\n'
+	printf '[image-prep]       skipped. composite_id (MAC-based) still keeps clones\n'
+	printf '[image-prep]       distinct; run as root only if you need a full generalize.\n'
+fi

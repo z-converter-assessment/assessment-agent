@@ -22,9 +22,103 @@ CMAKE   ?= cmake
 WINDRES ?= windres
 JOBS    ?= 4
 
+# ----------------------------------------------------------------------
+# Build profile — three NT generations from one source tree
+# ----------------------------------------------------------------------
+#   PROFILE=modern (default) : NT 10.0 — Server 2016/2019/2022/2025, Win10/11.
+#                              OpenSSL 3.x, _WIN32_WINNT=0x0A00.
+#   PROFILE=win7             : NT 6.1–6.3 — Server 2008R2 / 2012 / 2012R2,
+#                              Win7/8/8.1. OpenSSL 3.x (still supports Win7),
+#                              only the API ceiling drops to 0x0601.
+#   PROFILE=legacy           : NT 5.2 — Server 2003 / XP x64. OpenSSL 1.0.2u
+#                              (last XP-capable LTS), 0x0502, bcrypt dropped
+#                              from the import table.
+#
+#   make PROFILE=win7   vendor-build && make PROFILE=win7   release
+#   make PROFILE=legacy vendor-build && make PROFILE=legacy release
+#   (LEGACY=1 is kept as a backward-compatible alias for PROFILE=legacy.)
+#
+# The C code is identical across profiles: GetTickCount64 / BCryptGenRandom
+# are resolved at runtime (monotonic_ms / compat_rand_bytes), so a lower
+# WINNT_VER never leaves an unresolved import. Knobs that differ:
+#   - WINNT_VER          : API surface to compile against.
+#   - OPENSSL_VERSION    : 3.x dropped XP/2003; legacy pins 1.0.2u. Override
+#     with OPENSSL_VERSION= if a 1.1.1 build proves to handshake (TLS PoC).
+#   - CURL_VERSION       : legacy pins a curl that still builds on 1.0.2.
+#   - BCRYPT_LIB         : empty on legacy — no static -lbcrypt (Server 2003
+#     has no bcrypt.dll; a static import would break load).
+#   - BIN suffix         : all three binaries coexist in dist/.
+# NOTE: the legacy profile needs an OLDER MinGW-w64 toolchain that still
+# targets NT 5.2 (recent MinGW dropped XP/2003 startup support). modern and
+# win7 build fine on the current MSYS2/mingw64 toolchain.
+LEGACY  ?= 0
+ifeq ($(LEGACY),1)
+  PROFILE ?= legacy
+endif
+PROFILE ?= modern
+
+ifeq ($(PROFILE),legacy)
+  WINNT_VER           := 0x0502
+  OPENSSL_VERSION     ?= OpenSSL_1_0_2u
+  # curl 8.x still supports OpenSSL >= 1.0.2a, and unlike the ancient 7.64.1
+  # (whose lib/nonblock.c calls the long-gone `IoctlSocket`, which modern
+  # MinGW winsock no longer declares) it builds clean on the current toolchain.
+  # So share win7/modern's curl pin + the libcurl_static target default.
+  CURL_VERSION        ?= curl-8_10_1
+  # rabbitmq-c >= 0.11 requires OpenSSL 1.1.1+ (CMake hard-fails: "Found
+  # OpenSSL 1.0.2u but 1.1.1 or later is required"). 0.10.0 still builds
+  # against 1.0.2 and keeps the amqp_* API the agent uses.
+  RABBITMQ_C_VERSION  ?= v0.10.0
+  BIN                 := assessment-agent-legacy.exe
+  BCRYPT_LIB          :=
+  # OpenSSL 1.0.2 Configure has no `no-tests` option.
+  # KEEP engine support (no `no-engine`): rabbitmq-c v0.10.0's amqp_openssl.c
+  # includes <openssl/engine.h> and calls ENGINE_cleanup(). With no-engine the
+  # vendored 1.0.2 tree has no engine.h, so the compiler falls back to MSYS2's
+  # system OpenSSL 3.x engine.h → macros.h "OPENSSL_API_COMPAT impossible".
+  #
+  # GCC 14 promotes several legacy-C warnings to hard ERRORS by default, which
+  # 1.0.2u's engine sources (e.g. engines/e_capi.c: CryptDecrypt / d2i_X509
+  # pointer mismatches) trip. Demote them — Configure forwards bare -W args
+  # into CFLAGS.
+  OPENSSL_CONFIG_OPTS := no-shared no-dso \
+      -Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration \
+      -Wno-error=int-conversion -Wno-error=implicit-int
+  # OpenSSL 1.0.2 rand_win.c gathers entropy via GDI (screen) — needs gdi32.
+  EXTRA_SYS_LIBS      := -lgdi32
+  # Propagate the NT 5.2 target into the vendor builds. Without it curl 8.x
+  # compiles its RNG against the toolchain default (NT10) and hard-links
+  # BCryptGenRandom (Vista+), which does not exist on Server 2003. With the
+  # define curl takes the pre-Vista RNG path (no bcrypt dependency).
+  VENDOR_CFLAGS       := -D_WIN32_WINNT=0x0502 -DWINVER=0x0502
+  # NT 5.2 has no api-ms-win-* umbrella DLLs and bcrypt is runtime-loaded.
+  # gdi32 ships on every Windows incl. Server 2003.
+  ALLOWED_DLLS        := kernel32|advapi32|user32|gdi32|ws2_32|iphlpapi|crypt32|secur32|ole32|oleaut32|shell32|msvcrt|ntdll
+else ifeq ($(PROFILE),win7)
+  WINNT_VER           := 0x0601
+  OPENSSL_VERSION     ?= openssl-3.0.15
+  CURL_VERSION        ?= curl-8_10_1
+  BIN                 := assessment-agent-win7.exe
+  BCRYPT_LIB          := -lbcrypt
+  OPENSSL_CONFIG_OPTS := no-shared no-dso no-engine no-tests
+  ALLOWED_DLLS        := kernel32|advapi32|user32|ws2_32|iphlpapi|crypt32|secur32|bcrypt|ole32|oleaut32|shell32|msvcrt|ntdll|api-ms-win-.+
+else
+  WINNT_VER           := 0x0A00
+  OPENSSL_VERSION     ?= openssl-3.0.15
+  CURL_VERSION        ?= curl-8_10_1
+  BIN                 := assessment-agent.exe
+  BCRYPT_LIB          := -lbcrypt
+  OPENSSL_CONFIG_OPTS := no-shared no-dso no-engine no-tests
+  ALLOWED_DLLS        := kernel32|advapi32|user32|ws2_32|iphlpapi|crypt32|secur32|bcrypt|ole32|oleaut32|shell32|msvcrt|ntdll|api-ms-win-.+
+endif
+
+# Profile-specific extras (empty on modern/win7; set in the legacy block).
+EXTRA_SYS_LIBS ?=
+VENDOR_CFLAGS  ?=
+
 CFLAGS  ?= -Wall -Wextra -Wpedantic -O2 -std=c11 \
-           -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -DUNICODE -D_UNICODE \
-           -DCURL_STATICLIB
+           -D_WIN32_WINNT=$(WINNT_VER) -DWINVER=$(WINNT_VER) -DUNICODE -D_UNICODE \
+           -DCURL_STATICLIB -DAMQP_STATIC
 LDFLAGS ?= -static -static-libgcc -Wl,--no-insert-timestamp
 
 AGENT_VERSION ?= 1.0.0
@@ -34,10 +128,10 @@ AGENT_VERSION ?= 1.0.0
 # ----------------------------------------------------------------------
 VENDOR_DIR         := vendor
 CJSON_VERSION      := v1.7.18
-RABBITMQ_C_VERSION := v0.15.0
-CURL_VERSION       := curl-8_10_1
-OPENSSL_VERSION    := openssl-3.0.15
+RABBITMQ_C_VERSION ?= v0.15.0
 ZLIB_VERSION       := v1.3.1
+# CURL_VERSION / OPENSSL_VERSION are set by the build-profile block above
+# (modern vs LEGACY) so they can be pinned per ABI target.
 
 CJSON_DIR          := $(VENDOR_DIR)/cJSON
 RABBITMQ_C_DIR     := $(VENDOR_DIR)/rabbitmq-c
@@ -48,6 +142,9 @@ ZLIB_DIR           := $(VENDOR_DIR)/zlib
 CJSON_LIB          := $(CJSON_DIR)/build/libcjson.a
 RABBITMQ_C_LIB     := $(RABBITMQ_C_DIR)/build/librabbitmq/librabbitmq.a
 CURL_LIB           := $(CURL_DIR)/build/lib/libcurl.a
+# curl >= 7.77 splits the static lib into the `libcurl_static` target; older
+# curl (legacy pins 7.64.1) only exposes `libcurl`. Profile blocks override.
+CURL_STATIC_TARGET ?= libcurl_static
 OPENSSL_SSL        := $(OPENSSL_DIR)/install/lib/libssl.a
 OPENSSL_CRYPTO     := $(OPENSSL_DIR)/install/lib/libcrypto.a
 ZLIB_LIB           := $(ZLIB_DIR)/libz.a
@@ -58,6 +155,8 @@ OPENSSL_CROSS      ?=
 CFLAGS += -I$(CJSON_DIR) \
           -I$(RABBITMQ_C_DIR)/include \
           -I$(RABBITMQ_C_DIR)/build/include \
+          -I$(RABBITMQ_C_DIR)/librabbitmq \
+          -I$(RABBITMQ_C_DIR)/build/librabbitmq \
           -I$(CURL_DIR)/include \
           -I$(OPENSSL_DIR)/install/include \
           -I$(ZLIB_DIR) \
@@ -71,17 +170,19 @@ CFLAGS += -I$(CJSON_DIR) \
 #   advapi32 : Registry, Service Control Manager, ACL (SetNamedSecurityInfoW)
 #   crypt32  : OpenSSL on Windows needs CertOpenSystemStoreW etc.
 #   secur32  : SSPI (used transitively by some Schannel paths)
-#   bcrypt   : BCryptGenRandom (UUID v4 generation)
+#   bcrypt   : BCryptGenRandom (modern profile only — resolved at runtime via
+#              compat_rand_bytes(), so LEGACY drops the static import)
 #   ole32 / oleaut32 : COM init (used by some Windows API surfaces)
 #   shell32  : installer subcommand — SHCreateDirectoryExW, ShellExecuteW
 LDLIBS := $(RABBITMQ_C_LIB) $(CJSON_LIB) $(CURL_LIB) $(OPENSSL_SSL) $(OPENSSL_CRYPTO) $(ZLIB_LIB) \
           -lws2_32 -liphlpapi -ladvapi32 -lkernel32 -luser32 \
-          -lcrypt32 -lsecur32 -lbcrypt -lole32 -loleaut32 -lshell32
+          -lcrypt32 -lsecur32 $(BCRYPT_LIB) -lole32 -loleaut32 -lshell32 $(EXTRA_SYS_LIBS)
 
 SRC := $(wildcard src/*.c)
 OBJ := $(SRC:.c=.o)
 RES := src/resources.res
-BIN := assessment-agent.exe
+# BIN is set by the build-profile block above (assessment-agent.exe vs
+# assessment-agent-legacy.exe) so both ABIs can coexist in dist/.
 
 all: $(BIN)
 
@@ -119,10 +220,25 @@ vendor-build-openssl:
 	# `--libdir=lib` 명시 — OpenSSL 3.x 가 host triplet 에 따라 `lib64` 또는
 	# `lib/<host>` 로 install 하면 Makefile 의 $(OPENSSL_SSL) 고정 경로
 	# (`install/lib/libssl.a`) 와 어긋난다.
-	cd $(OPENSSL_DIR) && ./Configure $(OPENSSL_TARGET) no-shared no-dso no-engine no-tests $(OPENSSL_CROSS) \
+	cd $(OPENSSL_DIR) && ./Configure $(OPENSSL_TARGET) $(OPENSSL_CONFIG_OPTS) $(OPENSSL_CROSS) \
 	    --libdir=lib --prefix=$(CURDIR)/$(OPENSSL_DIR)/install
+ifeq ($(PROFILE),legacy)
+	# OpenSSL 1.0.2u (legacy profile): Configure mandates `make depend` before
+	# building — without it the generated Makefile keeps a stale dependency on
+	# include/openssl/engine.h, which `no-engine` never generates, and the
+	# build dies with "No rule to make target engine.h". 1.0.2's build is also
+	# not reliably parallel-safe, so build serially.
+	$(MAKE) -C $(OPENSSL_DIR) depend
+	$(MAKE) -C $(OPENSSL_DIR)
+	# 1.0.2 install_sw's mkdir is NOT idempotent — it dies with
+	# "Cannot create directory .../install: File exists" (Error 17) when the
+	# prefix dir already exists. Wipe it first so install starts clean.
+	rm -rf $(OPENSSL_DIR)/install
+	$(MAKE) -C $(OPENSSL_DIR) install_sw
+else
 	$(MAKE) -C $(OPENSSL_DIR) -j$(JOBS)
 	$(MAKE) -C $(OPENSSL_DIR) install_sw
+endif
 
 vendor-build-zlib:
 	# zlib win32/Makefile.gcc 가 ARFLAGS=rcs 를 자체 정의함. AR 변수에는
@@ -149,6 +265,10 @@ vendor-build-rabbitmq:
 	      -DENABLE_SSL_SUPPORT=ON \
 	      -DOPENSSL_ROOT_DIR=$(CURDIR)/$(OPENSSL_DIR)/install \
 	      -DOPENSSL_USE_STATIC_LIBS=TRUE \
+	      -DCMAKE_PREFIX_PATH=$(CURDIR)/$(OPENSSL_DIR)/install \
+	      -DOPENSSL_INCLUDE_DIR=$(CURDIR)/$(OPENSSL_DIR)/install/include \
+	      -DOPENSSL_SSL_LIBRARY=$(CURDIR)/$(OPENSSL_DIR)/install/lib/libssl.a \
+	      -DOPENSSL_CRYPTO_LIBRARY=$(CURDIR)/$(OPENSSL_DIR)/install/lib/libcrypto.a \
 	      -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 	$(CMAKE) --build $(RABBITMQ_C_DIR)/build --target rabbitmq-static -- -j$(JOBS)
 	# Windows mingw cmake 가 정적 라이브러리에 `lib` prefix 를 자동 추가하면서
@@ -165,9 +285,11 @@ vendor-build-curl:
 	# 위해 모든 선택적 의존을 명시적으로 OFF.
 	$(CMAKE) -S $(CURL_DIR) -B $(CURL_DIR)/build \
 	      -DCMAKE_C_COMPILER=$(CC) \
+	      -DCMAKE_C_FLAGS="$(VENDOR_CFLAGS)" \
 	      -DBUILD_SHARED_LIBS=OFF -DCURL_STATICLIB=ON \
 	      -DBUILD_CURL_EXE=OFF -DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF \
-	      -DCURL_USE_OPENSSL=ON -DCURL_DISABLE_LDAP=ON -DCURL_DISABLE_FTP=ON \
+	      -DCURL_USE_OPENSSL=ON -DCMAKE_USE_OPENSSL=ON \
+	      -DCURL_DISABLE_LDAP=ON -DCURL_DISABLE_FTP=ON \
 	      -DCURL_DISABLE_FILE=ON -DCURL_DISABLE_DICT=ON -DCURL_DISABLE_TELNET=ON \
 	      -DCURL_DISABLE_TFTP=ON -DCURL_DISABLE_RTSP=ON -DCURL_DISABLE_POP3=ON \
 	      -DCURL_DISABLE_IMAP=ON -DCURL_DISABLE_SMTP=ON -DCURL_DISABLE_GOPHER=ON \
@@ -190,7 +312,7 @@ vendor-build-curl:
 	      -DZLIB_INCLUDE_DIR=$(CURDIR)/$(ZLIB_DIR) \
 	      -DZLIB_LIBRARY=$(CURDIR)/$(ZLIB_LIB) \
 	      -DCMAKE_POLICY_VERSION_MINIMUM=3.5
-	$(CMAKE) --build $(CURL_DIR)/build --target libcurl_static -- -j$(JOBS)
+	$(CMAKE) --build $(CURL_DIR)/build --target $(CURL_STATIC_TARGET) -- -j$(JOBS)
 	# Windows mingw cmake 출력 이름은 `libcurl.a` 가 아닐 수 있어 — `libcurl_static`
 	# target 의 실제 파일을 $(CURL_LIB) 경로(`build/lib/libcurl.a`) 로 별칭.
 	@if [ ! -f $(CURL_DIR)/build/lib/libcurl.a ]; then \
@@ -211,11 +333,12 @@ verify: $(BIN)
 	@echo "[verify] checking DLL dependencies of $(BIN)..."
 	@objdump -p $(BIN) | awk '/DLL Name:/ {print tolower($$3)}' | sort -u > build-deps.txt
 	@cat build-deps.txt
-	@if grep -vE '^(kernel32|advapi32|user32|ws2_32|iphlpapi|crypt32|secur32|bcrypt|ole32|oleaut32|shell32|msvcrt|ntdll|api-ms-win-.+)\.dll$$' build-deps.txt; then \
+	@if grep -vE '^($(ALLOWED_DLLS))\.dll$$' build-deps.txt; then \
 		echo "[verify] FAIL: non-system DLL dependency listed above"; \
+		echo "[verify]   (profile: LEGACY=$(LEGACY), allowed: $(ALLOWED_DLLS))"; \
 		exit 1; \
 	fi
-	@echo "[verify] OK: only Windows system DLLs referenced"
+	@echo "[verify] OK: only Windows system DLLs referenced (LEGACY=$(LEGACY))"
 
 # ----------------------------------------------------------------------
 # Release packaging — dist/assessment-agent.exe + SHA256SUMS

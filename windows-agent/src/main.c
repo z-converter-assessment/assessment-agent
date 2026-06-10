@@ -37,6 +37,31 @@
 #endif
 
 /* ============================================================
+ *  User-level path defaults (no admin / no system dirs)
+ *
+ *  When WORKER_STATE_DIR / WORKER_TMP_DIR are not set in the env file, the
+ *  agent falls back to per-user locations under %LOCALAPPDATA% / %TEMP% so a
+ *  user-level install never needs to write Program Files / ProgramData /
+ *  C:\Windows\Temp.
+ * ============================================================ */
+static const char *user_worker_state_default(void)
+{
+	static char buf[MAX_PATH];
+	if (buf[0]) return buf;
+	if (agent_data_path_a("worker", buf, sizeof buf) != 0)
+		buf[0] = '\0';
+	return buf[0] ? buf : "C:\\Users\\Public\\assessment-agent\\worker";
+}
+
+static const char *user_tmp_default(void)
+{
+	const char *t = getenv("TEMP");
+	if (t && *t) return t;
+	t = getenv("TMP");
+	return (t && *t) ? t : "C:\\Windows\\Temp";
+}
+
+/* ============================================================
  *  publish_config_t builder (env-driven)
  * ============================================================ */
 static publish_config_t make_publish_config(void)
@@ -98,9 +123,8 @@ static worker_config_t make_worker_config(const publish_config_t *pcfg,
 	wcfg.result_routing_key = getenv_default("WORKER_TASK_RESULT_KEY", "task.result");
 	wcfg.machine_id         = machine_id;
 	wcfg.agent_version      = AGENT_VERSION;
-	wcfg.state_dir          = getenv_default("WORKER_STATE_DIR",
-	                                         "C:\\ProgramData\\assessment-agent\\worker");
-	wcfg.tmp_dir            = getenv_default("WORKER_TMP_DIR", "C:\\Windows\\Temp");
+	wcfg.state_dir          = getenv_default("WORKER_STATE_DIR", user_worker_state_default());
+	wcfg.tmp_dir            = getenv_default("WORKER_TMP_DIR",   user_tmp_default());
 	wcfg.allowed_hosts_csv  = getenv_default("WORKER_DOWNLOAD_ALLOWED_HOSTS", "");
 	wcfg.done_retention_sec = getenv_int_or ("WORKER_DONE_RETENTION_SEC", 604800);
 	wcfg.disk_reserve_mb    = getenv_int_or ("WORKER_DISK_RESERVE_MB",    50);
@@ -220,10 +244,16 @@ int agent_run(void)
 	WSADATA wsa;
 	WSAStartup(MAKEWORD(2, 2), &wsa);
 
-	/* Try local .env first (dev), then production paths. */
+	/* Try local .env first (dev), then the per-user install paths under
+	 * %LOCALAPPDATA%\assessment-agent (user-level install — no admin). */
 	load_env_file(".env");
-	load_env_file("C:\\ProgramData\\assessment-agent\\agent.env");
-	load_env_file("C:\\ProgramData\\assessment-agent\\agent.env.local");
+	{
+		char p[MAX_PATH];
+		if (agent_data_path_a("agent.env", p, sizeof p) == 0)
+			load_env_file(p);
+		if (agent_data_path_a("agent.env.local", p, sizeof p) == 0)
+			load_env_file(p);
+	}
 
 	srand((unsigned int)(time(NULL) ^ GetCurrentProcessId()));
 
@@ -344,7 +374,7 @@ int agent_run(void)
 		fprintf(stderr, "[agent] draining worker (grace=%ds, term=%ds, publish-stuck=%ds)\n",
 		        grace_sec, term_sec, publish_sec);
 
-		ULONGLONG t0 = GetTickCount64();
+		ULONGLONG t0 = monotonic_ms();
 		ULONGLONG reap_done_at = 0;
 		int term_sent = 0;
 		int kill_sent = 0;
@@ -354,7 +384,7 @@ int agent_run(void)
 			/* SCM 에 "아직 stopping 중" 알림 — dwCheckPoint 증분 + wait_hint 2.5s 갱신.
 			 * 호출 안 하면 service_ctrl_handler 의 30s wait_hint 만료 후 SCM stuck 판정. */
 			service_stop_pending_update(2500);
-			long elapsed = (long)((GetTickCount64() - t0) / 1000ULL);
+			long elapsed = (long)((monotonic_ms() - t0) / 1000ULL);
 
 			if (!term_sent && elapsed >= grace_sec) {
 				fprintf(stderr, "[agent] drain phase 2: soft term\n");
@@ -368,9 +398,9 @@ int agent_run(void)
 
 			/* Phase 4: child reap 후 result publish stuck deadline. */
 			if (reap_done_at == 0 && !worker_has_live_child(worker))
-				reap_done_at = GetTickCount64();
+				reap_done_at = monotonic_ms();
 			if (reap_done_at != 0 &&
-			    (long)((GetTickCount64() - reap_done_at) / 1000ULL) >= publish_sec) {
+			    (long)((monotonic_ms() - reap_done_at) / 1000ULL) >= publish_sec) {
 				fprintf(stderr, "[agent] drain: result publish stuck for %ds - giving up; "
 				                "result file will replay on next startup\n", publish_sec);
 				break;
@@ -404,12 +434,16 @@ static void print_usage(void)
 	fprintf(stderr,
 	    "assessment-agent.exe — Resource assessment collector\n"
 	    "\n"
+	    "User-level install (no 24/7 admin; one-time admin only to register the\n"
+	    "boot-time scheduled task). Files live under %%LOCALAPPDATA%%\\assessment-agent.\n"
+	    "\n"
 	    "Subcommands:\n"
-	    "  install [--image-prep]    register service (start unless --image-prep)\n"
-	    "  uninstall                 stop and delete service\n"
+	    "  install [--image-prep]    install + register a per-user scheduled task\n"
+	    "                            (start unless --image-prep)\n"
+	    "  uninstall                 stop + remove the scheduled task\n"
 	    "  prep-image [--sysprep]    regenerate MachineGuid for image cloning\n"
-	    "  --console, -c             foreground run for debugging\n"
-	    "  (no args)                 SCM service-mode entry (used by Windows itself)\n");
+	    "                            (best-effort; needs admin, never fatal)\n"
+	    "  --console, -c, run        foreground run (used by the scheduled task)\n");
 }
 
 int main(int argc, char **argv)
@@ -428,7 +462,8 @@ int main(int argc, char **argv)
 			return installer_run_uninstall();
 		if (strcmp(cmd, "prep-image") == 0)
 			return installer_run_prep_image(flag);
-		if (strcmp(cmd, "--console") == 0 || strcmp(cmd, "-c") == 0)
+		if (strcmp(cmd, "--console") == 0 || strcmp(cmd, "-c") == 0 ||
+		    strcmp(cmd, "run") == 0)
 			return run_as_console();
 		if (strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0) {
 			print_usage();
