@@ -32,6 +32,7 @@
 #include "util.h"
 #include "cJSON.h"
 #include <openssl/evp.h>
+#include "openssl_compat.h"   /* EVP_MD_CTX_new/_free on OpenSSL 1.0.2 (legacy) */
 #include <curl/curl.h>
 
 #include <ctype.h>
@@ -69,12 +70,6 @@
 #define AGENT_NT6 1
 #else
 #define AGENT_NT6 0
-#endif
-
-#if OPENSSL_VERSION_NUMBER < 0x10100000L
-/* OpenSSL < 1.1.0 (legacy 1.0.2u): the *_new/_free names did not exist yet. */
-#define EVP_MD_CTX_new   EVP_MD_CTX_create
-#define EVP_MD_CTX_free  EVP_MD_CTX_destroy
 #endif
 
 #if !AGENT_NT6
