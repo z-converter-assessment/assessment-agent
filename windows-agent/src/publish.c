@@ -57,11 +57,11 @@ static int wait_confirm(amqp_connection_state_t conn)
 	int t = getenv_int_or("RABBITMQ_CONFIRM_TIMEOUT_SEC", 5);
 	long limit_ms = (long)(t > 0 ? t : 5) * 1000;
 
-	ULONGLONG start_ms = GetTickCount64();
+	ULONGLONG start_ms = monotonic_ms();
 
 	amqp_frame_t frame;
 	for (;;) {
-		ULONGLONG now_ms = GetTickCount64();
+		ULONGLONG now_ms = monotonic_ms();
 		long elapsed_ms = (long)(now_ms - start_ms);
 		long remain_ms = limit_ms - elapsed_ms;
 		if (remain_ms <= 0) {

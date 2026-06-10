@@ -22,8 +22,71 @@ CMAKE   ?= cmake
 WINDRES ?= windres
 JOBS    ?= 4
 
+# ----------------------------------------------------------------------
+# Build profile — three NT generations from one source tree
+# ----------------------------------------------------------------------
+#   PROFILE=modern (default) : NT 10.0 — Server 2016/2019/2022/2025, Win10/11.
+#                              OpenSSL 3.x, _WIN32_WINNT=0x0A00.
+#   PROFILE=win7             : NT 6.1–6.3 — Server 2008R2 / 2012 / 2012R2,
+#                              Win7/8/8.1. OpenSSL 3.x (still supports Win7),
+#                              only the API ceiling drops to 0x0601.
+#   PROFILE=legacy           : NT 5.2 — Server 2003 / XP x64. OpenSSL 1.0.2u
+#                              (last XP-capable LTS), 0x0502, bcrypt dropped
+#                              from the import table.
+#
+#   make PROFILE=win7   vendor-build && make PROFILE=win7   release
+#   make PROFILE=legacy vendor-build && make PROFILE=legacy release
+#   (LEGACY=1 is kept as a backward-compatible alias for PROFILE=legacy.)
+#
+# The C code is identical across profiles: GetTickCount64 / BCryptGenRandom
+# are resolved at runtime (monotonic_ms / compat_rand_bytes), so a lower
+# WINNT_VER never leaves an unresolved import. Knobs that differ:
+#   - WINNT_VER          : API surface to compile against.
+#   - OPENSSL_VERSION    : 3.x dropped XP/2003; legacy pins 1.0.2u. Override
+#     with OPENSSL_VERSION= if a 1.1.1 build proves to handshake (TLS PoC).
+#   - CURL_VERSION       : legacy pins a curl that still builds on 1.0.2.
+#   - BCRYPT_LIB         : empty on legacy — no static -lbcrypt (Server 2003
+#     has no bcrypt.dll; a static import would break load).
+#   - BIN suffix         : all three binaries coexist in dist/.
+# NOTE: the legacy profile needs an OLDER MinGW-w64 toolchain that still
+# targets NT 5.2 (recent MinGW dropped XP/2003 startup support). modern and
+# win7 build fine on the current MSYS2/mingw64 toolchain.
+LEGACY  ?= 0
+ifeq ($(LEGACY),1)
+  PROFILE ?= legacy
+endif
+PROFILE ?= modern
+
+ifeq ($(PROFILE),legacy)
+  WINNT_VER           := 0x0502
+  OPENSSL_VERSION     ?= OpenSSL_1_0_2u
+  CURL_VERSION        ?= curl-7_64_1
+  BIN                 := assessment-agent-legacy.exe
+  BCRYPT_LIB          :=
+  # OpenSSL 1.0.2 Configure has no `no-tests` option.
+  OPENSSL_CONFIG_OPTS := no-shared no-dso no-engine
+  # NT 5.2 has no api-ms-win-* umbrella DLLs and bcrypt is runtime-loaded.
+  ALLOWED_DLLS        := kernel32|advapi32|user32|ws2_32|iphlpapi|crypt32|secur32|ole32|oleaut32|shell32|msvcrt|ntdll
+else ifeq ($(PROFILE),win7)
+  WINNT_VER           := 0x0601
+  OPENSSL_VERSION     ?= openssl-3.0.15
+  CURL_VERSION        ?= curl-8_10_1
+  BIN                 := assessment-agent-win7.exe
+  BCRYPT_LIB          := -lbcrypt
+  OPENSSL_CONFIG_OPTS := no-shared no-dso no-engine no-tests
+  ALLOWED_DLLS        := kernel32|advapi32|user32|ws2_32|iphlpapi|crypt32|secur32|bcrypt|ole32|oleaut32|shell32|msvcrt|ntdll|api-ms-win-.+
+else
+  WINNT_VER           := 0x0A00
+  OPENSSL_VERSION     ?= openssl-3.0.15
+  CURL_VERSION        ?= curl-8_10_1
+  BIN                 := assessment-agent.exe
+  BCRYPT_LIB          := -lbcrypt
+  OPENSSL_CONFIG_OPTS := no-shared no-dso no-engine no-tests
+  ALLOWED_DLLS        := kernel32|advapi32|user32|ws2_32|iphlpapi|crypt32|secur32|bcrypt|ole32|oleaut32|shell32|msvcrt|ntdll|api-ms-win-.+
+endif
+
 CFLAGS  ?= -Wall -Wextra -Wpedantic -O2 -std=c11 \
-           -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -DUNICODE -D_UNICODE \
+           -D_WIN32_WINNT=$(WINNT_VER) -DWINVER=$(WINNT_VER) -DUNICODE -D_UNICODE \
            -DCURL_STATICLIB
 LDFLAGS ?= -static -static-libgcc -Wl,--no-insert-timestamp
 
@@ -35,9 +98,9 @@ AGENT_VERSION ?= 1.0.0
 VENDOR_DIR         := vendor
 CJSON_VERSION      := v1.7.18
 RABBITMQ_C_VERSION := v0.15.0
-CURL_VERSION       := curl-8_10_1
-OPENSSL_VERSION    := openssl-3.0.15
 ZLIB_VERSION       := v1.3.1
+# CURL_VERSION / OPENSSL_VERSION are set by the build-profile block above
+# (modern vs LEGACY) so they can be pinned per ABI target.
 
 CJSON_DIR          := $(VENDOR_DIR)/cJSON
 RABBITMQ_C_DIR     := $(VENDOR_DIR)/rabbitmq-c
@@ -71,17 +134,19 @@ CFLAGS += -I$(CJSON_DIR) \
 #   advapi32 : Registry, Service Control Manager, ACL (SetNamedSecurityInfoW)
 #   crypt32  : OpenSSL on Windows needs CertOpenSystemStoreW etc.
 #   secur32  : SSPI (used transitively by some Schannel paths)
-#   bcrypt   : BCryptGenRandom (UUID v4 generation)
+#   bcrypt   : BCryptGenRandom (modern profile only — resolved at runtime via
+#              compat_rand_bytes(), so LEGACY drops the static import)
 #   ole32 / oleaut32 : COM init (used by some Windows API surfaces)
 #   shell32  : installer subcommand — SHCreateDirectoryExW, ShellExecuteW
 LDLIBS := $(RABBITMQ_C_LIB) $(CJSON_LIB) $(CURL_LIB) $(OPENSSL_SSL) $(OPENSSL_CRYPTO) $(ZLIB_LIB) \
           -lws2_32 -liphlpapi -ladvapi32 -lkernel32 -luser32 \
-          -lcrypt32 -lsecur32 -lbcrypt -lole32 -loleaut32 -lshell32
+          -lcrypt32 -lsecur32 $(BCRYPT_LIB) -lole32 -loleaut32 -lshell32
 
 SRC := $(wildcard src/*.c)
 OBJ := $(SRC:.c=.o)
 RES := src/resources.res
-BIN := assessment-agent.exe
+# BIN is set by the build-profile block above (assessment-agent.exe vs
+# assessment-agent-legacy.exe) so both ABIs can coexist in dist/.
 
 all: $(BIN)
 
@@ -119,7 +184,7 @@ vendor-build-openssl:
 	# `--libdir=lib` 명시 — OpenSSL 3.x 가 host triplet 에 따라 `lib64` 또는
 	# `lib/<host>` 로 install 하면 Makefile 의 $(OPENSSL_SSL) 고정 경로
 	# (`install/lib/libssl.a`) 와 어긋난다.
-	cd $(OPENSSL_DIR) && ./Configure $(OPENSSL_TARGET) no-shared no-dso no-engine no-tests $(OPENSSL_CROSS) \
+	cd $(OPENSSL_DIR) && ./Configure $(OPENSSL_TARGET) $(OPENSSL_CONFIG_OPTS) $(OPENSSL_CROSS) \
 	    --libdir=lib --prefix=$(CURDIR)/$(OPENSSL_DIR)/install
 	$(MAKE) -C $(OPENSSL_DIR) -j$(JOBS)
 	$(MAKE) -C $(OPENSSL_DIR) install_sw
@@ -211,11 +276,12 @@ verify: $(BIN)
 	@echo "[verify] checking DLL dependencies of $(BIN)..."
 	@objdump -p $(BIN) | awk '/DLL Name:/ {print tolower($$3)}' | sort -u > build-deps.txt
 	@cat build-deps.txt
-	@if grep -vE '^(kernel32|advapi32|user32|ws2_32|iphlpapi|crypt32|secur32|bcrypt|ole32|oleaut32|shell32|msvcrt|ntdll|api-ms-win-.+)\.dll$$' build-deps.txt; then \
+	@if grep -vE '^($(ALLOWED_DLLS))\.dll$$' build-deps.txt; then \
 		echo "[verify] FAIL: non-system DLL dependency listed above"; \
+		echo "[verify]   (profile: LEGACY=$(LEGACY), allowed: $(ALLOWED_DLLS))"; \
 		exit 1; \
 	fi
-	@echo "[verify] OK: only Windows system DLLs referenced"
+	@echo "[verify] OK: only Windows system DLLs referenced (LEGACY=$(LEGACY))"
 
 # ----------------------------------------------------------------------
 # Release packaging — dist/assessment-agent.exe + SHA256SUMS

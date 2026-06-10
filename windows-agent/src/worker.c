@@ -94,7 +94,7 @@ struct worker_ctx_s {
 
 	/* AMQP reconnect backoff with monotonic clock (Linux clock_gettime 대응). */
 	int             reconnect_backoff_sec;       /* current window (s), 1→2→4→...→60 */
-	ULONGLONG       last_reconnect_attempt_ms;   /* GetTickCount64() of last attempt; 0 = never */
+	ULONGLONG       last_reconnect_attempt_ms;   /* monotonic_ms() of last attempt; 0 = never */
 };
 
 #define WORKER_RECONNECT_BACKOFF_MAX 60
@@ -541,7 +541,7 @@ static unsigned __stdcall install_thread_main(void *arg)
 	rmrf_recursive(a->work_dir);
 	ensure_dir(a->work_dir);
 
-	ULONGLONG t0 = GetTickCount64();
+	ULONGLONG t0 = monotonic_ms();
 
 	download_status_t ds = download_package(a->url, a->sha256, a->size_bytes,
 	                                        a->allowed_hosts_csv, a->tmp_dir,
@@ -558,7 +558,7 @@ static unsigned __stdcall install_thread_main(void *arg)
 		                  a->active_proc_limit, a->task_id, a->machine_id, &er);
 	}
 
-	long duration_ms = (long)(GetTickCount64() - t0);
+	long duration_ms = (long)(monotonic_ms() - t0);
 	int success = (ds == DOWNLOAD_OK && xs == EXEC_OK);
 	const char *reason = success ? "" : reason_for_status(ds, xs);
 	int has_exit = (ds == DOWNLOAD_OK && xs != EXEC_ERR_SCRIPT_NOT_FOUND && xs != EXEC_ERR_INTERNAL);
@@ -707,7 +707,7 @@ static int ensure_connection(worker_ctx_t *ctx)
 
 	/* Backoff: 직전 attempt 이후 backoff_sec 가 안 지났으면 skip — broker 다운 시
 	 * 매 tick (1m) 무의미한 connect 시도 회피. Monotonic clock (GetTickCount64). */
-	ULONGLONG now_ms = GetTickCount64();
+	ULONGLONG now_ms = monotonic_ms();
 	if (ctx->reconnect_backoff_sec > 0 && ctx->last_reconnect_attempt_ms > 0) {
 		ULONGLONG since_ms = now_ms - ctx->last_reconnect_attempt_ms;
 		if (since_ms < (ULONGLONG)ctx->reconnect_backoff_sec * 1000ULL)
