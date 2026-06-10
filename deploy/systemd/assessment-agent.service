@@ -48,25 +48,22 @@ RestartSec=10s
 StartLimitBurst=5
 StartLimitIntervalSec=300
 
-# Hardening — limited to the subset that is meaningful and compatible inside
-# a per-user manager. Primary containment is already that the process runs
-# unprivileged; install.sh children are sandboxed separately in exec.c
-# (clearenv + setrlimit + setsid). ProtectSystem=/ProtectHome= are
-# deliberately NOT set: the binary and config live under the user's $HOME, so
-# virtualizing them away would break startup and worker writes.
+# Hardening — ONLY directives a per-user systemd manager can apply without
+# privilege. Primary containment is already that the process runs unprivileged;
+# install.sh children are sandboxed separately in exec.c (clearenv + setrlimit
+# + setsid).
+#
+# Deliberately NOT set (the user manager cannot enforce them → the unit would
+# fail to start with "Operation not permitted" / boolean parse errors):
+#   CapabilityBoundingSet=, PrivateDevices, ProtectKernelTunables/Modules/Logs,
+#   ProtectControlGroups, ProtectSystem, ProtectHome.
+# No inline '#' comments on directive lines — systemd folds them into the value.
 NoNewPrivileges=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectKernelLogs=yes
-ProtectControlGroups=yes
-RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
-PrivateDevices=yes
-PrivateTmp=no                     # install.sh extraction sandbox lives under %T
+RestrictNamespaces=yes
 SystemCallArchitectures=native
-CapabilityBoundingSet=
 
 # Logging — stderr captured by the user journal (journalctl --user).
 StandardOutput=journal
