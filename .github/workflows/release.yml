@@ -34,40 +34,59 @@ jobs:
   # + release + chown) 을 캡슐화하므로 여기서는 한 줄 호출만.
   # ============================================================
   build-linux:
-    name: Linux (manylinux2014 / glibc 2.17)
+    name: Linux (${{ matrix.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # Legacy (CentOS 6 / glibc 2.12) uses the archived manylinux2010 image —
+    # if it ever fails to pull/build it must NOT block the modern release.
+    continue-on-error: ${{ matrix.experimental || false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: modern (manylinux2014 / glibc 2.17)
+            image: quay.io/pypa/manylinux2014_x86_64
+            target: release
+            artifact: assessment-agent-linux-x86_64
+            binary: dist/assessment-agent-linux-x86_64
+          - name: legacy (manylinux2010 / glibc 2.12 / CentOS 6)
+            image: quay.io/pypa/manylinux2010_x86_64
+            target: release-legacy
+            artifact: assessment-agent-linux-x86_64-glibc2.12
+            binary: dist/assessment-agent-linux-x86_64-glibc2.12
+            experimental: true
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       # vendor/ 는 6개 라이브러리 git clone + cmake/configure 빌드 결과를 모두 포함.
-      # Makefile 의 버전 핀이 바뀌면 캐시 무효화 (해시 키에 Makefile 포함).
-      - name: Cache vendor (Linux)
+      # 프로파일별로 glibc 가 달라 정적 라이브러리가 호환되지 않으므로 target 을
+      # 캐시 키에 포함해 modern/legacy vendor 를 분리한다.
+      - name: Cache vendor (Linux ${{ matrix.target }})
         uses: actions/cache@v4
         with:
           path: vendor
-          key: vendor-linux-${{ hashFiles('Makefile') }}
+          key: vendor-linux-${{ matrix.target }}-${{ hashFiles('Makefile') }}
           restore-keys: |
-            vendor-linux-
+            vendor-linux-${{ matrix.target }}-
 
-      - name: Build (Docker / manylinux2014)
-        run: ./scripts/build-linux.sh
+      - name: Build (Docker / ${{ matrix.image }})
+        run: BUILD_IMAGE=${{ matrix.image }} BUILD_TARGET=${{ matrix.target }} ./scripts/build-linux.sh
 
       - name: Verify artifacts
         run: |
-          test -f dist/assessment-agent-linux-x86_64
+          test -f ${{ matrix.binary }}
           test -f dist/SHA256SUMS
           (cd dist && sha256sum -c SHA256SUMS)
-          file dist/assessment-agent-linux-x86_64
+          file ${{ matrix.binary }}
           ls -la dist/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: assessment-agent-linux-x86_64
+          name: ${{ matrix.artifact }}
           path: |
-            dist/assessment-agent-linux-x86_64
+            ${{ matrix.binary }}
             dist/SHA256SUMS
           retention-days: 90
 
@@ -77,9 +96,29 @@ jobs:
   # 대체하므로 build-windows.ps1 우회 — make 직접 호출.
   # ============================================================
   build-windows:
-    name: Windows (MSYS2 / mingw64)
+    name: Windows (${{ matrix.name }})
     runs-on: windows-latest
     timeout-minutes: 60
+    # legacy (Server 2003) needs an older MinGW + OpenSSL 1.0.2 that the
+    # windows-latest MSYS2 toolchain may not build — never block the release.
+    continue-on-error: ${{ matrix.experimental || false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: modern (NT10 — Server 2016~2025)
+            profile: modern
+            artifact: assessment-agent-windows-x86_64
+            binary: assessment-agent.exe
+          - name: win7 (NT6.1-6.3 — Server 2008R2~2012R2)
+            profile: win7
+            artifact: assessment-agent-windows-x86_64-win7
+            binary: assessment-agent-win7.exe
+          - name: legacy (NT5.2 — Server 2003 / XP x64)
+            profile: legacy
+            artifact: assessment-agent-windows-x86_64-legacy
+            binary: assessment-agent-legacy.exe
+            experimental: true
     defaults:
       run:
         shell: msys2 {0}
@@ -101,26 +140,28 @@ jobs:
             mingw-w64-x86_64-pkgconf
             perl
 
-      - name: Cache vendor (Windows)
+      # OpenSSL version differs per profile, so vendor static libs are not
+      # interchangeable — key the cache on the profile.
+      - name: Cache vendor (Windows ${{ matrix.profile }})
         uses: actions/cache@v4
         with:
           path: windows-agent/vendor
-          key: vendor-windows-${{ hashFiles('windows-agent/Makefile') }}
+          key: vendor-windows-${{ matrix.profile }}-${{ hashFiles('windows-agent/Makefile') }}
           restore-keys: |
-            vendor-windows-
+            vendor-windows-${{ matrix.profile }}-
 
       - name: Vendor fetch
-        run: make vendor-fetch
+        run: make PROFILE=${{ matrix.profile }} vendor-fetch
 
       - name: Vendor build (static)
-        run: make vendor-build
+        run: make PROFILE=${{ matrix.profile }} vendor-build
 
       - name: Build + release
-        run: make release
+        run: make PROFILE=${{ matrix.profile }} release
 
       - name: Verify artifacts
         run: |
-          test -f dist/assessment-agent.exe
+          test -f dist/${{ matrix.binary }}
           test -f dist/SHA256SUMS
           (cd dist && sha256sum -c SHA256SUMS)
           ls -la dist/
@@ -128,9 +169,9 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: assessment-agent-windows-x86_64
+          name: ${{ matrix.artifact }}
           path: |
-            windows-agent/dist/assessment-agent.exe
+            windows-agent/dist/${{ matrix.binary }}
             windows-agent/dist/SHA256SUMS
           retention-days: 90
 
@@ -630,13 +671,22 @@ jobs:
       - name: Flatten artifact layout
         run: |
           mkdir -p release
+          # Modern artifacts are REQUIRED — fail loudly if missing.
           cp artifacts/assessment-agent-linux-x86_64/assessment-agent-linux-x86_64 release/
           cp artifacts/assessment-agent-windows-x86_64/assessment-agent.exe release/
-          # Aggregate SHA256SUMS (Linux + Windows in one file)
-          {
-            cat artifacts/assessment-agent-linux-x86_64/SHA256SUMS
-            cat artifacts/assessment-agent-windows-x86_64/SHA256SUMS
-          } > release/SHA256SUMS
+          # Optional profiles (experimental) — attach only if their build job
+          # produced an artifact. A missing one is fine (continue-on-error).
+          cp artifacts/assessment-agent-linux-x86_64-glibc2.12/assessment-agent-linux-x86_64-glibc2.12 release/ 2>/dev/null \
+            || echo "[release] no Linux legacy (CentOS 6) artifact — skipped"
+          cp artifacts/assessment-agent-windows-x86_64-win7/assessment-agent-win7.exe release/ 2>/dev/null \
+            || echo "[release] no Windows win7 artifact — skipped"
+          cp artifacts/assessment-agent-windows-x86_64-legacy/assessment-agent-legacy.exe release/ 2>/dev/null \
+            || echo "[release] no Windows legacy (Server 2003) artifact — skipped"
+          # Aggregate every SHA256SUMS that was downloaded.
+          : > release/SHA256SUMS
+          for d in artifacts/*/; do
+            [ -f "$d/SHA256SUMS" ] && cat "$d/SHA256SUMS" >> release/SHA256SUMS
+          done
           ls -la release/
           cat release/SHA256SUMS
 
@@ -644,8 +694,12 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          fail_on_unmatched_files: true
+          # Optional profiles may be absent — do not fail the release on them.
+          fail_on_unmatched_files: false
           files: |
             release/assessment-agent-linux-x86_64
+            release/assessment-agent-linux-x86_64-glibc2.12
             release/assessment-agent.exe
+            release/assessment-agent-win7.exe
+            release/assessment-agent-legacy.exe
             release/SHA256SUMS
