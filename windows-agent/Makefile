@@ -233,6 +233,10 @@ vendor-build-rabbitmq:
 	      -DENABLE_SSL_SUPPORT=ON \
 	      -DOPENSSL_ROOT_DIR=$(CURDIR)/$(OPENSSL_DIR)/install \
 	      -DOPENSSL_USE_STATIC_LIBS=TRUE \
+	      -DCMAKE_PREFIX_PATH=$(CURDIR)/$(OPENSSL_DIR)/install \
+	      -DOPENSSL_INCLUDE_DIR=$(CURDIR)/$(OPENSSL_DIR)/install/include \
+	      -DOPENSSL_SSL_LIBRARY=$(CURDIR)/$(OPENSSL_DIR)/install/lib/libssl.a \
+	      -DOPENSSL_CRYPTO_LIBRARY=$(CURDIR)/$(OPENSSL_DIR)/install/lib/libcrypto.a \
 	      -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 	$(CMAKE) --build $(RABBITMQ_C_DIR)/build --target rabbitmq-static -- -j$(JOBS)
 	# Windows mingw cmake 가 정적 라이브러리에 `lib` prefix 를 자동 추가하면서
