@@ -26,21 +26,50 @@
 #include <aclapi.h>
 #include <sddl.h>
 #include <shlobj.h>
-#include <bcrypt.h>
 
 /* ====================================================================
- *  Fixed paths — match the prior install.ps1 layout 1:1 so an upgrade
- *  from the script-based installer finds the same files in place.
+ *  User-level install layout — everything under
+ *  %LOCALAPPDATA%\assessment-agent, resolved at runtime. No admin is needed
+ *  to read/write these; only registering the boot scheduled task wants a
+ *  one-time elevation.
+ *
+ *  Lazy accessors return pointers to per-path static buffers. The installer
+ *  is single-threaded, so the lazy init needs no locking.
  * ==================================================================== */
-#define PROG_DIR     L"C:\\Program Files\\assessment-agent"
-#define DATA_DIR     L"C:\\ProgramData\\assessment-agent"
-#define EXE_TARGET   PROG_DIR L"\\assessment-agent.exe"
-#define ENV_FILE     DATA_DIR L"\\agent.env"
-#define ENV_LOCAL    DATA_DIR L"\\agent.env.local"
-#define WORKER_DIR   DATA_DIR L"\\worker"
+static const wchar_t *p_base(void)
+{
+    static wchar_t b[MAX_PATH];
+    if (!b[0] && agent_data_path_w(NULL, b, MAX_PATH) != 0) b[0] = L'\0';
+    return b;
+}
+static const wchar_t *p_exe(void)
+{
+    static wchar_t b[MAX_PATH];
+    if (!b[0] && agent_data_path_w(L"assessment-agent.exe", b, MAX_PATH) != 0) b[0] = L'\0';
+    return b;
+}
+static const wchar_t *p_env(void)
+{
+    static wchar_t b[MAX_PATH];
+    if (!b[0] && agent_data_path_w(L"agent.env", b, MAX_PATH) != 0) b[0] = L'\0';
+    return b;
+}
+static const wchar_t *p_env_local(void)
+{
+    static wchar_t b[MAX_PATH];
+    if (!b[0] && agent_data_path_w(L"agent.env.local", b, MAX_PATH) != 0) b[0] = L'\0';
+    return b;
+}
+static const wchar_t *p_worker(void)
+{
+    static wchar_t b[MAX_PATH];
+    if (!b[0] && agent_data_path_w(L"worker", b, MAX_PATH) != 0) b[0] = L'\0';
+    return b;
+}
 
-#define SERVICE_DISPLAY L"Assessment Agent"
-#define SERVICE_DESC    L"Resource assessment collector — publishes inventory/metrics/error to RabbitMQ."
+/* Scheduled-task name (replaces the prior Windows service). */
+#define TASK_NAME    L"AssessmentAgent"
+#define SERVICE_DESC L"Resource assessment collector — publishes inventory/metrics/error to RabbitMQ."
 
 /* env-setup.ps1 의 PromptKeys / SecretKeys 와 1:1 매핑. */
 static const char *const PROMPT_KEYS[] = {
@@ -125,44 +154,10 @@ static int ensure_dir(const wchar_t *path)
     return -1;
 }
 
-/* SYSTEM + Administrators full control, no inheritance — equivalent to
- * `icacls <path> /inheritance:r /grant:r SYSTEM:F Administrators:F`. */
-static int apply_strict_acl(const wchar_t *path, int container)
-{
-    PSECURITY_DESCRIPTOR sd = NULL;
-    /* SDDL: D(ACL)P(rotected)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)
-     *   P    — break inheritance (matches /inheritance:r)
-     *   A;OICI;FA;;;SY  — SYSTEM full, inherited by child files+dirs
-     *   A;OICI;FA;;;BA  — BUILTIN\\Administrators full
-     * OICI is harmless on files; only takes effect on directories. */
-    const wchar_t *sddl = container
-        ? L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
-        : L"D:P(A;;FA;;;SY)(A;;FA;;;BA)";
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl, SDDL_REVISION_1, &sd, NULL)) {
-        fprintf(stderr, "[install] ACL build failed: %lu\n",
-                (unsigned long)GetLastError());
-        return -1;
-    }
-    BOOL dacl_present = FALSE, dacl_default = FALSE;
-    PACL dacl = NULL;
-    if (!GetSecurityDescriptorDacl(sd, &dacl_present, &dacl, &dacl_default) ||
-        !dacl_present) {
-        LocalFree(sd);
-        return -1;
-    }
-    DWORD rc = SetNamedSecurityInfoW((LPWSTR)path, SE_FILE_OBJECT,
-                                     DACL_SECURITY_INFORMATION |
-                                     PROTECTED_DACL_SECURITY_INFORMATION,
-                                     NULL, NULL, dacl, NULL);
-    LocalFree(sd);
-    if (rc != ERROR_SUCCESS) {
-        fprintf(stderr, "[install] SetNamedSecurityInfo failed (%lu) on %ls\n",
-                (unsigned long)rc, path);
-        return -1;
-    }
-    return 0;
-}
+/* (Former apply_strict_acl removed: user-level install lives under the user's
+ * own %LOCALAPPDATA%, whose default ACL already restricts access to that user
+ * plus SYSTEM/Administrators. A SYSTEM+Administrators-only ACL would lock out
+ * the agent itself, which now runs as the user rather than LocalSystem.) */
 
 static int copy_self_to(const wchar_t *target)
 {
@@ -185,110 +180,109 @@ static int copy_self_to(const wchar_t *target)
 }
 
 /* ====================================================================
- *  Service control helpers
+ *  Scheduled-task control (replaces the Windows service)
+ *
+ *  User-level model: the agent runs as a per-user Task Scheduler job, not as
+ *  a LocalSystem service. Registering an ONSTART (boot, whether-logged-on-or-
+ *  not) task for the current user needs admin ONCE (it creates an S4U task —
+ *  no stored password); the agent itself then runs unprivileged as that user.
+ *
+ *  We drive schtasks.exe rather than the Task Scheduler COM API: far less code
+ *  and no extra dependency. CreateProcessW (not _wsystem) avoids a cmd.exe
+ *  quoting layer.
  * ==================================================================== */
-static int service_exists(SC_HANDLE scm)
-{
-    SC_HANDLE s = OpenServiceW(scm, ASSESSMENT_AGENT_SERVICE_NAME,
-                               SERVICE_QUERY_STATUS);
-    if (!s) return 0;
-    CloseServiceHandle(s);
-    return 1;
-}
 
-static int stop_service_if_running(SC_HANDLE scm)
+/* Run a command line synchronously, no console window. Returns the child exit
+ * code, or -1 on spawn failure. The buffer is copied because CreateProcessW
+ * may write into its lpCommandLine argument. */
+static int run_process_w(const wchar_t *cmdline)
 {
-    SC_HANDLE s = OpenServiceW(scm, ASSESSMENT_AGENT_SERVICE_NAME,
-                               SERVICE_STOP | SERVICE_QUERY_STATUS);
-    if (!s) return 0;  /* not registered → nothing to do */
-    SERVICE_STATUS st = {0};
-    QueryServiceStatus(s, &st);
-    if (st.dwCurrentState == SERVICE_STOPPED) {
-        CloseServiceHandle(s);
-        return 0;
-    }
-    fprintf(stderr, "[install] stopping existing service for upgrade...\n");
-    ControlService(s, SERVICE_CONTROL_STOP, &st);
-    /* SCM stop is async; wait up to 30s for SERVICE_STOPPED so the exe
-     * file isn't held open when CopyFile overwrites it. */
-    for (int i = 0; i < 60; i++) {
-        QueryServiceStatus(s, &st);
-        if (st.dwCurrentState == SERVICE_STOPPED) break;
-        Sleep(500);
-    }
-    CloseServiceHandle(s);
-    return st.dwCurrentState == SERVICE_STOPPED ? 0 : -1;
-}
+    wchar_t buf[2048];
+    if ((size_t)_snwprintf(buf, 2048, L"%ls", cmdline) >= 2048) return -1;
 
-static int register_service(SC_HANDLE scm)
-{
-    /* Binary path must be quoted — the path itself contains a space
-     * ("C:\\Program Files\\..."). SCM treats lpBinaryPathName as a command
-     * line, so without quotes the first space splits the argv. */
-    const wchar_t *bin_path = L"\"" EXE_TARGET L"\"";
-
-    SC_HANDLE svc = CreateServiceW(scm,
-        ASSESSMENT_AGENT_SERVICE_NAME, SERVICE_DISPLAY,
-        SERVICE_ALL_ACCESS,
-        SERVICE_WIN32_OWN_PROCESS,
-        SERVICE_AUTO_START,
-        SERVICE_ERROR_NORMAL,
-        bin_path,
-        NULL, NULL, NULL,
-        NULL,  /* LocalSystem */
-        NULL);
-    if (!svc) {
-        DWORD err = GetLastError();
-        fprintf(stderr, "[install] CreateService failed: %lu\n", (unsigned long)err);
+    STARTUPINFOW si = { .cb = sizeof si };
+    PROCESS_INFORMATION pi = {0};
+    if (!CreateProcessW(NULL, buf, NULL, NULL, FALSE,
+                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        fprintf(stderr, "[install] CreateProcess failed: %lu\n",
+                (unsigned long)GetLastError());
         return -1;
     }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return (int)code;
+}
 
-    SERVICE_DESCRIPTIONW desc = { .lpDescription = (LPWSTR)SERVICE_DESC };
-    ChangeServiceConfig2W(svc, SERVICE_CONFIG_DESCRIPTION, &desc);
+/* "DOMAIN\user" of the current process, for schtasks /RU. Falls back to the
+ * bare username if USERDOMAIN is unset. */
+static int current_user_w(wchar_t *out, size_t cap)
+{
+    wchar_t dom[128] = {0}, usr[128] = {0};
+    DWORD nd = GetEnvironmentVariableW(L"USERDOMAIN", dom, 128);
+    DWORD nu = GetEnvironmentVariableW(L"USERNAME",   usr, 128);
+    if (nu == 0 || nu >= 128) return -1;
+    int w = (nd > 0 && nd < 128)
+        ? _snwprintf(out, cap, L"%ls\\%ls", dom, usr)
+        : _snwprintf(out, cap, L"%ls", usr);
+    return (w > 0 && (size_t)w < cap) ? 0 : -1;
+}
 
-    /* Failure recovery — restart after 5s / 10s / 30s. Reset counter after
-     * 1 clean day. Matches `sc.exe failure ... reset= 86400 actions= ...`
-     * from the previous install.ps1. */
-    SC_ACTION actions[3] = {
-        { SC_ACTION_RESTART,  5000 },
-        { SC_ACTION_RESTART, 10000 },
-        { SC_ACTION_RESTART, 30000 },
-    };
-    SERVICE_FAILURE_ACTIONSW fa = {
-        .dwResetPeriod = 86400,
-        .lpRebootMsg   = NULL,
-        .lpCommand     = NULL,
-        .cActions      = 3,
-        .lpsaActions   = actions,
-    };
-    ChangeServiceConfig2W(svc, SERVICE_CONFIG_FAILURE_ACTIONS, &fa);
+static int task_exists(void)
+{
+    return run_process_w(L"schtasks /Query /TN " TASK_NAME) == 0;
+}
 
-    CloseServiceHandle(svc);
+static int stop_task_if_running(void)
+{
+    /* Best-effort: /End is harmless if the task is not running, and lets the
+     * exe file be overwritten on upgrade. */
+    run_process_w(L"schtasks /End /TN " TASK_NAME);
+    Sleep(1500);
     return 0;
 }
 
-static int start_service_and_wait(SC_HANDLE scm)
+static int register_task(void)
 {
-    SC_HANDLE svc = OpenServiceW(scm, ASSESSMENT_AGENT_SERVICE_NAME,
-                                 SERVICE_START | SERVICE_QUERY_STATUS);
-    if (!svc) return -1;
-    if (!StartServiceW(svc, 0, NULL)) {
-        DWORD err = GetLastError();
-        if (err != ERROR_SERVICE_ALREADY_RUNNING) {
-            fprintf(stderr, "[install] StartService failed: %lu\n",
-                    (unsigned long)err);
-            CloseServiceHandle(svc);
-            return -1;
-        }
+    wchar_t user[260];
+    if (current_user_w(user, 260) != 0) {
+        fprintf(stderr, "[install] could not resolve current user for task principal\n");
+        return -1;
     }
-    SERVICE_STATUS st = {0};
-    for (int i = 0; i < 30; i++) {
-        QueryServiceStatus(svc, &st);
-        if (st.dwCurrentState == SERVICE_RUNNING) break;
-        Sleep(500);
+
+    /* Action = "<exe>" run  (foreground agent loop). On the schtasks command
+     * line the /TR value is one quoted token that itself contains quotes
+     * around the exe path, so the inner quotes are backslash-escaped.
+     *
+     * /SC ONSTART       — start at boot, before any interactive logon.
+     * /RU <user> (no /RP)— S4U: runs whether logged on or not, no stored
+     *                      password. Creating this requires admin ONCE.
+     * /RL LIMITED       — runtime stays unprivileged (no elevation).
+     * /F                — overwrite an existing task (upgrade/idempotent). */
+    wchar_t cmd[1536];
+    int w = _snwprintf(cmd, 1536,
+        L"schtasks /Create /TN " TASK_NAME
+        L" /TR \"\\\"%ls\\\" run\""
+        L" /SC ONSTART /RU \"%ls\" /RL LIMITED /F",
+        p_exe(), user);
+    if (w <= 0 || (size_t)w >= 1536) return -1;
+
+    int rc = run_process_w(cmd);
+    if (rc != 0) {
+        fprintf(stderr, "[install] schtasks /Create failed (exit %d).\n", rc);
+        fprintf(stderr, "[install]   Registering a boot task that runs whether you are\n");
+        fprintf(stderr, "[install]   logged on or not needs a one-time elevated (Admin)\n");
+        fprintf(stderr, "[install]   shell. The agent then runs as you, unprivileged.\n");
+        return -1;
     }
-    CloseServiceHandle(svc);
-    return st.dwCurrentState == SERVICE_RUNNING ? 0 : -1;
+    return 0;
+}
+
+static int run_task(void)
+{
+    return run_process_w(L"schtasks /Run /TN " TASK_NAME) == 0 ? 0 : -1;
 }
 
 /* ====================================================================
@@ -544,7 +538,7 @@ static int env_setup_run(const char *example, size_t example_len)
     }
     {
         char *existing = NULL; size_t elen = 0;
-        if (read_file_all(ENV_FILE, &existing, &elen) == 0 && existing) {
+        if (read_file_all(p_env(), &existing, &elen) == 0 && existing) {
             iterate_lines(existing, elen, existing_line_cb, &env_state);
             free(existing);
         }
@@ -560,8 +554,14 @@ static int env_setup_run(const char *example, size_t example_len)
             /* already customized — never overwrite */
             continue;
         }
+        /* Non-interactive (high-latency / no console): a preset in the
+         * environment wins outright — `set RABBITMQ_HOST=broker & install`. */
+        const char *envp = getenv(k);
+        if (envp && *envp) {
+            kv_arr_set(&env_state, k, envp);
+            continue;
+        }
         const char *def = schema.items[i].value;
-        char line[1024];
         if (def && *def) {
             fprintf(stdout, "%s [%s]: ", k, def);
         } else {
@@ -574,20 +574,19 @@ static int env_setup_run(const char *example, size_t example_len)
         } else if (def && *def) {
             kv_arr_set(&env_state, k, def);
         }
-        (void)line;
     }
-    if (write_env_file(ENV_FILE, &env_state, 1) != 0) {
-        fprintf(stderr, "[install] writing %ls failed\n", ENV_FILE);
+    if (write_env_file(p_env(), &env_state, 1) != 0) {
+        fprintf(stderr, "[install] writing %ls failed\n", p_env());
         kv_arr_free(&schema); kv_arr_free(&env_state);
         return -1;
     }
-    fprintf(stdout, "[install] wrote %ls\n", ENV_FILE);
+    fprintf(stdout, "[install] wrote %ls\n", p_env());
 
     /* --- agent.env.local (secret) --- */
     kv_arr_t local_state = {0};
     {
         char *existing = NULL; size_t elen = 0;
-        if (read_file_all(ENV_LOCAL, &existing, &elen) == 0 && existing) {
+        if (read_file_all(p_env_local(), &existing, &elen) == 0 && existing) {
             iterate_lines(existing, elen, existing_line_cb, &local_state);
             free(existing);
         }
@@ -595,20 +594,28 @@ static int env_setup_run(const char *example, size_t example_len)
     for (const char *const *k = SECRET_KEYS; *k; k++) {
         kv_t *cur = kv_arr_find(&local_state, *k);
         if (cur && cur->value && *cur->value) continue;
+        /* Preset secret in the environment → use it, no prompt. */
+        const char *envp = getenv(*k);
+        if (envp && *envp) {
+            kv_arr_set(&local_state, *k, envp);
+            continue;
+        }
         fprintf(stdout, "%s (input hidden): ", *k);
         fflush(stdout);
         char input[1024] = {0};
         if (read_console_line(input, sizeof input, 0) == 0 && *input)
             kv_arr_set(&local_state, *k, input);
     }
-    if (write_env_file(ENV_LOCAL, &local_state, 0) != 0) {
-        fprintf(stderr, "[install] writing %ls failed\n", ENV_LOCAL);
+    if (write_env_file(p_env_local(), &local_state, 0) != 0) {
+        fprintf(stderr, "[install] writing %ls failed\n", p_env_local());
         kv_arr_free(&schema); kv_arr_free(&env_state); kv_arr_free(&local_state);
         return -1;
     }
-    /* Strict ACL on the secret file — SYSTEM + Administrators only. */
-    apply_strict_acl(ENV_LOCAL, 0);
-    fprintf(stdout, "[install] wrote %ls (ACL: SYSTEM + Administrators)\n", ENV_LOCAL);
+    /* No explicit ACL: the file lives under the user's own %LOCALAPPDATA%,
+     * whose default ACL already grants only this user (+ SYSTEM/Admins). The
+     * old SYSTEM+Administrators-only ACL would lock out the agent itself,
+     * which now runs as this user, not LocalSystem. */
+    fprintf(stdout, "[install] wrote %ls (user-private)\n", p_env_local());
 
     kv_arr_free(&schema);
     kv_arr_free(&env_state);
@@ -621,15 +628,17 @@ static int env_setup_run(const char *example, size_t example_len)
  * ==================================================================== */
 int installer_run_install(int image_prep)
 {
-    fprintf(stdout, "\n=== Assessment Agent installer ===\n");
-    fprintf(stdout, "NOTE: cloned VMs inherit MachineGuid — run `prep-image`\n"
-                    "      on the golden template before snapshotting.\n\n");
+    fprintf(stdout, "\n=== Assessment Agent installer (user-level) ===\n");
+    fprintf(stdout, "Installs under %%LOCALAPPDATA%%\\assessment-agent and runs as you.\n");
+    fprintf(stdout, "One-time Administrator rights are needed only to register the\n");
+    fprintf(stdout, "boot scheduled task; the agent itself runs unprivileged.\n\n");
 
-    if (!is_elevated()) {
-        fprintf(stderr, "[install] must run from an elevated (Administrator) shell\n");
+    if (!check_windows_version()) return 1;
+
+    if (!p_base()[0] || !p_exe()[0]) {
+        fprintf(stderr, "[install] could not resolve %%LOCALAPPDATA%% — aborting\n");
         return 1;
     }
-    if (!check_windows_version()) return 1;
 
     size_t ex_len = 0;
     const char *ex = load_env_example(&ex_len);
@@ -638,117 +647,76 @@ int installer_run_install(int image_prep)
         return 1;
     }
 
-    SC_HANDLE scm = OpenSCManagerW(NULL, NULL,
-                                   SC_MANAGER_CREATE_SERVICE |
-                                   SC_MANAGER_CONNECT);
-    if (!scm) {
-        fprintf(stderr, "[install] OpenSCManager failed: %lu\n",
-                (unsigned long)GetLastError());
+    /* Stop a previously-registered task so the exe can be overwritten. */
+    if (task_exists())
+        stop_task_if_running();
+
+    wchar_t sub[MAX_PATH];
+    int dirs_ok =
+        ensure_dir(p_base()) == 0 &&
+        ensure_dir(p_worker()) == 0;
+    if (dirs_ok && _snwprintf(sub, MAX_PATH, L"%ls\\results", p_worker()) > 0)
+        dirs_ok = ensure_dir(sub) == 0;
+    if (dirs_ok && _snwprintf(sub, MAX_PATH, L"%ls\\done", p_worker()) > 0)
+        dirs_ok = ensure_dir(sub) == 0;
+    if (dirs_ok && _snwprintf(sub, MAX_PATH, L"%ls\\running", p_worker()) > 0)
+        dirs_ok = ensure_dir(sub) == 0;
+    if (!dirs_ok) return 1;
+
+    if (copy_self_to(p_exe()) != 0)
         return 1;
-    }
+    fprintf(stdout, "[install] binary     : %ls\n", p_exe());
 
-    if (stop_service_if_running(scm) != 0)
-        fprintf(stderr, "[install] warning: existing service did not stop cleanly\n");
-
-    if (ensure_dir(PROG_DIR) != 0 ||
-        ensure_dir(DATA_DIR) != 0 ||
-        ensure_dir(WORKER_DIR) != 0 ||
-        ensure_dir(WORKER_DIR L"\\results") != 0 ||
-        ensure_dir(WORKER_DIR L"\\done")    != 0 ||
-        ensure_dir(WORKER_DIR L"\\running") != 0) {
-        CloseServiceHandle(scm);
+    if (env_setup_run(ex, ex_len) != 0)
         return 1;
-    }
 
-    if (copy_self_to(EXE_TARGET) != 0) {
-        CloseServiceHandle(scm);
+    /* Register / refresh the boot scheduled task (needs admin once). */
+    fprintf(stdout, "[install] registering scheduled task '%ls'...\n", TASK_NAME);
+    if (register_task() != 0)
         return 1;
-    }
-    fprintf(stdout, "[install] binary     : %ls\n", EXE_TARGET);
-
-    if (env_setup_run(ex, ex_len) != 0) {
-        CloseServiceHandle(scm);
-        return 1;
-    }
-
-    /* Tighten DATA_DIR ACL last so the env-setup writes (which inherit the
-     * default ACL on first creation) get re-secured. */
-    apply_strict_acl(DATA_DIR, 1);
-
-    if (!service_exists(scm)) {
-        fprintf(stdout, "[install] registering service '%ls'...\n",
-                ASSESSMENT_AGENT_SERVICE_NAME);
-        if (register_service(scm) != 0) {
-            CloseServiceHandle(scm);
-            return 1;
-        }
-    }
 
     if (image_prep) {
-        fprintf(stdout, "\n[install] --image-prep — service registered, NOT started.\n");
+        fprintf(stdout, "\n[install] --image-prep — task registered, NOT started.\n");
         fprintf(stdout, "[install] before sealing the VM image, run:\n");
         fprintf(stdout, "[install]     assessment-agent.exe prep-image\n\n");
-        CloseServiceHandle(scm);
         return 0;
     }
 
-    fprintf(stdout, "[install] starting service...\n");
-    if (start_service_and_wait(scm) != 0) {
-        fprintf(stderr, "[install] service failed to reach RUNNING — check "
-                        "Application event log (Source: assessment-agent)\n");
-        CloseServiceHandle(scm);
+    fprintf(stdout, "[install] starting task...\n");
+    if (run_task() != 0) {
+        fprintf(stderr, "[install] schtasks /Run failed — start it manually with\n");
+        fprintf(stderr, "[install]   schtasks /Run /TN %ls\n", TASK_NAME);
         return 1;
     }
-    CloseServiceHandle(scm);
 
-    fprintf(stdout, "\n[install] OK — assessment-agent is running.\n");
-    fprintf(stdout, "[install] logs:      Get-WinEvent -LogName Application -MaxEvents 50 |\n"
-                    "[install]              ?{ $_.ProviderName -match 'assessment-agent' }\n");
-    fprintf(stdout, "[install] stop:      Stop-Service assessment-agent\n");
+    fprintf(stdout, "\n[install] OK — assessment-agent scheduled task is running.\n");
+    fprintf(stdout, "[install] status:    schtasks /Query /TN %ls /V /FO LIST\n", TASK_NAME);
+    fprintf(stdout, "[install] stop:      schtasks /End /TN %ls\n", TASK_NAME);
     fprintf(stdout, "[install] uninstall: assessment-agent.exe uninstall\n");
     return 0;
 }
 
 /* ====================================================================
- *  uninstall — stop + delete service; leave on-disk state alone.
+ *  uninstall — stop + delete the scheduled task; leave on-disk state alone.
+ *
+ *  Removing a boot task that was registered to "run whether logged on or not"
+ *  needs the same one-time admin as install. We attempt it regardless and let
+ *  schtasks report a clear error if not elevated.
  * ==================================================================== */
 int installer_run_uninstall(void)
 {
-    if (!is_elevated()) {
-        fprintf(stderr, "[uninstall] must run from an elevated shell\n");
-        return 1;
-    }
-    SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
-    if (!scm) return 1;
-    SC_HANDLE svc = OpenServiceW(scm, ASSESSMENT_AGENT_SERVICE_NAME,
-                                 SERVICE_STOP | SERVICE_QUERY_STATUS | DELETE);
-    if (!svc) {
-        fprintf(stdout, "[uninstall] service not registered — nothing to do\n");
-        CloseServiceHandle(scm);
+    if (!task_exists()) {
+        fprintf(stdout, "[uninstall] scheduled task not registered — nothing to do\n");
         return 0;
     }
-    SERVICE_STATUS st = {0};
-    QueryServiceStatus(svc, &st);
-    if (st.dwCurrentState != SERVICE_STOPPED) {
-        fprintf(stdout, "[uninstall] stopping service...\n");
-        ControlService(svc, SERVICE_CONTROL_STOP, &st);
-        for (int i = 0; i < 60; i++) {
-            QueryServiceStatus(svc, &st);
-            if (st.dwCurrentState == SERVICE_STOPPED) break;
-            Sleep(500);
-        }
-    }
-    if (!DeleteService(svc)) {
-        fprintf(stderr, "[uninstall] DeleteService failed: %lu\n",
-                (unsigned long)GetLastError());
-        CloseServiceHandle(svc); CloseServiceHandle(scm);
+    stop_task_if_running();
+    if (run_process_w(L"schtasks /Delete /TN " TASK_NAME L" /F") != 0) {
+        fprintf(stderr, "[uninstall] schtasks /Delete failed — re-run from an\n");
+        fprintf(stderr, "[uninstall]   elevated (Administrator) shell.\n");
         return 1;
     }
-    CloseServiceHandle(svc);
-    CloseServiceHandle(scm);
-    fprintf(stdout, "[uninstall] service removed. on-disk state preserved at:\n");
-    fprintf(stdout, "[uninstall]   %ls\n", DATA_DIR);
-    fprintf(stdout, "[uninstall]   %ls\n", PROG_DIR);
+    fprintf(stdout, "[uninstall] scheduled task removed. on-disk state preserved at:\n");
+    fprintf(stdout, "[uninstall]   %ls\n", p_base());
     return 0;
 }
 
@@ -757,13 +725,11 @@ int installer_run_uninstall(void)
  * ==================================================================== */
 static int regenerate_machine_guid(void)
 {
-    /* Build a UUID v4 string via BCryptGenRandom (same path util.h::uuid_v4
-     * uses for message_id). 36-char canonical form, lowercased and wrapped
-     * in braces to match the format Windows stores under MachineGuid. */
+    /* Build a UUID v4 string via compat_rand_bytes (bcrypt → CryptoAPI
+     * fallback, so this works on NT 5.2 / Server 2003 too). 36-char canonical
+     * form, lowercased, to match the format Windows stores under MachineGuid. */
     unsigned char r[16];
-    NTSTATUS s = BCryptGenRandom(NULL, r, sizeof r,
-                                 BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-    if (s != 0) return -1;
+    if (!compat_rand_bytes(r, sizeof r)) return -1;
     r[6] = (r[6] & 0x0f) | 0x40;
     r[8] = (r[8] & 0x3f) | 0x80;
 
@@ -802,19 +768,24 @@ static int regenerate_machine_guid(void)
 
 int installer_run_prep_image(int run_sysprep)
 {
-    if (!is_elevated()) {
-        fprintf(stderr, "[prep-image] must run from an elevated shell\n");
-        return 1;
-    }
     fprintf(stdout, "\n=== Assessment Agent — image preparation ===\n");
     fprintf(stdout, "Run once on the GOLDEN TEMPLATE before snapshotting.\n\n");
 
-    SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
-    if (scm) {
-        stop_service_if_running(scm);
-        CloseServiceHandle(scm);
+    /* Stop the scheduled task so it isn't running in the sealed image. */
+    if (task_exists())
+        stop_task_if_running();
+
+    /* MachineGuid regen is best-effort: machine_id is display-only — the
+     * engine keys hosts on composite_id = sha256(machine_id + MACs), which
+     * already diverges per clone via fresh NIC MACs. Regen needs admin (HKLM);
+     * when not elevated we skip with a note instead of failing. */
+    if (!is_elevated()) {
+        fprintf(stdout, "[prep-image] not elevated — SKIP MachineGuid reset.\n");
+        fprintf(stdout, "[prep-image]   Not fatal: composite_id diverges via per-clone MACs.\n");
+        fprintf(stdout, "[prep-image]   Run from an Admin shell to also reset MachineGuid.\n");
+    } else if (regenerate_machine_guid() != 0) {
+        return 1;
     }
-    if (regenerate_machine_guid() != 0) return 1;
 
     if (run_sysprep) {
         const wchar_t sys[] = L"C:\\Windows\\System32\\Sysprep\\Sysprep.exe";

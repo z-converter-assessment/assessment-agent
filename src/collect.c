@@ -1614,6 +1614,92 @@ static int add_cpu_stat(cJSON *root)
 	return 1;
 }
 
+/**
+ * @brief Sum of per-zone "low" watermarks from /proc/zoneinfo, in pages.
+ *
+ * Each memory zone prints a "low" line; the kernel's MemAvailable formula
+ * uses their sum. Returns the page-count total, or -1 if /proc/zoneinfo is
+ * unreadable or contains no "low" line.
+ */
+static long zoneinfo_wmark_low_pages(void)
+{
+	char *content = read_file_all("/proc/zoneinfo");
+	if (!content)
+		return -1;
+	long total = 0;
+	int found = 0;
+	const char *p = content;
+	while (*p) {
+		const char *eol = strchr(p, '\n');
+		const char *s = p;
+		while (*s == ' ' || *s == '\t')
+			s++;
+		if (strncmp(s, "low", 3) == 0 && (s[3] == ' ' || s[3] == '\t')) {
+			const char *v = s + 3;
+			while (*v == ' ' || *v == '\t')
+				v++;
+			char *end;
+			long val = strtol(v, &end, 10);
+			if (end != v) {
+				total += val;
+				found = 1;
+			}
+		}
+		if (!eol) break;
+		p = eol + 1;
+	}
+	free(content);
+	return found ? total : -1;
+}
+
+/**
+ * @brief Reproduce the kernel si_mem_available() value for kernels that do
+ *        not export MemAvailable (< 3.14: CentOS 6, CentOS 7.0~7.1).
+ *
+ * This is the *same algorithm* the kernel uses to fill /proc/meminfo's
+ * MemAvailable, evaluated in user space:
+ *
+ *   available = MemFree − wmark_low
+ *             + (pagecache  − min(pagecache/2,  wmark_low))   # Active(file)+Inactive(file)
+ *             + (SReclaimable − min(SReclaimable/2, wmark_low))
+ *
+ * so the result matches a kernel that does export it, rather than the coarse
+ * MemFree+Buffers+Cached estimate (which over-reports availability). All
+ * inputs exist on CentOS 6 (kernel 2.6.32). Returns kB, or -1 if any required
+ * input is missing — caller then falls back to the coarse estimate.
+ */
+static long derive_mem_available_kb(const char *meminfo, long mem_free)
+{
+	if (mem_free < 0)
+		return -1;
+	long active_file   = meminfo_get_kb(meminfo, "Active(file)");
+	long inactive_file = meminfo_get_kb(meminfo, "Inactive(file)");
+	long sreclaimable  = meminfo_get_kb(meminfo, "SReclaimable");
+	if (active_file < 0 || inactive_file < 0 || sreclaimable < 0)
+		return -1;
+
+	long wmark_pages = zoneinfo_wmark_low_pages();
+	if (wmark_pages < 0)
+		return -1;
+	long page_kb = sysconf(_SC_PAGESIZE) / 1024;
+	if (page_kb <= 0)
+		page_kb = 4;                      /* 4 KiB page default */
+	long wmark_low = wmark_pages * page_kb;
+
+	long available = mem_free - wmark_low;
+
+	long pagecache = active_file + inactive_file;
+	pagecache -= (pagecache / 2 < wmark_low) ? pagecache / 2 : wmark_low;
+	available += pagecache;
+
+	available += sreclaimable -
+	             ((sreclaimable / 2 < wmark_low) ? sreclaimable / 2 : wmark_low);
+
+	if (available < 0)
+		available = 0;
+	return available;
+}
+
 static int add_meminfo_full(cJSON *root)
 {
 	char *content = read_file_all("/proc/meminfo");
@@ -1626,28 +1712,31 @@ static int add_meminfo_full(cJSON *root)
 	long mem_cached    = meminfo_get_kb(content, "Cached");
 	long swap_total    = meminfo_get_kb(content, "SwapTotal");
 	long swap_free     = meminfo_get_kb(content, "SwapFree");
+
+	/* MemAvailable absent (kernel < 3.14: CentOS 6, CentOS 7.0~7.1). First
+	   reproduce the kernel si_mem_available() formula from /proc/zoneinfo
+	   watermarks + reclaimable pagecache/slab — same algorithm the kernel
+	   uses, so it matches kernels that do export it. Only if that fails
+	   (e.g. /proc/zoneinfo unreadable, missing Active(file)/SReclaimable)
+	   drop to the coarse MemFree+Buffers+Cached estimate. derive_* needs the
+	   meminfo text, so compute before free(). */
+	if (mem_available < 0)
+		mem_available = derive_mem_available_kb(content, mem_free);
+	if (mem_available < 0 && mem_free >= 0 && mem_buffers >= 0 && mem_cached >= 0)
+		mem_available = mem_free + mem_buffers + mem_cached;
+
 	free(content);
 
 	if (mem_total < 0)
 		return 0;
 
 	cJSON_AddNumberToObject(root, "mem_total_kb", (double)mem_total);
-	add_kb_or_null(root, "mem_free_kb",    mem_free);
-	add_kb_or_null(root, "mem_buffers_kb", mem_buffers);
-	add_kb_or_null(root, "mem_cached_kb",  mem_cached);
-	add_kb_or_null(root, "swap_total_kb",  swap_total);
-	add_kb_or_null(root, "swap_free_kb",   swap_free);
-
-	if (mem_available < 0) {
-		/* CentOS 7.0~7.1 fallback: MemFree + Buffers + Cached. */
-		if (mem_free >= 0 && mem_buffers >= 0 && mem_cached >= 0)
-			cJSON_AddNumberToObject(root, "mem_available_kb",
-			                        (double)(mem_free + mem_buffers + mem_cached));
-		else
-			cJSON_AddNullToObject(root, "mem_available_kb");
-	} else {
-		cJSON_AddNumberToObject(root, "mem_available_kb", (double)mem_available);
-	}
+	add_kb_or_null(root, "mem_free_kb",      mem_free);
+	add_kb_or_null(root, "mem_buffers_kb",   mem_buffers);
+	add_kb_or_null(root, "mem_cached_kb",    mem_cached);
+	add_kb_or_null(root, "swap_total_kb",    swap_total);
+	add_kb_or_null(root, "swap_free_kb",     swap_free);
+	add_kb_or_null(root, "mem_available_kb", mem_available);
 	return 1;
 }
 

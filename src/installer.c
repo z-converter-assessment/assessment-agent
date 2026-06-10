@@ -197,20 +197,17 @@ static int run_sh(const char *script, const char *const *envp_extra)
     return -1;
 }
 
-static int must_be_root(const char *cmd)
-{
-    if (geteuid() == 0) return 0;
-    fprintf(stderr, "[%s] must run as root (try: sudo %s ...)\n", cmd, cmd);
-    return -1;
-}
-
 /* ====================================================================
  *  Subcommand entry points
+ *
+ *  No root gate here. The staged shell scripts decide what privilege the
+ *  host actually needs: the systemd path installs entirely under the
+ *  invoking user's home (no root); only the SysV/EL6 fallback — which must
+ *  register an /etc/init.d service — requires root, and install.sh enforces
+ *  that inside its SysV branch.
  * ==================================================================== */
 int installer_run_install(int image_prep)
 {
-    if (must_be_root("install") != 0) return 1;
-
     char self[PATH_MAX];
     if (resolve_self(self, sizeof self) != 0) return 1;
 
@@ -240,8 +237,6 @@ int installer_run_install(int image_prep)
 
 int installer_run_uninstall(int purge)
 {
-    if (must_be_root("uninstall") != 0) return 1;
-
     char bundle[PATH_MAX];
     if (make_bundle(bundle, sizeof bundle) != 0) return 1;
 
@@ -262,8 +257,6 @@ int installer_run_uninstall(int purge)
 
 int installer_run_prep_image(void)
 {
-    if (must_be_root("prep-image") != 0) return 1;
-
     char bundle[PATH_MAX];
     if (make_bundle(bundle, sizeof bundle) != 0) return 1;
 

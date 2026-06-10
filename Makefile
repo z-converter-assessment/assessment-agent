@@ -93,6 +93,7 @@ $(EMBED_DIR)/image-prep.sh:            scripts/image-prep.sh
 $(EMBED_DIR)/detect-os.sh:             deploy/lib/detect-os.sh
 $(EMBED_DIR)/env-setup.sh:             deploy/lib/env-setup.sh
 $(EMBED_DIR)/assessment-agent.service: deploy/systemd/assessment-agent.service
+$(EMBED_DIR)/assessment-agent.sysv:    deploy/sysv/assessment-agent
 $(EMBED_DIR)/agent.env.example:        deploy/systemd/agent.env.example
 
 $(EMBED_DIR):
@@ -108,6 +109,7 @@ EMBED_STAGED := \
     $(EMBED_DIR)/detect-os.sh \
     $(EMBED_DIR)/env-setup.sh \
     $(EMBED_DIR)/assessment-agent.service \
+    $(EMBED_DIR)/assessment-agent.sysv \
     $(EMBED_DIR)/agent.env.example
 
 $(EMBED_OBJ): $(EMBED_STAGED)
@@ -245,27 +247,51 @@ vendor-clean:
 	rm -rf $(VENDOR_DIR)
 
 clean:
-	rm -f $(OBJ) $(BIN) $(TEST_BIN)
+	rm -f $(OBJ) $(BIN) $(LEGACY_BIN) $(TEST_BIN)
 	rm -rf $(EMBED_DIR)
 
 # ----------------------------------------------------------------------
-# verify — manylinux2014 ABI compliance.
+# verify — GLIBC / dyn-dep / forbidden-API ABI compliance.
 #
-# Gates the binary on three things:
-#   1. No GLIBC_2.18+ symbols (build container = glibc 2.17 = CentOS 7).
+# Two profiles, parameterized by the variables below:
+#   modern (default) : manylinux2014 / glibc 2.17 / CentOS 7 baseline.
+#                      Forbids GLIBC_2.18+ symbols.
+#   legacy           : manylinux2010 / glibc 2.12 / CentOS 6 baseline.
+#                      Forbids GLIBC_2.13+ symbols.
+#
+# The verify recipe is a single parameterized body; `verify` (modern) and
+# `verify-legacy` set the knobs and the binary under test. The modern path
+# is byte-for-byte the same checks as before — only the regex moved into a
+# variable whose default reproduces the old GLIBC_2.(1[89]|[2-9][0-9]) match.
+#
+# Gates each binary on three things:
+#   1. No GLIBC symbols above the profile ceiling.
 #   2. Only the documented dynamic deps (whitelist below).
-#   3. No forbidden API symbols (kernel 3.10 / glibc 2.17 ceiling).
+#   3. No forbidden API symbols (kernel/glibc ceiling for the profile).
 #
 # Fail-fast for `make release` (CI calls release, which depends on verify).
 # ----------------------------------------------------------------------
 ALLOWED_DLLS := linux-vdso libc libpthread libdl libm libresolv librt ld-linux-x86-64
 
-verify: $(BIN)
-	@echo "[verify] $(BIN) — manylinux2014 ABI compliance"
-	@bad=$$(objdump -T $(BIN) 2>/dev/null | awk '/GLIBC_/ {print $$5}' \
-	         | grep -E 'GLIBC_2\.(1[89]|[2-9][0-9])' || true); \
-	 if [ -n "$$bad" ]; then echo "[verify] FAIL: GLIBC 2.18+ symbols found (breaks manylinux2014 ABI):"; echo "$$bad"; exit 1; fi
-	@deps=$$(ldd $(BIN) | awk '/=>/ {print $$1} /linux-vdso/ {print $$1}' \
+# --- Profile knobs. Override via `make VERIFY_BIN=... GLIBC_FORBID_RE=... verify`
+#     but normally consumed through verify / verify-legacy below.
+VERIFY_BIN        ?= $(BIN)
+VERIFY_PROFILE    ?= manylinux2014
+# Modern ceiling: glibc 2.17 → forbid 2.18 and any 2.[2-9][0-9].
+GLIBC_FORBID_RE   ?= GLIBC_2\.(1[89]|[2-9][0-9])
+GLIBC_CEILING_MSG ?= GLIBC 2.18+
+# Forbidden APIs introduced after the ceiling. Modern set (post glibc 2.17 /
+# kernel 3.10). Legacy adds more (see verify-legacy) since glibc 2.12 lacks
+# several of these wrappers too.
+FORBID_API_RE     ?=  U (getrandom|statx|memfd_create|renameat2|copy_file_range|pidfd_)
+
+# verify_body — shared recipe (used by both verify and verify-legacy).
+define verify_body
+	@echo "[verify] $(VERIFY_BIN) — $(VERIFY_PROFILE) ABI compliance"
+	@bad=$$(objdump -T $(VERIFY_BIN) 2>/dev/null | awk '/GLIBC_/ {print $$5}' \
+	         | grep -E '$(GLIBC_FORBID_RE)' || true); \
+	 if [ -n "$$bad" ]; then echo "[verify] FAIL: $(GLIBC_CEILING_MSG) symbols found (breaks $(VERIFY_PROFILE) ABI):"; echo "$$bad"; exit 1; fi
+	@deps=$$(ldd $(VERIFY_BIN) | awk '/=>/ {print $$1} /linux-vdso/ {print $$1}' \
 	         | sed -E 's/\.so.*$$//' | sort -u); \
 	 for d in $$deps; do \
 	   case " $(ALLOWED_DLLS) " in *" $$d "*) ;; \
@@ -273,9 +299,25 @@ verify: $(BIN)
 	        echo "[verify]   allowed: $(ALLOWED_DLLS)"; exit 1 ;; \
 	   esac; \
 	 done
-	@bad=$$(nm -D $(BIN) 2>/dev/null | grep -E ' U (getrandom|statx|memfd_create|renameat2|copy_file_range|pidfd_)' || true); \
-	 if [ -n "$$bad" ]; then echo "[verify] FAIL: forbidden APIs (glibc 2.17 / kernel 3.10 ceiling):"; echo "$$bad"; exit 1; fi
-	@echo "[verify] OK: GLIBC 2.17 clean, dyn-dep whitelist matches, no forbidden APIs"
+	@bad=$$(nm -D $(VERIFY_BIN) 2>/dev/null | grep -E '$(FORBID_API_RE)' || true); \
+	 if [ -n "$$bad" ]; then echo "[verify] FAIL: forbidden APIs ($(VERIFY_PROFILE) ceiling):"; echo "$$bad"; exit 1; fi
+	@echo "[verify] OK: $(VERIFY_PROFILE) clean, dyn-dep whitelist matches, no forbidden APIs"
+endef
+
+verify: $(BIN)
+	$(verify_body)
+
+# verify-legacy — manylinux2010 / glibc 2.12 / CentOS 6 ceiling.
+# Forbids GLIBC_2.13+ (i.e. 2.13..2.19 and any 2.[2-9][0-9]). Also forbids a
+# wider API set: secure_getenv (2.17), __ppoll_chk etc. are not present pre
+# 2.12, plus the modern set. Runs against the legacy binary.
+verify-legacy: $(LEGACY_BIN)
+	$(MAKE) verify \
+	  VERIFY_BIN=$(LEGACY_BIN) \
+	  VERIFY_PROFILE=manylinux2010 \
+	  GLIBC_CEILING_MSG="GLIBC 2.13+" \
+	  GLIBC_FORBID_RE='GLIBC_2\.(1[3-9]|[2-9][0-9])' \
+	  FORBID_API_RE=' U (getrandom|statx|memfd_create|renameat2|copy_file_range|pidfd_|secure_getenv|getauxval)'
 
 # ----------------------------------------------------------------------
 # release — produce dist/assessment-agent-linux-x86_64 + SHA256SUMS.
@@ -296,8 +338,49 @@ release: $(BIN) verify
 	@echo "[release] packaged $(DIST_BIN)"
 	@cat $(DIST_DIR)/SHA256SUMS
 
+# ----------------------------------------------------------------------
+# release-legacy — manylinux2010 / glibc 2.12 / CentOS 6 binary.
+#
+# Produces a SEPARATE artifact (assessment-agent-legacy + the abi-tagged
+# dist name) so it never collides with the modern dist/. The build inputs
+# (sources, CFLAGS, vendored static-link set) are identical — only the
+# build HOST differs (older glibc) and the verify ceiling is glibc 2.12.
+# The modern `release` path above is untouched.
+#
+# Usage (from a manylinux2010 build host — glibc 2.12):
+#   docker run --rm -v $(pwd):/src -w /src quay.io/pypa/manylinux2010_x86_64 \
+#       bash -lc 'make vendor-fetch && make vendor-build && \
+#                 make USE_VENDORED=1 release-legacy'
+#
+# manylinux2010 reached EOL upstream; if the image is unavailable, any
+# CentOS 6 / glibc-2.12 toolchain box works — the verify-legacy gate is the
+# real ABI guarantee, not the specific image. USE_VENDORED=1 statically links
+# cJSON/rabbitmq-c/curl/libarchive/OpenSSL/zlib exactly as the modern build,
+# so only the glibc-family libs stay dynamic against the 2.12 baseline.
+#
+# The legacy binary is the one install.sh ships to CentOS/RHEL/Oracle Linux 6
+# (SysV path). See docs/centos6-bringup.md.
+# ----------------------------------------------------------------------
+LEGACY_BIN      := assessment-agent-legacy
+LEGACY_DIST_BIN := $(DIST_DIR)/assessment-agent-linux-x86_64-glibc2.12
+
+# Build the legacy binary from the same objects + embed blob as $(BIN). We
+# depend on $(BIN) so the standard compile runs, then copy it under the legacy
+# name. (The ABI floor is a property of the build HOST's glibc, not of extra
+# compiler flags — so the bytes are identical to $(BIN) on a 2.12 host; the
+# separate name exists so verify-legacy and the dist artifact are unambiguous.)
+$(LEGACY_BIN): $(BIN)
+	cp $(BIN) $(LEGACY_BIN)
+
+release-legacy: $(LEGACY_BIN) verify-legacy
+	@mkdir -p $(DIST_DIR)
+	cp $(LEGACY_BIN) $(LEGACY_DIST_BIN)
+	cd $(DIST_DIR) && sha256sum $(notdir $(LEGACY_DIST_BIN)) >> SHA256SUMS
+	@echo "[release-legacy] packaged $(LEGACY_DIST_BIN)"
+	@cat $(DIST_DIR)/SHA256SUMS
+
 .PHONY: all clean test-unit \
         vendor-fetch vendor-build vendor-clean \
         vendor-build-openssl vendor-build-zlib vendor-build-cjson \
         vendor-build-rabbitmq vendor-build-curl vendor-build-libarchive \
-        verify release
+        verify verify-legacy release release-legacy

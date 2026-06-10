@@ -25,6 +25,7 @@
 #define WIN32_LEAN_AND_MEAN
 
 #include "exec.h"
+#include "util.h"   /* monotonic_ms */
 
 #include <ctype.h>
 #include <stdint.h>
@@ -232,7 +233,7 @@ static int drain_once(HANDLE pipe, tail_buf_t *t)
 
 static long monotonic_ms_since(ULONGLONG t0)
 {
-	return (long)(GetTickCount64() - t0);
+	return (long)(monotonic_ms() - t0);
 }
 
 exec_status_t exec_install(void                *job_handle_in,
@@ -379,7 +380,7 @@ exec_status_t exec_install(void                *job_handle_in,
 	ResumeThread(pi.hThread);
 
 	/* 5. Drain loop + timeout */
-	ULONGLONG t0 = GetTickCount64();
+	ULONGLONG t0 = monotonic_ms();
 	char out_storage[4096];
 	char err_storage[4096];
 	tail_buf_t out_t = { .buf = out_storage, .cap = sizeof out_storage, .len = 0 };
