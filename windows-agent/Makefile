@@ -72,7 +72,14 @@ ifeq ($(PROFILE),legacy)
   # includes <openssl/engine.h> and calls ENGINE_cleanup(). With no-engine the
   # vendored 1.0.2 tree has no engine.h, so the compiler falls back to MSYS2's
   # system OpenSSL 3.x engine.h → macros.h "OPENSSL_API_COMPAT impossible".
-  OPENSSL_CONFIG_OPTS := no-shared no-dso
+  #
+  # GCC 14 promotes several legacy-C warnings to hard ERRORS by default, which
+  # 1.0.2u's engine sources (e.g. engines/e_capi.c: CryptDecrypt / d2i_X509
+  # pointer mismatches) trip. Demote them — Configure forwards bare -W args
+  # into CFLAGS.
+  OPENSSL_CONFIG_OPTS := no-shared no-dso \
+      -Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration \
+      -Wno-error=int-conversion -Wno-error=implicit-int
   # NT 5.2 has no api-ms-win-* umbrella DLLs and bcrypt is runtime-loaded.
   ALLOWED_DLLS        := kernel32|advapi32|user32|ws2_32|iphlpapi|crypt32|secur32|ole32|oleaut32|shell32|msvcrt|ntdll
 else ifeq ($(PROFILE),win7)
