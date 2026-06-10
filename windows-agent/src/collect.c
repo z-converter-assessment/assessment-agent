@@ -53,6 +53,54 @@
  * <windows.h>) since Vista — <psapi.h> not needed. */
 
 /* ============================================================
+ *  NT 5.2 (Server 2003 / XP x64) legacy-API compat
+ *
+ *  The legacy build (PROFILE=legacy, _WIN32_WINNT=0x0502, OpenSSL 1.0.2u)
+ *  predates several APIs this collector uses on Vista+/OpenSSL 1.1+:
+ *    - GetIfTable2 / MIB_IF_ROW2 / FreeMibTable  → GetIfTable / MIB_IFROW
+ *    - inet_ntop                                 → small polyfill below
+ *    - IP_ADAPTER_UNICAST_ADDRESS.OnLinkPrefixLength (no member on XP struct)
+ *    - EVP_MD_CTX_new / _free                    → EVP_MD_CTX_create / _destroy
+ *    - QueryFullProcessImageNameW (+ PROCESS_QUERY_LIMITED_INFORMATION)
+ *  Per the collector contract, fields that cannot be obtained on the legacy
+ *  OS degrade to empty/absent (never an error).
+ * ============================================================ */
+#if defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0600
+#define AGENT_NT6 1
+#else
+#define AGENT_NT6 0
+#endif
+
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+/* OpenSSL < 1.1.0 (legacy 1.0.2u): the *_new/_free names did not exist yet. */
+#define EVP_MD_CTX_new   EVP_MD_CTX_create
+#define EVP_MD_CTX_free  EVP_MD_CTX_destroy
+#endif
+
+#if !AGENT_NT6
+/* inet_ntop is Vista+. Minimal polyfill (uncompressed IPv6 — acceptable for
+ * the display-only ip_internal field; the engine keys on composite_id). */
+static const char *compat_inet_ntop(int af, const void *src, char *dst, size_t size)
+{
+	const unsigned char *b = (const unsigned char *)src;
+	if (af == AF_INET) {
+		snprintf(dst, size, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+		return dst;
+	}
+	if (af == AF_INET6) {
+		snprintf(dst, size, "%x:%x:%x:%x:%x:%x:%x:%x",
+		         (b[0] << 8) | b[1],  (b[2] << 8) | b[3],
+		         (b[4] << 8) | b[5],  (b[6] << 8) | b[7],
+		         (b[8] << 8) | b[9],  (b[10] << 8) | b[11],
+		         (b[12] << 8) | b[13], (b[14] << 8) | b[15]);
+		return dst;
+	}
+	return NULL;
+}
+#define inet_ntop compat_inet_ntop
+#endif
+
+/* ============================================================
  *  Process-lifetime cached timestamps (boot_time, agent_started_at)
  * ============================================================ */
 static char g_boot_time_iso[32]      = {0};
@@ -449,6 +497,7 @@ static cJSON *enumerate_disk_io(void)
 /* ============================================================
  *  Network IO (GetIfTable2)
  * ============================================================ */
+#if AGENT_NT6
 static cJSON *enumerate_net_io(void)
 {
 	cJSON *arr = cJSON_CreateArray();
@@ -475,6 +524,39 @@ static cJSON *enumerate_net_io(void)
 	FreeMibTable(table);
 	return arr;
 }
+#else
+/* NT 5.2 fallback: GetIfTable2 / MIB_IF_ROW2 / FreeMibTable are Vista+. The
+ * classic GetIfTable / MIB_IFROW (NT4+) exposes 32-bit counters — sufficient
+ * for the wire format (engine handles counter wrap). */
+static cJSON *enumerate_net_io(void)
+{
+	cJSON *arr = cJSON_CreateArray();
+	ULONG sz = 0;
+	if (GetIfTable(NULL, &sz, FALSE) != ERROR_INSUFFICIENT_BUFFER) return arr;
+	MIB_IFTABLE *t = (MIB_IFTABLE *)malloc(sz);
+	if (!t) return arr;
+	if (GetIfTable(t, &sz, FALSE) != NO_ERROR) { free(t); return arr; }
+	for (DWORD i = 0; i < t->dwNumEntries; i++) {
+		MIB_IFROW *r = &t->table[i];
+		if (r->dwType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+
+		char name[256];
+		WideCharToMultiByte(CP_UTF8, 0, r->wszName, -1, name, sizeof name, NULL, NULL);
+
+		cJSON *o = cJSON_CreateObject();
+		cJSON_AddStringToObject(o, "interface", name);
+		cJSON_AddNumberToObject(o, "rx_bytes",   (double)r->dwInOctets);
+		cJSON_AddNumberToObject(o, "tx_bytes",   (double)r->dwOutOctets);
+		cJSON_AddNumberToObject(o, "rx_packets", (double)((double)r->dwInUcastPkts + r->dwInNUcastPkts));
+		cJSON_AddNumberToObject(o, "tx_packets", (double)((double)r->dwOutUcastPkts + r->dwOutNUcastPkts));
+		cJSON_AddNumberToObject(o, "rx_errors",  (double)r->dwInErrors);
+		cJSON_AddNumberToObject(o, "tx_errors",  (double)r->dwOutErrors);
+		cJSON_AddItemToArray(arr, o);
+	}
+	free(t);
+	return arr;
+}
+#endif
 
 /* ============================================================
  *  IP addresses + MAC addresses (GetAdaptersAddresses, single pass)
@@ -528,11 +610,18 @@ static void fill_network_info(cJSON *inv)
 				inet_ntop(AF_INET6, &sa->sin6_addr, ip, sizeof ip);
 			}
 			if (!ip[0]) continue;
+			char cidr[INET6_ADDRSTRLEN + 5];
+#if AGENT_NT6
 			/* CIDR: "<ip>/<prefix>" — OnLinkPrefixLength is supplied by
 			 * GetAdaptersAddresses (Vista+). Buffer fits IPv6 + "/128". */
-			char cidr[INET6_ADDRSTRLEN + 5];
 			snprintf(cidr, sizeof cidr, "%s/%u", ip,
 				(unsigned)u->OnLinkPrefixLength);
+#else
+			/* NT 5.2: IP_ADAPTER_UNICAST_ADDRESS_XP has no OnLinkPrefixLength.
+			 * Emit the bare IP (no prefix) — ip_internal is display-only; the
+			 * engine keys hosts on composite_id. */
+			snprintf(cidr, sizeof cidr, "%s", ip);
+#endif
 			cJSON_AddItemToArray(ips, cJSON_CreateString(cidr));
 		}
 
@@ -889,6 +978,7 @@ static void fill_comm_for_pid(DWORD pid, char *out, size_t out_sz)
 {
 	out[0] = '\0';
 	if (pid == 0) return;
+#if AGENT_NT6
 	HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
 	if (!hp) return;
 	wchar_t wname[1024];
@@ -901,6 +991,11 @@ static void fill_comm_for_pid(DWORD pid, char *out, size_t out_sz)
 		if (dot && _stricmp(dot, ".exe") == 0) *dot = '\0';
 	}
 	CloseHandle(hp);
+#else
+	/* NT 5.2: QueryFullProcessImageNameW + PROCESS_QUERY_LIMITED_INFORMATION
+	 * are Vista+. comm is nullable by contract — leave empty on legacy. */
+	(void)pid; (void)out_sz;
+#endif
 }
 
 static void add_listen_entry(cJSON *arr, const char *proto, const char *addr,
