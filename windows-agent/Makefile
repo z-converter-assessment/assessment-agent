@@ -68,7 +68,11 @@ ifeq ($(PROFILE),legacy)
   BIN                 := assessment-agent-legacy.exe
   BCRYPT_LIB          :=
   # OpenSSL 1.0.2 Configure has no `no-tests` option.
-  OPENSSL_CONFIG_OPTS := no-shared no-dso no-engine
+  # KEEP engine support (no `no-engine`): rabbitmq-c v0.10.0's amqp_openssl.c
+  # includes <openssl/engine.h> and calls ENGINE_cleanup(). With no-engine the
+  # vendored 1.0.2 tree has no engine.h, so the compiler falls back to MSYS2's
+  # system OpenSSL 3.x engine.h → macros.h "OPENSSL_API_COMPAT impossible".
+  OPENSSL_CONFIG_OPTS := no-shared no-dso
   # NT 5.2 has no api-ms-win-* umbrella DLLs and bcrypt is runtime-loaded.
   ALLOWED_DLLS        := kernel32|advapi32|user32|ws2_32|iphlpapi|crypt32|secur32|ole32|oleaut32|shell32|msvcrt|ntdll
 else ifeq ($(PROFILE),win7)
