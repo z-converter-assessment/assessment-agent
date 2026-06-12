@@ -1,5 +1,7 @@
 # assessment-agent
 
+> 시스템 전체 그림·레포 간 계약·재구현 가이드: [assessment-docs](https://github.com/z-converter-assessment/assessment-docs) · 이 레포 구현 문서: [`docs/README.md`](docs/README.md)
+
 AI 기반 Assessment 서비스의 **데이터 수집 에이전트**.
 
 고객 서버(상용 클라우드 VM)에서 정적 인벤토리와 리소스 메트릭을 자동 수집하여 RabbitMQ를 통해 중앙 분석 서버(`assessment-engine`)로 전송합니다.
