@@ -37,7 +37,7 @@ AI 기반 Assessment 서비스의 **데이터 수집 에이전트**.
 
 ## 핵심 설계 원칙
 
-1. **No-Execution.** 에이전트는 수집·전송만 수행하며 대상 서버에 어떠한 변경도 가하지 않습니다.
+1. **Restricted execution.** 수집은 `/proc`·`/sys` 순수 read. 실행은 portal이 발행한 `task.install` 채널 한정이며, 비특권 user + `clearenv` + `setrlimit` + sandbox 디렉토리로 격리합니다 (초기 No-Execution 원칙은 worker 도입 시 의도적으로 폐기 — payload v3.2 이력 참조). 그 외 부수효과 없음 — 패키지·서비스·자기 바이너리를 임의로 건드리지 않습니다.
 2. **Stateless.** 직전 tick / 카운터를 보관하지 않습니다. `/proc` 누적값을 그대로 publish 합니다.
 3. **Raw values only.** `avg`, `pct`, `iops_per_second` 등 2차 가공값은 보내지 않습니다. delta·비율 계산은 분석 엔진 책임입니다.
 4. **Single normalized schema.** OS·버전 차이는 에이전트 내부 collector가 분기 처리하고, 전송 페이로드는 단일 스키마입니다.
@@ -107,7 +107,7 @@ AI 기반 Assessment 서비스의 **데이터 수집 에이전트**.
 [고객 서버]                    [브로커]                    [분석 Engine]
  Agent (Producer)   →    RabbitMQ (AMQPS 5671)   →    assessment-engine
  - /proc / /sys / syscall      - vhost: /assessment            - consumer + web
- - JSON 직렬화                 - Exchange: assessment (direct) - DB upsert (machine_id)
+ - JSON 직렬화                 - Exchange: assessment (direct) - DB upsert (composite_id)
  - Publish (durable, persistent) - Queues: server.{inv,met,err}  - 시계열 분석
                                - DLX: assessment.dlx           - PDF 리포트 생성
           │                                                │
@@ -154,7 +154,7 @@ DLX(`assessment.dlx`)는 컨슈머 측 NAK / TTL 만료 / 큐 길이 초과 시 
 | `/proc/net/dev` | 인터페이스별 누적 RX/TX (`net_io[]`) |
 | `/proc/loadavg` | 1m / 5m / 15m 로드 평균 |
 | `/proc/cpuinfo` | CPU 모델 |
-| `/proc/uptime` | 부팅 시각 (시계열 단절 감지) |
+| `/proc/stat`의 `btime` | 부팅 시각 (시계열 단절 감지 — 프로세스 시작 시 1회 캐시, v3.4에서 `/proc/uptime` 산출 대체) |
 | `/etc/os-release` | OS id / version / codename |
 | `/etc/machine-id` | 서버 불변 식별자 (fallback: `dbus-uuidgen` → IMDS instance-id) |
 | `lsblk -dn -b -J` | 디스크 목록 |

@@ -13,7 +13,8 @@
  *   4. loop: `metrics` every AGENT_INTERVAL_SEC, `inventory` republish every
  *      AGENT_INVENTORY_REFRESH_SEC ±15% jitter
  *
- * v1 한정: worker (task.install) 없음.
+ * worker (task.install): RABBITMQ_WORKER_USER 설정 시 활성 — install thread
+ * 모델 (Linux fork 모델의 포팅, worker.c 참조).
  */
 
 #include "collect.h"

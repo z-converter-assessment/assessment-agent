@@ -31,7 +31,7 @@ typedef struct worker_ctx_s worker_ctx_t;
 
 typedef struct {
 	publish_config_t amqp;                /* AMQP target + worker creds */
-	const char      *queue_name;          /* e.g. "agent.tasks.<machine_id>" */
+	const char      *queue_name;          /* e.g. "agent.tasks.<composite_id>" */
 	const char      *result_routing_key;  /* e.g. "task.result" */
 	const char      *machine_id;
 	const char      *agent_version;
