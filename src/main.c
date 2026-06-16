@@ -316,13 +316,18 @@ int main(int argc, char **argv)
 
 	char *machine_id = resolve_machine_id();
 	if (!machine_id) {
-		fprintf(stderr, "[agent] machine_id resolution failed (no /etc/machine-id, "
-		                "no dbus-uuidgen, no IMDS). Cannot identify host.\n");
-		emit_error(&cfg, NULL,
-		           "MACHINE_ID_UNRESOLVED",
-		           "no /etc/machine-id, no dbus-uuidgen, no IMDS instance-id",
-		           "collect", -1, NULL, NULL);
-		return 2;
+		/* machine_id is display-only — the canonical host key is composite_id =
+		 * sha256(machine_id + "\n" + sorted MACs), which stays stable from the
+		 * MAC set even when machine_id is empty. Pre-systemd hosts (CentOS/RHEL
+		 * 6) often have no /etc/machine-id and no dbus-uuidgen, and on-prem boxes
+		 * have no IMDS — that is NOT fatal and NOT a server.error (optional source
+		 * absent). Continue with an empty machine_id; the engine keys on
+		 * composite_id. */
+		fprintf(stderr, "[agent] machine_id unresolved (no /etc/machine-id, no "
+		                "dbus-uuidgen, no IMDS) — continuing; composite_id is "
+		                "derived from MAC addresses (machine_id is display-only).\n");
+		machine_id = strdup("");
+		if (!machine_id) return 2;   /* OOM only */
 	}
 	fprintf(stderr, "[agent] machine_id=%s\n", machine_id);
 

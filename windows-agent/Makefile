@@ -30,13 +30,22 @@ JOBS    ?= 4
 #   PROFILE=win7             : NT 6.1–6.3 — Server 2008R2 / 2012 / 2012R2,
 #                              Win7/8/8.1. OpenSSL 3.x (still supports Win7),
 #                              only the API ceiling drops to 0x0601.
-#   PROFILE=legacy           : NT 5.2 — Server 2003 / XP x64. OpenSSL 1.0.2u
-#                              (last XP-capable LTS), 0x0502, bcrypt dropped
-#                              from the import table.
+#   PROFILE=legacy           : NT 5.2, **x86_64** — Server 2003 x64 Edition /
+#                              XP x64. OpenSSL 1.0.2u (last XP-capable LTS),
+#                              0x0502, bcrypt dropped from the import table.
+#   PROFILE=legacy32         : NT 5.2, **i686 (32-bit)** — Server 2003 x86 (the
+#                              common SKU; the x64 Edition was rare) / XP. Same
+#                              OpenSSL 1.0.2u + NT 5.2 ceiling as legacy; only
+#                              the target arch (i686 toolchain + OpenSSL `mingw`
+#                              target) differs. WITHOUT this the bulk of the real
+#                              2003 fleet (32-bit) has no installable binary.
 #
-#   make PROFILE=win7   vendor-build && make PROFILE=win7   release
-#   make PROFILE=legacy vendor-build && make PROFILE=legacy release
+#   make PROFILE=win7     vendor-build && make PROFILE=win7     release
+#   make PROFILE=legacy   vendor-build && make PROFILE=legacy   release
+#   make PROFILE=legacy32 vendor-build && make PROFILE=legacy32 release
 #   (LEGACY=1 is kept as a backward-compatible alias for PROFILE=legacy.)
+#   NOTE: legacy and legacy32 share the vendor/ tree at different ABIs — run
+#   `make vendor-clean` when switching between an x64 and an x86 build.
 #
 # The C code is identical across profiles: GetTickCount64 / BCryptGenRandom
 # are resolved at runtime (monotonic_ms / compat_rand_bytes), so a lower
@@ -93,6 +102,32 @@ ifeq ($(PROFILE),legacy)
   VENDOR_CFLAGS       := -D_WIN32_WINNT=0x0502 -DWINVER=0x0502
   # NT 5.2 has no api-ms-win-* umbrella DLLs and bcrypt is runtime-loaded.
   # gdi32 ships on every Windows incl. Server 2003.
+  ALLOWED_DLLS        := kernel32|advapi32|user32|gdi32|ws2_32|iphlpapi|crypt32|secur32|ole32|oleaut32|shell32|msvcrt|ntdll
+else ifeq ($(PROFILE),legacy32)
+  # legacy32 = legacy(NT 5.2) but **32-bit (i686)**. The mass-market Server 2003
+  # SKU is x86; the x64 Edition was rare. The legacy(x64) binary above never
+  # loads on those hosts, so without this profile "we target 2003" is unmet.
+  # Identical NT 5.2 ceiling, OpenSSL 1.0.2u and curl/rabbitmq pins as legacy —
+  # ONLY the architecture changes: i686 toolchain + the OpenSSL `mingw` (32-bit)
+  # target. Cross-built from an x64 host; override CC/AR/WINDRES/OPENSSL_CROSS
+  # if you build inside a native mingw32 shell. Like legacy, it needs an OLDER
+  # MinGW-w64 (i686) that still emits NT 5.2 startup code.
+  CC                  := i686-w64-mingw32-gcc
+  AR                  := i686-w64-mingw32-ar
+  WINDRES             := i686-w64-mingw32-windres
+  OPENSSL_TARGET      := mingw
+  OPENSSL_CROSS       := --cross-compile-prefix=i686-w64-mingw32-
+  WINNT_VER           := 0x0502
+  OPENSSL_VERSION     ?= OpenSSL_1_0_2u
+  CURL_VERSION        ?= curl-8_10_1
+  RABBITMQ_C_VERSION  ?= v0.10.0
+  BIN                 := assessment-agent-legacy-x86.exe
+  BCRYPT_LIB          :=
+  OPENSSL_CONFIG_OPTS := no-shared no-dso \
+      -Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration \
+      -Wno-error=int-conversion -Wno-error=implicit-int
+  EXTRA_SYS_LIBS      := -lgdi32
+  VENDOR_CFLAGS       := -D_WIN32_WINNT=0x0502 -DWINVER=0x0502
   ALLOWED_DLLS        := kernel32|advapi32|user32|gdi32|ws2_32|iphlpapi|crypt32|secur32|ole32|oleaut32|shell32|msvcrt|ntdll
 else ifeq ($(PROFILE),win7)
   WINNT_VER           := 0x0601

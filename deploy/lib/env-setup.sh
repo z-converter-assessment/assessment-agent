@@ -196,9 +196,15 @@ for key in $SECRET_KEYS; do
 done
 if [ "$wrote_secrets" = "1" ]; then
 	if [ "$(id -u)" -eq 0 ] && id assessment-agent >/dev/null 2>&1; then
-		install -o root -g assessment-agent -m 0600 "$TMP_LOCAL" "$LOCAL"
+		# 0640 group-read (NOT 0600): the SysV system install runs the agent as
+		# the unprivileged assessment-agent user, which must read these secrets
+		# (RABBITMQ_PASS/…). Owner root:rw, group assessment-agent:r. With 0600
+		# the daemon user got an empty password → broker login refused.
+		install -o root -g assessment-agent -m 0640 "$TMP_LOCAL" "$LOCAL"
+		printf '[env-setup] wrote %s (mode 0640, group assessment-agent)\n' "$LOCAL" >&2
 	else
+		# User-level install: owner IS the agent user, so 0600 owner-read is enough.
 		install -m 0600 "$TMP_LOCAL" "$LOCAL"
+		printf '[env-setup] wrote %s (mode 0600)\n' "$LOCAL" >&2
 	fi
-	printf '[env-setup] wrote %s (mode 0600)\n' "$LOCAL" >&2
 fi

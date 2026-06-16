@@ -93,10 +93,21 @@ start() {
 	printf 'Starting %s: ' "$PROG"
 	load_env
 
-	# Launch as the non-privileged RUNAS user, detached, stdout/stderr to a
-	# log file (no journald on SysV hosts). `su -s /bin/sh` works even though
-	# the account's login shell is /usr/sbin/nologin.
-	su -s /bin/sh - "$RUNAS" -c "exec $EXEC >> $LOGFILE 2>&1 &" >/dev/null 2>&1
+	# /var/log is root-owned, so the unprivileged RUNAS shell cannot create the
+	# log file itself — the `>> $LOGFILE` redirection (run AS that user) would
+	# fail with EACCES and abort start. Create it as root and hand ownership to
+	# RUNAS so the append succeeds on every start.
+	touch "$LOGFILE" 2>/dev/null || true
+	chown "$RUNAS" "$LOGFILE" 2>/dev/null || true
+	chmod 0640 "$LOGFILE" 2>/dev/null || true
+
+	# Launch as the non-privileged RUNAS user, detached, stdout/stderr to the
+	# log file (no journald on SysV hosts). `su -s /bin/sh` overrides the
+	# account's nologin shell. NOTE: NO login dash (`-`) — a login shell resets
+	# the environment, which would discard the RABBITMQ_*/WORKER_* vars that
+	# load_env just exported (incl. the broker password from agent.env.local),
+	# leaving the daemon with an empty password → broker login refused.
+	su -s /bin/sh "$RUNAS" -c "exec $EXEC >> $LOGFILE 2>&1 &" >/dev/null 2>&1
 
 	# su backgrounds inside the subshell, so capture the new pid by name.
 	# Give it a moment to fork+exec, then resolve the pid.

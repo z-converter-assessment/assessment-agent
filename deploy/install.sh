@@ -184,6 +184,18 @@ install_user_systemd() {
 	fi
 	sh "$SCRIPT_DIR/lib/env-setup.sh" "$ENV_EXAMPLE" "$ENV_FILE" "$ENV_LOCAL"
 
+	# agent.env.example ships WORKER_STATE_DIR=/var/lib/agent-worker — the SysV
+	# system path. A user-level agent cannot write there, so worker_init() fails
+	# and the worker silently stays off (collector-only). Rewrite it to this
+	# user's own writable state dir so the value the installer lays down is
+	# correct on its own, not only when the unit's %S override happens to apply.
+	# (WORKER_TMP_DIR stays /tmp — every user can write there.)
+	tmp_env=$(mktemp)
+	sed "s|^[[:space:]]*WORKER_STATE_DIR=.*|WORKER_STATE_DIR=$STATE_DIR|" "$ENV_FILE" > "$tmp_env"
+	install -m 0640 "$tmp_env" "$ENV_FILE"
+	rm -f "$tmp_env"
+	echo "[install] worker state: $STATE_DIR"
+
 	systemctl --user daemon-reload
 
 	# Boot-without-login: enable lingering. On most distros a user may enable
