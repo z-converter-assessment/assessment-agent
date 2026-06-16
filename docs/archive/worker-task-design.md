@@ -1,6 +1,9 @@
 # Worker (task.install) 설계 노트
 
-> **상태**: 설계 단계 (구현 시작 전).
+> **상태**: Superseded — 구현 완료. 현행 문서는 [`../architecture/worker.md`](../architecture/worker.md), 스키마는 [`../payload-schema.md`](../payload-schema.md) v3.2+.
+> 아래는 구현 전 의사결정 기록 원문 그대로 (역사 자료 — 인용 금지).
+
+> **상태(원문)**: 설계 단계 (구현 시작 전).
 > 이 문서는 다음 작업 세션에서 바로 이어받기 위한 핸드오프 노트입니다.
 > 정식 스키마가 확정되면 `docs/payload-schema.md`에 통합합니다.
 

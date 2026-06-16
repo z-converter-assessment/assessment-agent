@@ -139,7 +139,7 @@ Exchange: `assessment` (**direct**, durable). Delivery mode: persistent (2). Vho
 
 Common metadata (every message): `message_type`, `machine_id`, `agent_version`, `collected_at` (ISO 8601 UTC), `hostname`, `message_id` (UUID v4), `boot_time` (ISO 8601 UTC, nullable), `agent_started_at` (ISO 8601 UTC).
 
-`machine_id` is the canonical server identifier (read from `/etc/machine-id`). When the file is empty (containers, custom images), the agent falls back to `dbus-uuidgen --get`, then to the cloud IMDS instance-id. `hostname` is captured for human readability but **must not** be used as a primary key by the engine.
+`composite_id` is the canonical host identifier (payload v4): `sha256(machine_id + "\n" + sorted·lowercase·dedup MACs)`, computed once per process and shared by both OS agents. `machine_id` is display/debug-only (read from `/etc/machine-id`; falls back to `dbus-uuidgen --get`, then the cloud IMDS instance-id). `hostname` is captured for human readability but **must not** be used as a primary key by the engine.
 
 `boot_time` and `agent_started_at` carry distinct responsibilities and **must not be confused**:
 
@@ -210,15 +210,15 @@ DLX: assessment.dlx              (direct, durable)
   └── server.error            → queue: server.error.dead
 
 Exchange: assessment.tasks       (direct, durable)
-  ├── task.install.<m1>       → queue: agent.tasks.<m1>      (durable, DLX-bound, x-message-ttl=1h, x-max-length=100, x-overflow=reject-publish)
-  ├── task.install.<m2>       → queue: agent.tasks.<m2>      (...)
+  ├── task.install.<cid1>     → queue: agent.tasks.<cid1>    (durable, x-message-ttl=1h, x-max-length=100, x-overflow=reject-publish)
+  ├── task.install.<cid2>     → queue: agent.tasks.<cid2>    (... — <cid> = composite_id, payload v4)
   └── task.result             → queue: worker.result          (portal consumes)
 
 DLX: assessment.tasks.dlx        (direct, durable)
   └── task.install.*          → queue: assessment.tasks.dead (durable, x-message-ttl=7d)
 ```
 
-The agent publishes to `assessment` (inventory/metrics/error) and `assessment.tasks` (task.result), and consumes from its own `agent.tasks.<machine_id>` queue via `basic_get`. Exchange + DLX declarations are owned by the engine (run once with `topology-admin`). The per-machine `agent.tasks.<machine_id>` queue is declared by the **portal** when it first registers a new machine.
+The agent publishes to `assessment` (inventory/metrics/error) and `assessment.tasks` (task.result), and consumes from its own `agent.tasks.<composite_id>` queue via `basic_get`. Exchange + DLX declarations are owned by the engine (run once with `topology-admin`). The per-machine `agent.tasks.<composite_id>` queue is declared dynamically by the **engine (web)** at task-publish time (idempotent); the agent builds the same queue name from its own `composite_id` so it always matches the routing key.
 
 ### Permissions Model (least privilege)
 
@@ -233,7 +233,7 @@ The agent publishes to `assessment` (inventory/metrics/error) and `assessment.ta
 | `topology-admin` | `^(assessment(\.tasks)?(\.dlx)?\|server\..*\|worker\.result\|assessment\.tasks\.dead)$` | `^(assessment(\.tasks)?(\.dlx)?\|server\..*\|worker\.result\|assessment\.tasks\.dead)$` | `^(server\..*\|agent\.tasks\..*\|worker\.result)$` | one-shot bootstrap |
 | `monitor-readonly` | `^$` | `^$` | `^$` | management UI (`monitoring` tag) |
 
-The agent ships with two credentials: `agent-publisher` (collector connection) and `agent-worker` (worker connection — CM2 model: separate AMQP connections per role). `agent-worker` is a single shared credential across the fleet, so the read scope is the wildcard `^agent\.tasks\..*$` — a malicious agent could theoretically subscribe to another machine's queue, but machine_ids are UUIDs from `/etc/machine-id` so guessing is impractical. For stricter isolation, fleet provisioning may issue per-machine credentials.
+The agent ships with two credentials: `agent-publisher` (collector connection) and `agent-worker` (worker connection — CM2 model: separate AMQP connections per role). `agent-worker` is a single shared credential across the fleet, so the read scope is the wildcard `^agent\.tasks\..*$` — a malicious agent could theoretically subscribe to another machine's queue, but queue names are sha256 composite_ids so guessing is impractical. For stricter isolation, fleet provisioning may issue per-machine credentials.
 
 ### TLS
 
@@ -285,7 +285,7 @@ This repo does **not** bundle a broker. To exercise the agent locally, the opera
 | `WORKER_DISK_RESERVE_MB` | `50` | required free space margin on `WORKER_TMP_DIR` above `download.size_bytes` before download starts |
 | `WORKER_INSTALL_MEM_LIMIT_MB` | `2048` | `RLIMIT_AS` applied to `install.sh` (address-space cap) |
 | `WORKER_INSTALL_FSIZE_LIMIT_MB` | `5120` | `RLIMIT_FSIZE` applied to `install.sh` (max file size) |
-| `WORKER_TASK_QUEUE_PREFIX` | `agent.tasks` | queue name prefix; agent consumes `<prefix>.<machine_id>` |
+| `WORKER_TASK_QUEUE_PREFIX` | `agent.tasks` | queue name prefix; agent consumes `<prefix>.<composite_id>` (payload v4) |
 | `WORKER_TASK_EXCHANGE` | `assessment.tasks` | exchange to which task.result is published |
 | `WORKER_TASK_RESULT_KEY` | `task.result` | routing key for task.result |
 
@@ -304,12 +304,12 @@ The worker consumes `task.install` messages from a per-machine queue, executes a
                                                  │ assessment-portal    │
                                                  │ (publisher / consumer)
                                                  └──────────┬───────────┘
-                                                            │ publishes task.install.<machine_id>
+                                                            │ publishes task.install.<composite_id>
                                                             ▼
         ┌──────────────────────[assessment.tasks (direct exchange)]──────────────────────┐
         │                                                                                 │
-        │   task.install.<m1> → agent.tasks.<m1>   (TTL 1h, max 100, reject-publish, DLX) │
-        │   task.install.<m2> → agent.tasks.<m2>   (...)                                  │
+        │   task.install.<cid1> → agent.tasks.<cid1> (TTL 1h, max 100, reject-publish)    │
+        │   task.install.<cid2> → agent.tasks.<cid2> (... <cid> = composite_id, v4)       │
         │   task.result       → worker.result      (portal consumes)                      │
         │                                                                                 │
         └────────────────┬────────────────────────────────────────────────────────────────┘
@@ -318,7 +318,7 @@ The worker consumes `task.install` messages from a per-machine queue, executes a
             ┌─────────────────────────────────────────────┐
             │  agent parent process (single thread)        │
             │   tick: collect/publish metrics →            │
-            │         if idle: basic_get(agent.tasks.<m>)  │
+            │         if idle: basic_get(agent.tasks.<cid>)│
             │         if got task: fork() child            │
             │         reap any finished child →            │
             │           read /var/lib/agent-worker/results/│
