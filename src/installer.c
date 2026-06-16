@@ -10,7 +10,8 @@
  *     ├── uninstall.sh
  *     ├── image-prep.sh
  *     ├── lib/{detect-os,env-setup}.sh
- *     └── systemd/{assessment-agent.service,agent.env.example}
+ *     ├── systemd/{assessment-agent.service,agent.env.example}
+ *     └── sysv/assessment-agent          (EL6 / pre-systemd init script)
  *
  * Then execs /bin/sh against the chosen entry point with INSTALLER_SELF_PATH
  * pointing at /proc/self/exe so install.sh can install our own binary
@@ -52,6 +53,7 @@ DECL_EMBED(image_prep_sh)
 DECL_EMBED(detect_os_sh)
 DECL_EMBED(env_setup_sh)
 DECL_EMBED(assessment_agent_service)
+DECL_EMBED(assessment_agent_sysv)
 DECL_EMBED(agent_env_example)
 
 #define EMBED_PTR(sym) (_binary_##sym##_start)
@@ -128,6 +130,8 @@ static int make_bundle(char *out_path, size_t cap)
     if (mkdir(sub, 0700) != 0) goto fail;
     snprintf(sub, sizeof sub, "%s/systemd", dir);
     if (mkdir(sub, 0700) != 0) goto fail;
+    snprintf(sub, sizeof sub, "%s/sysv", dir);
+    if (mkdir(sub, 0700) != 0) goto fail;
 
     struct { const char *rel; const char *data; size_t len; mode_t mode; } files[] = {
         { "install.sh",                       EMBED_PTR(install_sh),               EMBED_LEN(install_sh),               0700 },
@@ -137,6 +141,7 @@ static int make_bundle(char *out_path, size_t cap)
         { "lib/env-setup.sh",                 EMBED_PTR(env_setup_sh),             EMBED_LEN(env_setup_sh),             0600 },
         { "systemd/assessment-agent.service", EMBED_PTR(assessment_agent_service), EMBED_LEN(assessment_agent_service), 0600 },
         { "systemd/agent.env.example",        EMBED_PTR(agent_env_example),        EMBED_LEN(agent_env_example),        0600 },
+        { "sysv/assessment-agent",            EMBED_PTR(assessment_agent_sysv),    EMBED_LEN(assessment_agent_sysv),    0700 },
     };
     for (size_t i = 0; i < sizeof files / sizeof *files; i++) {
         char full[PATH_MAX];
