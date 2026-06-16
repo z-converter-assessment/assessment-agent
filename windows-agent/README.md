@@ -10,13 +10,16 @@ publish + task.install consumer (v2 — `direct_exec` / `msi`) 모두 지원.
 
 ## 지원 환경
 
-- **OS**: Windows 10 (1809+) / Windows Server 2016 이상 (NT 10.0+)
-- **아키텍처**: x86_64
+- **OS**: Windows 10 (1809+) / Windows Server 2016 이상 (NT 10.0+) — `modern` 프로파일
+- **아키텍처**: x86_64 (`modern` / `win7` / `legacy`), **x86 32-bit (`legacy32`)**
+  - 32-bit 은 NT 5.2 전용 — Server 2003 의 일반 SKU(x86)는 `legacy32` 로만 설치 가능.
+    `legacy`(x64) 바이너리는 32-bit 호스트에 아예 로드되지 않는다.
 - **권한**: Service 등록은 Administrator. Service runtime 계정은 LocalSystem (기본 —
   `install.ps1` 가 `New-Service` 로 등록 시 default)
 
-비활성 환경 (Server 2012 R2 / Windows 7 등) 은 SCM API / TLS / SHA256 표면 차이로
-빌드는 가능해도 runtime 호환 보장 안 함.
+구세대(Server 2012 R2 / Windows 7 → `win7`, Server 2003 / XP → `legacy`·`legacy32`)
+는 SCM API / TLS / SHA256 표면 차이로 빌드는 가능해도 runtime 호환 보장 안 함 —
+프로파일·검증 절차는 `docs/win2003-bringup.md` 참조.
 
 ---
 
