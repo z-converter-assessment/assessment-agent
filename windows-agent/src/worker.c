@@ -72,6 +72,8 @@ typedef struct {
 	int           disk_reserve_mb;
 	const char   *machine_id;
 	const char   *agent_version;
+	char        **install_args;    /* install.args 복제 — NULL-terminated. exec_install argv_extra 로 전달.
+	                                  thread 가 주소공간 공유 → 각 문자열 strdup 필수 (task JSON free 후 UAF 방지). */
 } install_thread_arg_t;
 
 struct worker_ctx_s {
@@ -533,6 +535,14 @@ static int worker_download_cancel_cb(void *user)
 	return stop_requested();
 }
 
+/* install_args (NULL-terminated, 각 원소 strdup) 해제. */
+static void free_install_args(char **args)
+{
+	if (!args) return;
+	for (int i = 0; args[i]; i++) free(args[i]);
+	free(args);
+}
+
 static unsigned __stdcall install_thread_main(void *arg)
 {
 	install_thread_arg_t *a = (install_thread_arg_t *)arg;
@@ -553,7 +563,7 @@ static unsigned __stdcall install_thread_main(void *arg)
 
 	if (ds == DOWNLOAD_OK) {
 		xs = exec_install((void *)a->job, a->install_type,
-		                  a->work_dir, a->target_file, NULL,
+		                  a->work_dir, a->target_file, (const char **)a->install_args,
 		                  a->timeout_sec, a->mem_limit_mb, a->fsize_limit_mb,
 		                  a->active_proc_limit, a->task_id, a->machine_id, &er);
 	}
@@ -621,6 +631,7 @@ static unsigned __stdcall install_thread_main(void *arg)
 	free(a->task_id);    free(a->url);         free(a->sha256);
 	free(a->work_dir);   free(a->target_file); free(a->result_path);
 	free(a->running_marker_path);
+	free_install_args(a->install_args);
 	free(a);
 	return 0;
 }
@@ -820,6 +831,26 @@ static int spawn_install(worker_ctx_t *ctx, cJSON *task)
 	a->machine_id        = ctx->cfg.machine_id;
 	a->agent_version     = ctx->cfg.agent_version;
 
+	/* install.args 파싱 — direct_exec 패키지(NSIS)에 -s/-u 등 인자 전달.
+	 * Linux worker 는 fork 라 valuestring 참조로 충분하지만, Windows 는 install thread 가
+	 * 부모와 주소공간을 공유하므로 각 문자열을 strdup 으로 복제한다(task JSON free 후 UAF 방지).
+	 * NULL-terminated → exec_install 의 argv_extra 로 그대로 전달. msi 타입은 exec.c 에서 무시. */
+	{
+		const cJSON *ja = cJSON_IsObject(jinstall)
+			? cJSON_GetObjectItemCaseSensitive(jinstall, "args") : NULL;
+		if (cJSON_IsArray(ja)) {
+			int n = cJSON_GetArraySize(ja);
+			a->install_args = (char **)calloc((size_t)n + 1, sizeof(char *));
+			if (a->install_args) {
+				int k = 0;
+				for (int i = 0; i < n; i++) {
+					const cJSON *e = cJSON_GetArrayItem(ja, i);
+					if (cJSON_IsString(e)) a->install_args[k++] = _strdup(e->valuestring);
+				}
+			}
+		}
+	}
+
 	char work[1024], target[1024], res[1024], run[1024];
 	snprintf(work,   sizeof work,   "%s\\agent-task-%s", ctx->cfg.tmp_dir, task_id);
 	const char *ext = (install_type == EXEC_INSTALL_TYPE_MSI) ? "msi" : "exe";
@@ -836,6 +867,7 @@ static int spawn_install(worker_ctx_t *ctx, cJSON *task)
 		free(a->task_id); free(a->url); free(a->sha256);
 		free(a->work_dir); free(a->target_file); free(a->result_path);
 		free(a->running_marker_path);
+		free_install_args(a->install_args);
 		free(a);
 		return -1;
 	}
@@ -847,6 +879,7 @@ static int spawn_install(worker_ctx_t *ctx, cJSON *task)
 		free(a->task_id); free(a->url); free(a->sha256);
 		free(a->work_dir); free(a->target_file); free(a->result_path);
 		free(a->running_marker_path);
+		free_install_args(a->install_args);
 		free(a);
 		return -1;
 	}
@@ -861,6 +894,7 @@ static int spawn_install(worker_ctx_t *ctx, cJSON *task)
 		free(a->task_id); free(a->url); free(a->sha256);
 		free(a->work_dir); free(a->target_file); free(a->result_path);
 		free(a->running_marker_path);
+		free_install_args(a->install_args);
 		free(a);
 		return -1;
 	}
@@ -875,6 +909,7 @@ static int spawn_install(worker_ctx_t *ctx, cJSON *task)
 		free(a->task_id); free(a->url); free(a->sha256);
 		free(a->work_dir); free(a->target_file); free(a->result_path);
 		free(a->running_marker_path);
+		free_install_args(a->install_args);
 		free(a);
 		return -1;
 	}
