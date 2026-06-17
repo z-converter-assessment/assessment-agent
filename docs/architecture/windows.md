@@ -73,6 +73,12 @@ collect.c 헤더의 매핑 표 그대로:
 
 자기 OS가 아닌 type은 양쪽 모두 즉시 result 발행 + ack — 잘못 라우팅된 task가 DLQ에 쌓이지 않는다.
 
+### `direct_exec` install.args 전달 (v1.3.0)
+
+엔진은 `install.args`(예: ZDM `["-s", <zdm_host>, "-u", <zdm_user>]`)를 발행하지만, v1.3.0 이전 Windows worker는 install 블록에서 `type`/`timeout_sec`만 파싱하고 `args`를 누락 → `exec_install(..., argv_extra=NULL, ...)`로 호출해 인스톨러가 인자 없이 실행됐다(install 실패). v1.3.0에서 `spawn_install`이 `install.args`를 파싱해 전달하도록 수정. **Windows install thread는 부모와 주소공간을 공유하므로** Linux worker의 `valuestring` 참조 방식(fork라 안전)과 달리 각 인자 문자열을 `_strdup`로 복제한다(task JSON free 후 UAF 방지). `msi`는 `build_cmdline`에서 argv_extra를 무시하므로 영향 없다.
+
+> **미해결(벤더 확인):** 엔진은 unix-style `-s`/`-u`로 발행한다. 실제 `ZConverter_CloudSource_Setup_Windows.exe`(third-party 32-bit NSIS)가 기대하는 플래그 형식(`-s` vs NSIS 기본 `/S`)은 인스톨러 `.nsi`의 `GetOptions` 파싱에 달려 있어 이 레포 코드로는 검증 불가. dev mock(`dev_zdm_mock.py`)은 args echo + exit 0이라 형식과 무관하게 success → mock으로는 규약을 못 거른다. win2022/win2012R2 실인스턴스 E2E로 `-s`/`-u` 수용 여부 확인 필요.
+
 ## Linux 대비 의도적 단순화 (worker.c 헤더 "v1 단순화")
 
 추후 보강이 필요한 항목으로 소스에 명시돼 있다:
