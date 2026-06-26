@@ -50,6 +50,7 @@
 #include <windows.h>
 #include <winioctl.h>    /* IOCTL_DISK_PERFORMANCE, DISK_PERFORMANCE, GET_LENGTH_INFORMATION */
 #include <ntddstor.h>    /* IOCTL_STORAGE_GET_DEVICE_NUMBER, STORAGE_DEVICE_NUMBER */
+#include "nt52_compat.h" /* strtok_s/strncpy_s — NT5.2 msvcrt 부재 대비(legacy 빌드) */
 /* QueryFullProcessImageNameW lives in <processthreadsapi.h> (auto-pulled by
  * <windows.h>) since Vista — <psapi.h> not needed. */
 
@@ -537,6 +538,15 @@ static cJSON *enumerate_net_io(void)
 
 		char name[256];
 		WideCharToMultiByte(CP_UTF8, 0, r->wszName, -1, name, sizeof name, NULL, NULL);
+		/* NT5.2 일부 인터페이스는 wszName 이 빈 문자열 -> interface="" 가 되어
+		 * 엔진 NetIo 검증(min_length>=1)에서 메트릭 메시지 전체가 거부된다.
+		 * description -> "if<index>" 순으로 fallback 해 항상 non-empty 보장. */
+		if (name[0] == '\0') {
+			if (r->dwDescrLen > 0 && r->bDescr[0])
+				snprintf(name, sizeof name, "%.*s", (int)r->dwDescrLen, (char *)r->bDescr);
+			else
+				snprintf(name, sizeof name, "if%lu", (unsigned long)r->dwIndex);
+		}
 
 		cJSON *o = cJSON_CreateObject();
 		cJSON_AddStringToObject(o, "interface", name);

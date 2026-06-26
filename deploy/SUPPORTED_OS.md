@@ -39,11 +39,12 @@ Three build profiles from one source tree (`make PROFILE=…`):
 
 | Family | Versions | NT | Profile | Binary | Verified |
 |---|---|---|---|---|---|
-| Windows Server | 2016, 2019, 2022, 2025 | 10.0 | `modern` | `assessment-agent.exe` | yes (CI + smoke) |
-| Windows | 10, 11 | 10.0 | `modern` | `assessment-agent.exe` | yes |
-| Windows Server | 2008 R2, 2012, 2012 R2 | 6.1–6.3 | `win7` | `assessment-agent-win7.exe` | **build only** |
-| Windows | 7, 8, 8.1 | 6.1–6.3 | `win7` | `assessment-agent-win7.exe` | **build only** |
-| **Windows Server** | **2003 / XP x64** | **5.2** | `legacy` | `assessment-agent-legacy.exe` | **build only + TLS PoC** |
+| Windows Server | 2016, 2019, 2022, 2025 | 10.0 | `modern` | `assessment-agent-win2016-x64.exe` | yes (CI + smoke) |
+| Windows | 10, 11 | 10.0 | `modern` | `assessment-agent-win2016-x64.exe` | yes |
+| Windows Server | 2008 R2, 2012, 2012 R2 | 6.1–6.3 | `win7` | `assessment-agent-win2008r2-x64.exe` | **build only** |
+| Windows | 7, 8, 8.1 | 6.1–6.3 | `win7` | `assessment-agent-win2008r2-x64.exe` | **build only** |
+| **Windows Server** | **2003 / XP x64** | **5.2** | `legacy` | `assessment-agent-win2003-x64.exe` | **build only + TLS PoC** |
+| **Windows Server** | **2003 x86 (common SKU) / XP** | **5.2** | `legacy32` | `assessment-agent-win2003-x86.exe` | **build only + TLS PoC** |
 
 - `modern` → OpenSSL 3.x, `_WIN32_WINNT=0x0A00`. The only profile validated
   end-to-end (CI build + installer smoke).
@@ -91,4 +92,4 @@ error message and exits non-zero. Same on Windows for unsupported builds.
 - Windows: the modern installer checks
   `[Environment]::OSVersion.Version.Major >= 10`. The legacy build targets NT
   5.2 and installs via `deploy/install.bat` (or
-  `assessment-agent-legacy.exe install`) since Server 2003 has no PowerShell.
+  `assessment-agent-win2003-x86.exe install`) since Server 2003 has no PowerShell.

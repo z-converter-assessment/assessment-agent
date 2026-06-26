@@ -5,9 +5,10 @@ tree builds binaries for several NT generations:
 
 | Profile | NT version | Arch | Windows | OpenSSL | Binary |
 |---|---|---|---|---|---|
-| modern (default) | 6.1–10.0 | x86_64 | Server 2008R2 / 2012 / 2012R2 / 2016 / 2019 / 2022, Win7–11 | 3.x | `assessment-agent.exe` |
-| **legacy** (`LEGACY=1`) | 5.2 | x86_64 | **Server 2003 x64 Edition / XP x64** | 1.0.2u | `assessment-agent-legacy.exe` |
-| **legacy32** | 5.2 | **i686 (32-bit)** | **Server 2003 x86 (the common SKU) / XP** | 1.0.2u | `assessment-agent-legacy-x86.exe` |
+| modern (default) | 10.0 | x86_64 | Server 2016 / 2019 / 2022 / 2025, Win10/11 | 3.x | `assessment-agent-win2016-x64.exe` |
+| win7 | 6.1–6.3 | x86_64 | Server 2008R2 / 2012 / 2012R2, Win7–8.1 | 3.x | `assessment-agent-win2008r2-x64.exe` |
+| **legacy** (`LEGACY=1`) | 5.2 | x86_64 | **Server 2003 x64 Edition / XP x64** | 1.0.2u | `assessment-agent-win2003-x64.exe` |
+| **legacy32** | 5.2 | **i686 (32-bit)** | **Server 2003 x86 (the common SKU) / XP** | 1.0.2u | `assessment-agent-win2003-x86.exe` |
 
 > **Pick by architecture, not just OS version.** The mass-market Server 2003
 > install is **32-bit (x86)** — its x64 Edition was rare. So the default 2003
@@ -64,12 +65,12 @@ curl source. Pick the arch that matches your fleet (see the table above —
 # CC/AR/WINDRES/OPENSSL_CROSS if you build inside a native mingw32 shell.
 make PROFILE=legacy32 vendor-fetch    # clones OpenSSL_1_0_2u + curl
 make PROFILE=legacy32 vendor-build    # static 32-bit libs (OpenSSL target: mingw)
-make PROFILE=legacy32 release         # builds assessment-agent-legacy-x86.exe + verify
+make PROFILE=legacy32 release         # builds assessment-agent-win2003-x86.exe + verify
 
 # 64-bit (x86_64) — only for confirmed Server 2003 / XP x64 Edition hosts.
 make LEGACY=1 vendor-fetch       # clones OpenSSL_1_0_2u + curl
 make LEGACY=1 vendor-build       # static libs (OpenSSL 1.0.2: no `no-tests`)
-make LEGACY=1 release            # builds assessment-agent-legacy.exe + verify
+make LEGACY=1 release            # builds assessment-agent-win2003-x64.exe + verify
 ```
 
 > legacy and legacy32 **share the `vendor/` tree** at different ABIs. Run
@@ -91,8 +92,8 @@ Known per-profile build notes:
 
 ## 2. Install on the 2003 host (no PowerShell)
 
-Copy the binary for your host's architecture — `assessment-agent-legacy-x86.exe`
-for 32-bit Server 2003 (the common case), `assessment-agent-legacy.exe` for x64
+Copy the binary for your host's architecture — `assessment-agent-win2003-x86.exe`
+for 32-bit Server 2003 (the common case), `assessment-agent-win2003-x64.exe` for x64
 Edition — plus `deploy\install.bat` to the host, then from an **elevated
 Command Prompt**:
 
@@ -101,7 +102,8 @@ install.bat                 :: register + start the service
 install.bat --image-prep    :: register but do not start (golden image)
 ```
 
-`install.bat` just forwards to `assessment-agent-legacy.exe install`
+`install.bat` just forwards to `assessment-agent-win2003-x86.exe install` (or the
+x64 build's `install` subcommand)
 (`CreateServiceW` + auto-restart policy via `ChangeServiceConfig2W`, both
 present on NT 5.2). If that fails, the script prints a raw `sc.exe create`
 fallback for diagnosis.

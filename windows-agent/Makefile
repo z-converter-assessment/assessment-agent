@@ -7,7 +7,7 @@
 # Usage:
 #   make vendor-fetch   # one-time: git clone vendor deps
 #   make vendor-build   # configure + compile static libs (cmake required)
-#   make                # build assessment-agent.exe (statically linked)
+#   make                # build assessment-agent-win2016-x64.exe (default PROFILE=modern, static)
 #   make verify         # confirm only Windows system DLLs are referenced
 #   make release        # build + verify + dist/ packaging with SHA256SUMS
 #
@@ -78,7 +78,7 @@ ifeq ($(PROFILE),legacy)
   # OpenSSL 1.0.2u but 1.1.1 or later is required"). 0.10.0 still builds
   # against 1.0.2 and keeps the amqp_* API the agent uses.
   RABBITMQ_C_VERSION  ?= v0.10.0
-  BIN                 := assessment-agent-legacy.exe
+  BIN                 := assessment-agent-win2003-x64.exe
   BCRYPT_LIB          :=
   # OpenSSL 1.0.2 Configure has no `no-tests` option.
   # KEEP engine support (no `no-engine`): rabbitmq-c v0.10.0's amqp_openssl.c
@@ -121,19 +121,19 @@ else ifeq ($(PROFILE),legacy32)
   OPENSSL_VERSION     ?= OpenSSL_1_0_2u
   CURL_VERSION        ?= curl-8_10_1
   RABBITMQ_C_VERSION  ?= v0.10.0
-  BIN                 := assessment-agent-legacy-x86.exe
+  BIN                 := assessment-agent-win2003-x86.exe
   BCRYPT_LIB          :=
   OPENSSL_CONFIG_OPTS := no-shared no-dso \
       -Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration \
-      -Wno-error=int-conversion -Wno-error=implicit-int
-  EXTRA_SYS_LIBS      := -lgdi32
+      -Wno-error=int-conversion -Wno-error=implicit-int -fcommon
+  EXTRA_SYS_LIBS      := -lgdi32 -lssp
   VENDOR_CFLAGS       := -D_WIN32_WINNT=0x0502 -DWINVER=0x0502
   ALLOWED_DLLS        := kernel32|advapi32|user32|gdi32|ws2_32|iphlpapi|crypt32|secur32|ole32|oleaut32|shell32|msvcrt|ntdll
 else ifeq ($(PROFILE),win7)
   WINNT_VER           := 0x0601
   OPENSSL_VERSION     ?= openssl-3.0.15
   CURL_VERSION        ?= curl-8_10_1
-  BIN                 := assessment-agent-win7.exe
+  BIN                 := assessment-agent-win2008r2-x64.exe
   BCRYPT_LIB          := -lbcrypt
   OPENSSL_CONFIG_OPTS := no-shared no-dso no-engine no-tests
   ALLOWED_DLLS        := kernel32|advapi32|user32|ws2_32|iphlpapi|crypt32|secur32|bcrypt|ole32|oleaut32|shell32|msvcrt|ntdll|api-ms-win-.+
@@ -141,7 +141,7 @@ else
   WINNT_VER           := 0x0A00
   OPENSSL_VERSION     ?= openssl-3.0.15
   CURL_VERSION        ?= curl-8_10_1
-  BIN                 := assessment-agent.exe
+  BIN                 := assessment-agent-win2016-x64.exe
   BCRYPT_LIB          := -lbcrypt
   OPENSSL_CONFIG_OPTS := no-shared no-dso no-engine no-tests
   ALLOWED_DLLS        := kernel32|advapi32|user32|ws2_32|iphlpapi|crypt32|secur32|bcrypt|ole32|oleaut32|shell32|msvcrt|ntdll|api-ms-win-.+
@@ -216,8 +216,8 @@ LDLIBS := $(RABBITMQ_C_LIB) $(CJSON_LIB) $(CURL_LIB) $(OPENSSL_SSL) $(OPENSSL_CR
 SRC := $(wildcard src/*.c)
 OBJ := $(SRC:.c=.o)
 RES := src/resources.res
-# BIN is set by the build-profile block above (assessment-agent.exe vs
-# assessment-agent-legacy.exe) so both ABIs can coexist in dist/.
+# BIN is set by the build-profile block above (per-profile names like
+# assessment-agent-win2016-x64.exe / -win2003-x86.exe) so all profiles coexist in dist/.
 
 all: $(BIN)
 
@@ -228,7 +228,7 @@ src/%.o: src/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # PE resource — embeds deploy/agent.env.example as RT_RCDATA so the installer
-# subcommand (assessment-agent.exe install) can seed and prompt without any
+# subcommand (e.g. assessment-agent-win2016-x64.exe install) can seed and prompt without any
 # external files on the target host.
 # `-I .` so the `deploy/agent.env.example` reference in resources.rc resolves
 # against the windows-agent/ root (windres' default is the .rc file's dir).
@@ -283,7 +283,7 @@ vendor-build-zlib:
 
 vendor-build-cjson:
 	$(CMAKE) -S $(CJSON_DIR) -B $(CJSON_DIR)/build \
-	      -DCMAKE_C_COMPILER=$(CC) \
+	      -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_C_COMPILER=$(CC) \
 	      -DBUILD_SHARED_LIBS=OFF -DENABLE_CJSON_TEST=OFF \
 	      -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 	$(CMAKE) --build $(CJSON_DIR)/build --target cjson -- -j$(JOBS)
@@ -293,8 +293,8 @@ vendor-build-rabbitmq:
 	# promote — rabbitmq-c v0.15.0 amqp_socket.c:309 의 ioctlsocket(int*) ↔
 	# Windows winsock2.h 의 u_long* 미스매치를 거부. upstream fix 전까지 demote.
 	$(CMAKE) -S $(RABBITMQ_C_DIR) -B $(RABBITMQ_C_DIR)/build \
-	      -DCMAKE_C_COMPILER=$(CC) \
-	      -DCMAKE_C_FLAGS="-Wno-error=incompatible-pointer-types" \
+	      -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_C_COMPILER=$(CC) \
+	      -DCMAKE_C_FLAGS="-Wno-error=incompatible-pointer-types $(VENDOR_CFLAGS)" \
 	      -DBUILD_SHARED_LIBS=OFF -DBUILD_STATIC_LIBS=ON \
 	      -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF -DBUILD_TOOLS=OFF \
 	      -DENABLE_SSL_SUPPORT=ON \
@@ -319,7 +319,7 @@ vendor-build-curl:
 	# 미해결 심볼을 남긴다. Linux manylinux2014 와 동일한 최소 의존 빌드를 강제하기
 	# 위해 모든 선택적 의존을 명시적으로 OFF.
 	$(CMAKE) -S $(CURL_DIR) -B $(CURL_DIR)/build \
-	      -DCMAKE_C_COMPILER=$(CC) \
+	      -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_C_COMPILER=$(CC) \
 	      -DCMAKE_C_FLAGS="$(VENDOR_CFLAGS)" \
 	      -DBUILD_SHARED_LIBS=OFF -DCURL_STATICLIB=ON \
 	      -DBUILD_CURL_EXE=OFF -DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF \
@@ -376,7 +376,7 @@ verify: $(BIN)
 	@echo "[verify] OK: only Windows system DLLs referenced (LEGACY=$(LEGACY))"
 
 # ----------------------------------------------------------------------
-# Release packaging — dist/assessment-agent.exe + SHA256SUMS
+# Release packaging — dist/$(BIN) + SHA256SUMS
 # ----------------------------------------------------------------------
 DIST_DIR := dist
 

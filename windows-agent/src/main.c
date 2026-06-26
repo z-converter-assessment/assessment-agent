@@ -242,8 +242,23 @@ static int publish_with_retry(const publish_config_t *cfg, const char *rk,
  * ============================================================ */
 int agent_run(void)
 {
+	/* Optional debug log gate. When AGENT_DEBUG_LOG holds a path, stderr is
+	 * redirected (unbuffered) to that file and DBG() lines below are emitted —
+	 * used to diagnose legacy NT5.2 (Server 2003) load/startup issues without a
+	 * rebuild. Unset (the default) leaves stderr on the systemd journal /
+	 * scheduled-task log and DBG() is a no-op. No hardcoded path. */
+	const char *dbg_path = getenv("AGENT_DEBUG_LOG");
+	int g_dbg = (dbg_path && *dbg_path);
+	if (g_dbg) {
+		freopen(dbg_path, "w", stderr);
+		setvbuf(stderr, NULL, _IONBF, 0);
+	}
+#define DBG(...) do { if (g_dbg) fprintf(stderr, __VA_ARGS__); } while (0)
+
+	DBG("[dbg] enter; WSAStartup\n");
 	WSADATA wsa;
 	WSAStartup(MAKEWORD(2, 2), &wsa);
+	DBG("[dbg] after WSAStartup\n");
 
 	/* Try local .env first (dev), then the per-user install paths under
 	 * %LOCALAPPDATA%\assessment-agent (user-level install — no admin). */
@@ -278,7 +293,9 @@ int agent_run(void)
 	fprintf(stderr, "[agent] machine_id=%s\n", machine_id);
 
 	/* --- Initial inventory --- */
+	DBG("[dbg] before collect_inventory\n");
 	cJSON *inv = collect_inventory_payload(machine_id, AGENT_VERSION);
+	DBG("[dbg] after collect_inventory inv=%p\n", (void*)inv);
 	if (!inv) {
 		emit_error(&cfg, machine_id, "COLLECT_INVENTORY_FAILED",
 		           "core inventory source unreadable", "collect",
@@ -415,6 +432,7 @@ int agent_run(void)
 	free(machine_id);
 	WSACleanup();
 	return 0;
+#undef DBG
 }
 
 /* ============================================================

@@ -57,6 +57,12 @@ elif command -v yum >/dev/null 2>&1; then
 	for pkg in $RPM_PKGS; do
 		try_install_one yum "$pkg"
 	done
+	# manylinux2014(CentOS7) base cmake=2.8.12 -> libarchive(cmake 3.x 필요) 실패.
+	# cmake3(EPEL, 3.17)을 설치해 /usr/local/bin/cmake 로 우선 노출.
+	if yum install -y -q cmake3 >/dev/null 2>&1 && command -v cmake3 >/dev/null 2>&1; then
+		ln -sf "$(command -v cmake3)" /usr/local/bin/cmake
+		echo "  + cmake3 -> /usr/local/bin/cmake ($(cmake3 --version | head -1))"
+	fi
 else
 	echo "[build-prep] no supported package manager found (apt-get / yum / dnf)" >&2
 	exit 1

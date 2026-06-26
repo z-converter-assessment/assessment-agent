@@ -40,6 +40,7 @@
 #include <windows.h>
 #include <process.h>      /* _beginthreadex */
 #include <direct.h>       /* _mkdir */
+#include "nt52_compat.h"  /* strncpy_s — NT5.2 msvcrt 부재 대비(legacy 빌드) */
 
 #ifndef AGENT_VERSION
 #define AGENT_VERSION "1.0.0"
@@ -237,6 +238,22 @@ static char *iso8601_now(void)
 	return buf;
 }
 
+/* OS 버전 식별자 — Registry CurrentBuildNumber (bare, UBR 미포함). 엔진의 성공 exit code
+ * 보정 정책 키 (예: Windows Server 2022 = "20348"). collect.c 의 인벤토리용 os_version_info
+ * 는 build.UBR 형식이지만, 정책은 빌드 메이저만 보면 되므로 task.result 에는 bare build 만 발행.
+ * 읽기 실패 시 빈 문자열 (엔진은 nullable 로 흡수). */
+static void os_build_number(char *out, size_t out_sz)
+{
+	if (out_sz) out[0] = '\0';
+	HKEY hKey;
+	if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+	    "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
+	    0, KEY_READ, &hKey) != ERROR_SUCCESS) return;
+	DWORD sz = (DWORD)out_sz;
+	RegQueryValueExA(hKey, "CurrentBuildNumber", NULL, NULL, (LPBYTE)out, &sz);
+	RegCloseKey(hKey);
+}
+
 static char *build_result_json(const worker_ctx_t *ctx,
                                const char *task_id,
                                const char *status,
@@ -251,6 +268,12 @@ static char *build_result_json(const worker_ctx_t *ctx,
 	cJSON_AddStringToObject(root, "message_type",     "task.result");
 	cJSON_AddStringToObject(root, "machine_id",       ctx->cfg.machine_id ? ctx->cfg.machine_id : "");
 	cJSON_AddStringToObject(root, "os_family",        "windows");
+	char os_build_b[32];
+	os_build_number(os_build_b, sizeof os_build_b);
+	if (os_build_b[0])
+		cJSON_AddStringToObject(root, "os_version", os_build_b);
+	else
+		cJSON_AddNullToObject  (root, "os_version");
 	cJSON_AddStringToObject(root, "agent_version",    ctx->cfg.agent_version ? ctx->cfg.agent_version : AGENT_VERSION);
 	cJSON_AddStringToObject(root, "collected_at",     iso8601_now());
 
@@ -579,6 +602,12 @@ static unsigned __stdcall install_thread_main(void *arg)
 		cJSON_AddStringToObject(root, "message_type",     "task.result");
 		cJSON_AddStringToObject(root, "machine_id",       a->machine_id ? a->machine_id : "");
 		cJSON_AddStringToObject(root, "os_family",        "windows");
+		char os_build_b[32];
+		os_build_number(os_build_b, sizeof os_build_b);
+		if (os_build_b[0])
+			cJSON_AddStringToObject(root, "os_version", os_build_b);
+		else
+			cJSON_AddNullToObject  (root, "os_version");
 		cJSON_AddStringToObject(root, "agent_version",    a->agent_version ? a->agent_version : AGENT_VERSION);
 		cJSON_AddStringToObject(root, "collected_at",     iso8601_now());
 

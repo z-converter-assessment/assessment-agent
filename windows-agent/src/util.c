@@ -18,6 +18,7 @@
 #include <windows.h>
 #include <objbase.h>   /* CoCreateGuid */
 #include <wincrypt.h>  /* CryptAcquireContextW / CryptGenRandom (NT 5.2 fallback) */
+#include "nt52_compat.h" /* _putenv_s — NT5.2 msvcrt 부재 대비(legacy 빌드) */
 
 /* ---------- compat: CSPRNG (bcrypt → CryptoAPI fallback) ----------
  *

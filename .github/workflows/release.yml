@@ -106,18 +106,26 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: modern (NT10 — Server 2016~2025)
+          - name: win2016-x64 (NT10 — Server 2016~2025)
             profile: modern
-            artifact: assessment-agent-windows-x86_64
-            binary: assessment-agent.exe
-          - name: win7 (NT6.1-6.3 — Server 2008R2~2012R2)
+            artifact: assessment-agent-windows-win2016-x64
+            binary: assessment-agent-win2016-x64.exe
+          - name: win2008r2-x64 (NT6.1-6.3 — Server 2008R2~2012R2)
             profile: win7
-            artifact: assessment-agent-windows-x86_64-win7
-            binary: assessment-agent-win7.exe
-          - name: legacy (NT5.2 — Server 2003 / XP x64)
+            artifact: assessment-agent-windows-win2008r2-x64
+            binary: assessment-agent-win2008r2-x64.exe
+          - name: win2003-x64 (NT5.2 — Server 2003 / XP x64)
             profile: legacy
-            artifact: assessment-agent-windows-x86_64-legacy
-            binary: assessment-agent-legacy.exe
+            artifact: assessment-agent-windows-win2003-x64
+            binary: assessment-agent-win2003-x64.exe
+            experimental: true
+          # 32-bit Server 2003 (the mass-market x86 SKU). i686 cross-toolchain +
+          # OpenSSL 1.0.2u mingw target. Recent MinGW may not emit NT5.2 startup —
+          # experimental so a build failure never blocks the rest of the release.
+          - name: win2003-x86 (NT5.2 — Server 2003 x86, 32-bit)
+            profile: legacy32
+            artifact: assessment-agent-windows-win2003-x86
+            binary: assessment-agent-win2003-x86.exe
             experimental: true
     defaults:
       run:
@@ -132,12 +140,18 @@ jobs:
         with:
           msystem: MINGW64
           update: false
+          # i686 packages are needed only by the legacy32 (win2003-x86) profile,
+          # which cross-builds with i686-w64-mingw32-*. Installing them
+          # unconditionally is harmless for the x64 profiles.
           install: >-
             git
             make
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-pkgconf
+            mingw-w64-i686-gcc
+            mingw-w64-i686-cmake
+            mingw-w64-i686-pkgconf
             perl
 
       # OpenSSL version differs per profile, so vendor static libs are not
@@ -400,12 +414,12 @@ jobs:
       - name: Download Windows artifact
         uses: actions/download-artifact@v4
         with:
-          name: assessment-agent-windows-x86_64
+          name: assessment-agent-windows-win2016-x64
           path: dist
 
       # ---------- Phase A: --image-prep flow (user-level, scheduled task) ----------
       - name: A1. install --image-prep
-        run: $null | .\dist\assessment-agent.exe install --image-prep
+        run: $null | .\dist\assessment-agent-win2016-x64.exe install --image-prep
       - name: A2. Verify scheduled task registered + user-level files
         run: |
           $base = Join-Path $env:LOCALAPPDATA 'assessment-agent'
@@ -431,13 +445,13 @@ jobs:
       - name: A4. prep-image runs (MachineGuid reset best-effort; needs admin)
         run: |
           $before = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography' MachineGuid).MachineGuid
-          .\dist\assessment-agent.exe prep-image
+          .\dist\assessment-agent-win2016-x64.exe prep-image
           if ($LASTEXITCODE -ne 0) { throw "A4: prep-image exited $LASTEXITCODE" }
           $after = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography' MachineGuid).MachineGuid
           Write-Host "MachineGuid: $before -> $after (changed=$($before -ne $after))"
       - name: A5. uninstall (state preserved)
         run: |
-          .\dist\assessment-agent.exe uninstall
+          .\dist\assessment-agent-win2016-x64.exe uninstall
           & schtasks /Query /TN AssessmentAgent 2>$null | Out-Null
           $exists = ($LASTEXITCODE -eq 0); $global:LASTEXITCODE = 0
           if ($exists) { throw "A5: task still registered" }
@@ -615,7 +629,7 @@ jobs:
           [IO.File]::WriteAllText((Join-Path $base 'agent.env'), $env_text, (New-Object Text.UTF8Encoding $false))
           [IO.File]::WriteAllText((Join-Path $base 'agent.env.local'), "RABBITMQ_PASS=guest`n", (New-Object Text.UTF8Encoding $false))
       - name: B5. install (no --image-prep) — scheduled task must start the agent
-        run: $null | .\dist\assessment-agent.exe install
+        run: $null | .\dist\assessment-agent-win2016-x64.exe install
       - name: B6. agent process running
         run: |
           $p = $null
@@ -656,7 +670,7 @@ jobs:
       - name: B9. Upgrade — install twice, agent restarts
         run: |
           $pid_before = (Get-Process -Name assessment-agent -ErrorAction SilentlyContinue | Select-Object -First 1).Id
-          $null | .\dist\assessment-agent.exe install
+          $null | .\dist\assessment-agent-win2016-x64.exe install
           $p = $null
           for ($i=0; $i -lt 20; $i++) {
               $p = Get-Process -Name assessment-agent -ErrorAction SilentlyContinue
@@ -669,7 +683,7 @@ jobs:
           Write-Host "upgrade PID: $pid_before -> $pid_after"
       - name: B10. uninstall (state preserved)
         run: |
-          .\dist\assessment-agent.exe uninstall
+          .\dist\assessment-agent-win2016-x64.exe uninstall
           & schtasks /Query /TN AssessmentAgent 2>$null | Out-Null
           $exists = ($LASTEXITCODE -eq 0); $global:LASTEXITCODE = 0
           if ($exists) { throw "B10: task still registered" }
@@ -698,15 +712,17 @@ jobs:
           mkdir -p release
           # Modern artifacts are REQUIRED — fail loudly if missing.
           cp artifacts/assessment-agent-linux-x86_64/assessment-agent-linux-x86_64 release/
-          cp artifacts/assessment-agent-windows-x86_64/assessment-agent.exe release/
+          cp artifacts/assessment-agent-windows-win2016-x64/assessment-agent-win2016-x64.exe release/
           # Optional profiles (experimental) — attach only if their build job
           # produced an artifact. A missing one is fine (continue-on-error).
           cp artifacts/assessment-agent-linux-x86_64-glibc2.12/assessment-agent-linux-x86_64-glibc2.12 release/ 2>/dev/null \
             || echo "[release] no Linux legacy (CentOS 6) artifact — skipped"
-          cp artifacts/assessment-agent-windows-x86_64-win7/assessment-agent-win7.exe release/ 2>/dev/null \
-            || echo "[release] no Windows win7 artifact — skipped"
-          cp artifacts/assessment-agent-windows-x86_64-legacy/assessment-agent-legacy.exe release/ 2>/dev/null \
-            || echo "[release] no Windows legacy (Server 2003) artifact — skipped"
+          cp artifacts/assessment-agent-windows-win2008r2-x64/assessment-agent-win2008r2-x64.exe release/ 2>/dev/null \
+            || echo "[release] no Windows win2008r2 (win7) artifact — skipped"
+          cp artifacts/assessment-agent-windows-win2003-x64/assessment-agent-win2003-x64.exe release/ 2>/dev/null \
+            || echo "[release] no Windows win2003 x64 artifact — skipped"
+          cp artifacts/assessment-agent-windows-win2003-x86/assessment-agent-win2003-x86.exe release/ 2>/dev/null \
+            || echo "[release] no Windows win2003 x86 (32-bit) artifact — skipped"
           # Aggregate every SHA256SUMS that was downloaded.
           : > release/SHA256SUMS
           for d in artifacts/*/; do
@@ -724,7 +740,8 @@ jobs:
           files: |
             release/assessment-agent-linux-x86_64
             release/assessment-agent-linux-x86_64-glibc2.12
-            release/assessment-agent.exe
-            release/assessment-agent-win7.exe
-            release/assessment-agent-legacy.exe
+            release/assessment-agent-win2016-x64.exe
+            release/assessment-agent-win2008r2-x64.exe
+            release/assessment-agent-win2003-x64.exe
+            release/assessment-agent-win2003-x86.exe
             release/SHA256SUMS

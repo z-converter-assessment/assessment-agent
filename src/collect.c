@@ -418,12 +418,91 @@ static int read_os_release_field(const char *content, const char *key, char **ou
 }
 
 /**
+ * @brief Pre-systemd EL6 (CentOS/RHEL/Oracle 6) fallback.
+ *
+ * EL6 predates `/etc/os-release`; OS identity lives in `/etc/redhat-release`
+ * (or `centos-release` / `oracle-release` / `system-release`). Without this the
+ * legacy binary reports os_id/os_version=null on CentOS 6. Mirrors the installer
+ * logic in `deploy/lib/detect-os.sh` (detect_redhat_release_el6).
+ *
+ * Sets os_id (centos/rhel/ol/rocky/almalinux/amzn) + os_version ("6.10") +
+ * os_codename(null) on @p root. Returns 1 if a release file yielded a version.
+ */
+static int add_redhat_release_fallback(cJSON *root)
+{
+	static const char *files[] = {
+		"/etc/redhat-release", "/etc/centos-release",
+		"/etc/oracle-release", "/etc/system-release", NULL,
+	};
+	char *content = NULL;
+	for (int i = 0; files[i]; i++) {
+		content = read_file_all(files[i]);
+		if (content && content[0])
+			break;
+		free(content);
+		content = NULL;
+	}
+	if (!content)
+		return 0;
+
+	/* first line only */
+	char *nl = strchr(content, '\n');
+	if (nl)
+		*nl = '\0';
+
+	/* lowercase copy for case-insensitive keyword match */
+	char low[256];
+	size_t i = 0;
+	for (; content[i] && i < sizeof low - 1; i++)
+		low[i] = (char)tolower((unsigned char)content[i]);
+	low[i] = '\0';
+
+	const char *os_id = "rhel";  /* EL-family default */
+	if (strstr(low, "centos"))            os_id = "centos";
+	else if (strstr(low, "rocky"))        os_id = "rocky";
+	else if (strstr(low, "almalinux"))    os_id = "almalinux";
+	else if (strstr(low, "oracle"))       os_id = "ol";
+	else if (strstr(low, "amazon"))       os_id = "amzn";
+	else if (strstr(low, "red hat") || strstr(low, "redhat")) os_id = "rhel";
+
+	/* version: text after "release " — capture [0-9.] run (e.g. "6.10") */
+	char ver[32] = {0};
+	const char *rel = strstr(low, "release ");
+	if (rel) {
+		const char *p = rel + 8;  /* strlen("release ") */
+		while (*p == ' ' || *p == '\t')
+			p++;
+		size_t v = 0;
+		while ((*p >= '0' && *p <= '9') || *p == '.') {
+			if (v < sizeof ver - 1)
+				ver[v++] = *p;
+			p++;
+		}
+		ver[v] = '\0';
+	}
+
+	if (ver[0] == '\0') {
+		free(content);
+		return 0;
+	}
+
+	cJSON_AddStringToObject(root, "os_id", os_id);
+	cJSON_AddStringToObject(root, "os_version", ver);
+	cJSON_AddNullToObject(root, "os_codename");
+	free(content);
+	return 1;
+}
+
+/**
  * @brief Add `os_id`, `os_version`, `os_codename` to @p root.
  */
 static int add_os_release(cJSON *root)
 {
 	char *content = read_file_all("/etc/os-release");
 	if (!content) {
+		/* pre-systemd EL6 — fall back to /etc/redhat-release family */
+		if (add_redhat_release_fallback(root))
+			return 1;
 		cJSON_AddNullToObject(root, "os_id");
 		cJSON_AddNullToObject(root, "os_version");
 		cJSON_AddNullToObject(root, "os_codename");
@@ -1233,11 +1312,18 @@ static cJSON *collect_external_ip(void)
 }
 
 /**
- * @brief Collect active systemd service units.
+ * @brief Collect active systemd service + socket units.
  *
- * Source: `systemctl list-units --type=service --state=running --no-pager
- *         --plain --no-legend`
+ * Source: `systemctl list-units --type=service --type=socket
+ *         --state=running --state=listening --no-pager --plain --no-legend`
  * Output line layout: `UNIT  LOAD  ACTIVE  SUB  DESCRIPTION...`
+ *
+ * Socket units are included so socket-activated workloads surface even when
+ * their .service is not currently running — notably `podman.socket`
+ * (rootless OCI runtime; sub=listening). The engine classifier substring-
+ * matches the unit name (e.g. "podman" in "podman.socket"), so reporting the
+ * socket is enough for container-workload recognition. Other listening
+ * sockets fall through to the engine's "unknown" bucket and are harmless.
  *
  * On non-systemd hosts (Amazon Linux 1, custom containers) systemctl is
  * absent — `run_cmd` returns NULL and we emit a JSON null literal so the
@@ -1252,7 +1338,8 @@ static cJSON *collect_external_ip(void)
 static cJSON *collect_services(void)
 {
 	char *out = run_cmd(
-		"systemctl list-units --type=service --state=running "
+		"systemctl list-units --type=service --type=socket "
+		"--state=running --state=listening "
 		"--no-pager --plain --no-legend 2>/dev/null");
 	if (!out)
 		return cJSON_CreateNull();
