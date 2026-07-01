@@ -22,11 +22,9 @@ setlocal
 
 set "SCRIPT_DIR=%~dp0"
 
-REM The Server 2003 binary ships next to this .bat. The mass-market SKU is
-REM 32-bit (x86), so prefer it; fall back to the x64 build if that is what
-REM was packaged.
+REM The Server 2003 binary (x86 — the only 2003 target; the x64 Edition is
+REM not built) ships next to this .bat.
 set "EXE=%SCRIPT_DIR%assessment-agent-win2003-x86.exe"
-if not exist "%EXE%" set "EXE=%SCRIPT_DIR%assessment-agent-win2003-x64.exe"
 if not exist "%EXE%" (
     echo [install] agent exe not found next to install.bat
     exit /b 1

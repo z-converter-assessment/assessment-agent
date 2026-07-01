@@ -11,11 +11,11 @@ agent는 NT 세대별로 4개의 Windows 바이너리를 만든다(빌드 프로
 |---|---|---|---|---|
 | Server 2016 / 2019 / 2022 / 2025 | modern | assessment-agent-win2016-x64.exe | 10.0 | 가능 |
 | Server 2012 / 2012R2 | win7 | assessment-agent-win2008r2-x64.exe | 6.2 / 6.3 | 가능 |
-| Server 2008 (x64) | legacy | assessment-agent-win2003-x64.exe | 6.0 (grey zone) | 불가(WinRM 미지원) |
 | Server 2003 (x86) | legacy32 | assessment-agent-win2003-x86.exe | 5.2 / i386 | 불가(WinRM 미지원) |
 
-modern은 OpenSSL 3.x + bcrypt, win7도 OpenSSL 3.x, legacy/legacy32는 OpenSSL 1.0.2u + gdi32
-(bcrypt 없음). 검증된 것은 modern(2016~2025)·win7(2012/2012R2)이고, legacy 둘은 build-only.
+modern은 OpenSSL 3.x + bcrypt, win7도 OpenSSL 3.x, legacy32는 OpenSSL 1.0.2u + gdi32
+(bcrypt 없음). 검증된 것은 modern(2016~2025)·win7(2012/2012R2)이고, legacy32(2003 x86)는
+build-only. 2003 x64 Edition은 드물어 빌드하지 않는다(x86이 유일한 2003 타겟).
 
 ## 배포 흐름 (폐쇄망, ADR-0007)
 

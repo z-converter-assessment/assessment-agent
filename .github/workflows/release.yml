@@ -99,8 +99,8 @@ jobs:
     name: Windows (${{ matrix.name }})
     runs-on: windows-latest
     timeout-minutes: 60
-    # legacy (Server 2003) needs an older MinGW + OpenSSL 1.0.2 that the
-    # windows-latest MSYS2 toolchain may not build — never block the release.
+    # legacy32 (Server 2003 x86) needs an older MinGW + OpenSSL 1.0.2 + the
+    # win32/threads NT5.2 patch — never block the release on it.
     continue-on-error: ${{ matrix.experimental || false }}
     strategy:
       fail-fast: false
@@ -114,14 +114,12 @@ jobs:
             profile: win7
             artifact: assessment-agent-windows-win2008r2-x64
             binary: assessment-agent-win2008r2-x64.exe
-          - name: win2003-x64 (NT5.2 — Server 2003 / XP x64)
-            profile: legacy
-            artifact: assessment-agent-windows-win2003-x64
-            binary: assessment-agent-win2003-x64.exe
-            experimental: true
-          # 32-bit Server 2003 (the mass-market x86 SKU). i686 cross-toolchain +
-          # OpenSSL 1.0.2u mingw target. Recent MinGW may not emit NT5.2 startup —
-          # experimental so a build failure never blocks the rest of the release.
+          # Server 2003 is x86 only (the x64 Edition was rare and is not built).
+          # i686 cross-toolchain + OpenSSL 1.0.2u mingw target. NOTE: requires the
+          # win32/threads NT5.2 patch (SRWLock -> CRITICAL_SECTION) from
+          # agent-fleet/win-legacy-patch, which this workflow does NOT yet apply —
+          # so this job currently fails at link. experimental so it never blocks
+          # the rest of the release.
           - name: win2003-x86 (NT5.2 — Server 2003 x86, 32-bit)
             profile: legacy32
             artifact: assessment-agent-windows-win2003-x86
@@ -719,8 +717,6 @@ jobs:
             || echo "[release] no Linux legacy (CentOS 6) artifact — skipped"
           cp artifacts/assessment-agent-windows-win2008r2-x64/assessment-agent-win2008r2-x64.exe release/ 2>/dev/null \
             || echo "[release] no Windows win2008r2 (win7) artifact — skipped"
-          cp artifacts/assessment-agent-windows-win2003-x64/assessment-agent-win2003-x64.exe release/ 2>/dev/null \
-            || echo "[release] no Windows win2003 x64 artifact — skipped"
           cp artifacts/assessment-agent-windows-win2003-x86/assessment-agent-win2003-x86.exe release/ 2>/dev/null \
             || echo "[release] no Windows win2003 x86 (32-bit) artifact — skipped"
           # Aggregate every SHA256SUMS that was downloaded.
@@ -742,6 +738,5 @@ jobs:
             release/assessment-agent-linux-x86_64-glibc2.12
             release/assessment-agent-win2016-x64.exe
             release/assessment-agent-win2008r2-x64.exe
-            release/assessment-agent-win2003-x64.exe
             release/assessment-agent-win2003-x86.exe
             release/SHA256SUMS

@@ -23,87 +23,41 @@ WINDRES ?= windres
 JOBS    ?= 4
 
 # ----------------------------------------------------------------------
-# Build profile — three NT generations from one source tree
+# Build profile — NT generations from one source tree
 # ----------------------------------------------------------------------
 #   PROFILE=modern (default) : NT 10.0 — Server 2016/2019/2022/2025, Win10/11.
 #                              OpenSSL 3.x, _WIN32_WINNT=0x0A00.
 #   PROFILE=win7             : NT 6.1–6.3 — Server 2008R2 / 2012 / 2012R2,
 #                              Win7/8/8.1. OpenSSL 3.x (still supports Win7),
 #                              only the API ceiling drops to 0x0601.
-#   PROFILE=legacy           : NT 5.2, **x86_64** — Server 2003 x64 Edition /
-#                              XP x64. OpenSSL 1.0.2u (last XP-capable LTS),
-#                              0x0502, bcrypt dropped from the import table.
-#   PROFILE=legacy32         : NT 5.2, **i686 (32-bit)** — Server 2003 x86 (the
-#                              common SKU; the x64 Edition was rare) / XP. Same
-#                              OpenSSL 1.0.2u + NT 5.2 ceiling as legacy; only
-#                              the target arch (i686 toolchain + OpenSSL `mingw`
-#                              target) differs. WITHOUT this the bulk of the real
-#                              2003 fleet (32-bit) has no installable binary.
+#   PROFILE=legacy32         : NT 5.2, **i686 (32-bit)** — Server 2003 x86 / XP.
+#                              OpenSSL 1.0.2u (last XP-capable LTS), 0x0502,
+#                              bcrypt dropped from the import table. This is the
+#                              SOLE 2003 target: the mass-market 2003 SKU is x86
+#                              and the x64 Edition was rare, so no x64 build is
+#                              produced. Needs the win32/threads NT5.2 patch
+#                              (SRWLock -> CRITICAL_SECTION); see
+#                              agent-fleet/win-legacy-patch.
 #
 #   make PROFILE=win7     vendor-build && make PROFILE=win7     release
-#   make PROFILE=legacy   vendor-build && make PROFILE=legacy   release
 #   make PROFILE=legacy32 vendor-build && make PROFILE=legacy32 release
-#   (LEGACY=1 is kept as a backward-compatible alias for PROFILE=legacy.)
-#   NOTE: legacy and legacy32 share the vendor/ tree at different ABIs — run
-#   `make vendor-clean` when switching between an x64 and an x86 build.
 #
 # The C code is identical across profiles: GetTickCount64 / BCryptGenRandom
 # are resolved at runtime (monotonic_ms / compat_rand_bytes), so a lower
 # WINNT_VER never leaves an unresolved import. Knobs that differ:
 #   - WINNT_VER          : API surface to compile against.
-#   - OPENSSL_VERSION    : 3.x dropped XP/2003; legacy pins 1.0.2u. Override
+#   - OPENSSL_VERSION    : 3.x dropped XP/2003; legacy32 pins 1.0.2u. Override
 #     with OPENSSL_VERSION= if a 1.1.1 build proves to handshake (TLS PoC).
-#   - CURL_VERSION       : legacy pins a curl that still builds on 1.0.2.
-#   - BCRYPT_LIB         : empty on legacy — no static -lbcrypt (Server 2003
+#   - CURL_VERSION       : legacy32 pins a curl that still builds on 1.0.2.
+#   - BCRYPT_LIB         : empty on legacy32 — no static -lbcrypt (Server 2003
 #     has no bcrypt.dll; a static import would break load).
-#   - BIN suffix         : all three binaries coexist in dist/.
-# NOTE: the legacy profile needs an OLDER MinGW-w64 toolchain that still
-# targets NT 5.2 (recent MinGW dropped XP/2003 startup support). modern and
-# win7 build fine on the current MSYS2/mingw64 toolchain.
-LEGACY  ?= 0
-ifeq ($(LEGACY),1)
-  PROFILE ?= legacy
-endif
+#   - BIN suffix         : all binaries coexist in dist/.
+# NOTE: legacy32 needs an OLDER MinGW-w64 (i686) that still targets NT 5.2
+# (recent MinGW dropped XP/2003 startup support). modern and win7 build fine
+# on the current MSYS2/mingw64 toolchain.
 PROFILE ?= modern
 
-ifeq ($(PROFILE),legacy)
-  WINNT_VER           := 0x0502
-  OPENSSL_VERSION     ?= OpenSSL_1_0_2u
-  # curl 8.x still supports OpenSSL >= 1.0.2a, and unlike the ancient 7.64.1
-  # (whose lib/nonblock.c calls the long-gone `IoctlSocket`, which modern
-  # MinGW winsock no longer declares) it builds clean on the current toolchain.
-  # So share win7/modern's curl pin + the libcurl_static target default.
-  CURL_VERSION        ?= curl-8_10_1
-  # rabbitmq-c >= 0.11 requires OpenSSL 1.1.1+ (CMake hard-fails: "Found
-  # OpenSSL 1.0.2u but 1.1.1 or later is required"). 0.10.0 still builds
-  # against 1.0.2 and keeps the amqp_* API the agent uses.
-  RABBITMQ_C_VERSION  ?= v0.10.0
-  BIN                 := assessment-agent-win2003-x64.exe
-  BCRYPT_LIB          :=
-  # OpenSSL 1.0.2 Configure has no `no-tests` option.
-  # KEEP engine support (no `no-engine`): rabbitmq-c v0.10.0's amqp_openssl.c
-  # includes <openssl/engine.h> and calls ENGINE_cleanup(). With no-engine the
-  # vendored 1.0.2 tree has no engine.h, so the compiler falls back to MSYS2's
-  # system OpenSSL 3.x engine.h → macros.h "OPENSSL_API_COMPAT impossible".
-  #
-  # GCC 14 promotes several legacy-C warnings to hard ERRORS by default, which
-  # 1.0.2u's engine sources (e.g. engines/e_capi.c: CryptDecrypt / d2i_X509
-  # pointer mismatches) trip. Demote them — Configure forwards bare -W args
-  # into CFLAGS.
-  OPENSSL_CONFIG_OPTS := no-shared no-dso \
-      -Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration \
-      -Wno-error=int-conversion -Wno-error=implicit-int
-  # OpenSSL 1.0.2 rand_win.c gathers entropy via GDI (screen) — needs gdi32.
-  EXTRA_SYS_LIBS      := -lgdi32
-  # Propagate the NT 5.2 target into the vendor builds. Without it curl 8.x
-  # compiles its RNG against the toolchain default (NT10) and hard-links
-  # BCryptGenRandom (Vista+), which does not exist on Server 2003. With the
-  # define curl takes the pre-Vista RNG path (no bcrypt dependency).
-  VENDOR_CFLAGS       := -D_WIN32_WINNT=0x0502 -DWINVER=0x0502
-  # NT 5.2 has no api-ms-win-* umbrella DLLs and bcrypt is runtime-loaded.
-  # gdi32 ships on every Windows incl. Server 2003.
-  ALLOWED_DLLS        := kernel32|advapi32|user32|gdi32|ws2_32|iphlpapi|crypt32|secur32|ole32|oleaut32|shell32|msvcrt|ntdll
-else ifeq ($(PROFILE),legacy32)
+ifeq ($(PROFILE),legacy32)
   # legacy32 = legacy(NT 5.2) but **32-bit (i686)**. The mass-market Server 2003
   # SKU is x86; the x64 Edition was rare. The legacy(x64) binary above never
   # loads on those hosts, so without this profile "we target 2003" is unmet.
@@ -257,23 +211,12 @@ vendor-build-openssl:
 	# (`install/lib/libssl.a`) 와 어긋난다.
 	cd $(OPENSSL_DIR) && ./Configure $(OPENSSL_TARGET) $(OPENSSL_CONFIG_OPTS) $(OPENSSL_CROSS) \
 	    --libdir=lib --prefix=$(CURDIR)/$(OPENSSL_DIR)/install
-ifeq ($(PROFILE),legacy)
-	# OpenSSL 1.0.2u (legacy profile): Configure mandates `make depend` before
-	# building — without it the generated Makefile keeps a stale dependency on
-	# include/openssl/engine.h, which `no-engine` never generates, and the
-	# build dies with "No rule to make target engine.h". 1.0.2's build is also
-	# not reliably parallel-safe, so build serially.
-	$(MAKE) -C $(OPENSSL_DIR) depend
-	$(MAKE) -C $(OPENSSL_DIR)
 	# 1.0.2 install_sw's mkdir is NOT idempotent — it dies with
 	# "Cannot create directory .../install: File exists" (Error 17) when the
 	# prefix dir already exists. Wipe it first so install starts clean.
 	rm -rf $(OPENSSL_DIR)/install
-	$(MAKE) -C $(OPENSSL_DIR) install_sw
-else
 	$(MAKE) -C $(OPENSSL_DIR) -j$(JOBS)
 	$(MAKE) -C $(OPENSSL_DIR) install_sw
-endif
 
 vendor-build-zlib:
 	# zlib win32/Makefile.gcc 가 ARFLAGS=rcs 를 자체 정의함. AR 변수에는

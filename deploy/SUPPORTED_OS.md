@@ -43,25 +43,25 @@ Three build profiles from one source tree (`make PROFILE=…`):
 | Windows | 10, 11 | 10.0 | `modern` | `assessment-agent-win2016-x64.exe` | yes |
 | Windows Server | 2008 R2, 2012, 2012 R2 | 6.1–6.3 | `win7` | `assessment-agent-win2008r2-x64.exe` | **build only** |
 | Windows | 7, 8, 8.1 | 6.1–6.3 | `win7` | `assessment-agent-win2008r2-x64.exe` | **build only** |
-| **Windows Server** | **2003 / XP x64** | **5.2** | `legacy` | `assessment-agent-win2003-x64.exe` | **build only + TLS PoC** |
-| **Windows Server** | **2003 x86 (common SKU) / XP** | **5.2** | `legacy32` | `assessment-agent-win2003-x86.exe` | **build only + TLS PoC** |
+| **Windows Server** | **2003 x86 (the only 2003 target) / XP** | **5.2** | `legacy32` | `assessment-agent-win2003-x86.exe` | **build only + patch + TLS PoC** |
 
 - `modern` → OpenSSL 3.x, `_WIN32_WINNT=0x0A00`. The only profile validated
   end-to-end (CI build + installer smoke).
 - `win7` → `make PROFILE=win7`, OpenSSL 3.x (still supports Win7),
   `_WIN32_WINNT=0x0601`. Built in CI; **NT 6.x runtime not yet validated on
   real hardware.**
-- `legacy` → `make PROFILE=legacy` (alias `LEGACY=1`), OpenSSL 1.0.2u,
-  `_WIN32_WINNT=0x0502`, needs an older MinGW toolchain. `GetTickCount64` /
+- `legacy32` → `make PROFILE=legacy32`, OpenSSL 1.0.2u, i686, `_WIN32_WINNT=0x0502`,
+  needs an older MinGW (i686) toolchain **and** the win32/threads NT5.2 patch
+  (SRWLock → CRITICAL_SECTION) from `agent-fleet/win-legacy-patch`. `GetTickCount64` /
   `BCryptGenRandom` are resolved at runtime so the NT 5.2 import table stays
-  valid. Gated on the broker TLS PoC (see below).
+  valid. Gated on the broker TLS PoC (see below). The 2003 x64 Edition is rare
+  and is **not** built — x86 is the sole 2003 target.
 
-`win7` / `legacy` build jobs run in CI as `continue-on-error` (the legacy
-toolchain/OpenSSL 1.0.2 may not build on the windows-latest runner) and attach
-to releases best-effort. The `task.install` worker is **not** in the Windows
-Phase 1 build — collection (inventory + metrics + error) only. Server 2008 /
-Vista (NT 6.0) is a grey zone (OpenSSL 3.x is unsupported there); cover it via
-the `legacy` profile if needed. See
+`win7` / `legacy32` build jobs run in CI as `continue-on-error` (the legacy
+toolchain/OpenSSL 1.0.2 may not build on the windows-latest runner, and the
+threads patch is not yet applied in CI) and attach to releases best-effort. The
+`task.install` worker is **not** in the Windows Phase 1 build — collection
+(inventory + metrics + error) only. See
 [`../windows-agent/docs/win2003-bringup.md`](../windows-agent/docs/win2003-bringup.md).
 
 > **Server 2003 caveat:** TLS reaches the broker only if the broker offers

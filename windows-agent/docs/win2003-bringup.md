@@ -1,24 +1,24 @@
 # Windows Server 2003 (NT 5.2) bring-up checklist
 
-Operator runbook for the **legacy** Windows agent build. The single source
+Operator runbook for the **legacy32** Windows agent build. The single source
 tree builds binaries for several NT generations:
 
 | Profile | NT version | Arch | Windows | OpenSSL | Binary |
 |---|---|---|---|---|---|
 | modern (default) | 10.0 | x86_64 | Server 2016 / 2019 / 2022 / 2025, Win10/11 | 3.x | `assessment-agent-win2016-x64.exe` |
 | win7 | 6.1–6.3 | x86_64 | Server 2008R2 / 2012 / 2012R2, Win7–8.1 | 3.x | `assessment-agent-win2008r2-x64.exe` |
-| **legacy** (`LEGACY=1`) | 5.2 | x86_64 | **Server 2003 x64 Edition / XP x64** | 1.0.2u | `assessment-agent-win2003-x64.exe` |
-| **legacy32** | 5.2 | **i686 (32-bit)** | **Server 2003 x86 (the common SKU) / XP** | 1.0.2u | `assessment-agent-win2003-x86.exe` |
+| **legacy32** | 5.2 | **i686 (32-bit)** | **Server 2003 x86 / XP** | 1.0.2u | `assessment-agent-win2003-x86.exe` |
 
-> **Pick by architecture, not just OS version.** The mass-market Server 2003
-> install is **32-bit (x86)** — its x64 Edition was rare. So the default 2003
-> target is **legacy32**; use **legacy** only for confirmed x64 Edition hosts.
-> A 64-bit binary will not load on a 32-bit host at all. Check the host with
-> `systeminfo | findstr /C:"System Type"` (`x86-based PC` → legacy32).
+> **Server 2003 is x86 only here.** The mass-market 2003 install is 32-bit (x86);
+> the x64 Edition was rare and is **not** built — `legacy32` is the sole 2003
+> target. A 64-bit binary would not load on a 32-bit host anyway. Confirm with
+> `systeminfo | findstr /C:"System Type"` (expect `x86-based PC`).
 
-> Server 2008 / Vista (NT 6.0) is a grey zone: GetTickCount64/bcrypt exist, but
-> OpenSSL 3.x does not officially support it. If you must cover it, build it
-> from the legacy profile and validate TLS the same way as 2003.
+> **legacy32 needs a vendor patch.** rabbitmq-c v0.10's `win32/threads` uses
+> SRWLock (Vista+), which NT5.2 lacks → link fails with `undefined reference to
+> InitializeSRWLock`. Overwrite `vendor/rabbitmq-c/librabbitmq/win32/threads.{h,c}`
+> with the CRITICAL_SECTION version from `agent-fleet/win-legacy-patch` after
+> `vendor-fetch`, before `vendor-build`. See that directory's README.
 
 The code is **identical** between profiles — `GetTickCount64` and
 `BCryptGenRandom` are resolved at runtime (`monotonic_ms()` /
@@ -52,58 +52,55 @@ If they cannot/ will not, drop 2003 — the legacy build is wasted otherwise.
 
 ---
 
-## 1. Build the legacy binary
+## 1. Build the legacy32 binary
 
-Requires an **older MinGW-w64 toolchain** that still targets NT 5.2 (recent
-MinGW dropped XP/2003 startup support) and an OpenSSL 1.0.2 + 1.0.2-compatible
-curl source. Pick the arch that matches your fleet (see the table above —
-**32-bit is the common 2003 SKU**):
+Requires an **older MinGW-w64 (i686) toolchain** that still targets NT 5.2
+(recent MinGW dropped XP/2003 startup support) and an OpenSSL 1.0.2 +
+1.0.2-compatible curl source. Server 2003 is x86 only here (the rare x64 Edition
+is not built):
 
 ```bash
-# 32-bit (i686) — Server 2003 x86, the default 2003 target.
+# 32-bit (i686) — Server 2003 x86, the sole 2003 target.
 # Cross-built from an x64 host with the i686-w64-mingw32 toolchain; override
 # CC/AR/WINDRES/OPENSSL_CROSS if you build inside a native mingw32 shell.
 make PROFILE=legacy32 vendor-fetch    # clones OpenSSL_1_0_2u + curl
+# Apply the NT5.2 rabbitmq threads patch (SRWLock -> CRITICAL_SECTION) BEFORE
+# vendor-build, or the link fails with `undefined reference to InitializeSRWLock`:
+cp ../../agent-fleet/win-legacy-patch/rabbitmq-threads.h \
+   vendor/rabbitmq-c/librabbitmq/win32/threads.h
+cp ../../agent-fleet/win-legacy-patch/rabbitmq-threads.c \
+   vendor/rabbitmq-c/librabbitmq/win32/threads.c
 make PROFILE=legacy32 vendor-build    # static 32-bit libs (OpenSSL target: mingw)
 make PROFILE=legacy32 release         # builds assessment-agent-win2003-x86.exe + verify
-
-# 64-bit (x86_64) — only for confirmed Server 2003 / XP x64 Edition hosts.
-make LEGACY=1 vendor-fetch       # clones OpenSSL_1_0_2u + curl
-make LEGACY=1 vendor-build       # static libs (OpenSSL 1.0.2: no `no-tests`)
-make LEGACY=1 release            # builds assessment-agent-win2003-x64.exe + verify
 ```
 
-> legacy and legacy32 **share the `vendor/` tree** at different ABIs. Run
-> `make vendor-clean` when switching between the x64 and x86 builds, or the
-> link step mixes architectures and fails.
+> When cross-building, rabbitmq-c also needs `-lwinpthread` (give it via
+> `EXTRA_SYS_LIBS="-lgdi32 -lssp -lwinpthread"` on the `release` line), and
+> `make clean` between profiles so i686/x86_64 objects do not mix.
 
-`make PROFILE=legacy32 verify` (and `make LEGACY=1 verify`) enforce the NT 5.2
-import whitelist — **no `bcrypt.dll`, no `api-ms-win-*` umbrella DLLs** (2003
-lacks them). If verify lists either, something re-introduced a static import;
-fix before shipping.
+`make PROFILE=legacy32 verify` enforces the NT 5.2 import whitelist — **no
+`bcrypt.dll`, no `api-ms-win-*` umbrella DLLs** (2003 lacks them). If verify
+lists either, something re-introduced a static import; fix before shipping.
 
-Known per-profile build notes:
+Known build notes:
 - OpenSSL 1.0.2 `Configure` has no `no-tests` flag (handled by
   `OPENSSL_CONFIG_OPTS` in the Makefile).
 - Older curl may use `CMAKE_USE_OPENSSL` instead of `CURL_USE_OPENSSL`; adjust
   `vendor-build-curl` flags for the pinned curl version if cmake errors.
 - If a 1.1.1 build is later proven to handshake (step 0), override with
-  `make LEGACY=1 OPENSSL_VERSION=OpenSSL_1_1_1w ...` — no code change needed.
+  `make PROFILE=legacy32 OPENSSL_VERSION=OpenSSL_1_1_1w ...` — no code change needed.
 
 ## 2. Install on the 2003 host (no PowerShell)
 
-Copy the binary for your host's architecture — `assessment-agent-win2003-x86.exe`
-for 32-bit Server 2003 (the common case), `assessment-agent-win2003-x64.exe` for x64
-Edition — plus `deploy\install.bat` to the host, then from an **elevated
-Command Prompt**:
+Copy `assessment-agent-win2003-x86.exe` plus `deploy\install.bat` to the host,
+then from an **elevated Command Prompt**:
 
 ```cmd
 install.bat                 :: register + start the service
 install.bat --image-prep    :: register but do not start (golden image)
 ```
 
-`install.bat` just forwards to `assessment-agent-win2003-x86.exe install` (or the
-x64 build's `install` subcommand)
+`install.bat` just forwards to `assessment-agent-win2003-x86.exe install`
 (`CreateServiceW` + auto-restart policy via `ChangeServiceConfig2W`, both
 present on NT 5.2). If that fails, the script prints a raw `sc.exe create`
 fallback for diagnosis.
@@ -128,7 +125,7 @@ credentials, CA pem path for AMQPS).
 
 ## 4. Other version-gated APIs
 
-If `make LEGACY=1` link or load fails on 2003 with an unresolved import other
+If `make PROFILE=legacy32` link or load fails on 2003 with an unresolved import other
 than the two already handled, it means another NT6+/NT10-only API is statically
 imported. Find it with `objdump -T` / dependency walker, and wrap it in the
 same dynamic-`GetProcAddress` pattern (see `RtlGetVersion` in `installer.c` and
